@@ -84,6 +84,11 @@ mimori todo done 1                               # Mark task #1 completed ([x])
 mimori idea add "Explore distributed AST indexing"
 mimori idea promote 1                            # Move idea #1 into Active Tasks
 
+# Manage & synchronize in-code ponytail debt
+mimori debt                                      # List code-level debt markers
+mimori debt sync                                 # Reconcile markers into memory.md
+mimori debt check                                # CI validation check
+
 # Generate or refresh repository symbol map
 mimori map
 
