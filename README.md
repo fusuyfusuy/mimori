@@ -7,6 +7,10 @@
 
 > **Fast, zero-daemon project orientation, live PageRank AST symbol mapping, ADR tracking, tasklists, and activity telemetry for AI coding agents.**
 
+> [!NOTE]
+> **Evolving Skill & Language Coverage**
+> `mimori` is an actively evolving agent memory and symbol-mapping skill. It is battle-tested and optimized primarily for the programming languages and tech stacks we use the most: **Python**, **TypeScript / JavaScript** (Next.js, React, Node.js), **Go**, **Rust**, and **Shell / Bash**. Support for additional languages, AST grammars, and framework conventions continues to expand.
+
 `mimori` is a lightweight, zero-dependency CLI tool written in pure Python that lives inside your agent harness or user environment. It gives coding agents (Claude Code, Antigravity, Pi, OpenCode, Aider) instant project memory and structural architectural awareness upon entering any repository — without background servers, vector databases, or bloated indexing daemons.
 
 ---
