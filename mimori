@@ -1,0 +1,2794 @@
+#!/usr/bin/env python3
+"""mimori: Zero-daemon Agent Context, Memory, Repo Mapping & Activity Tracking CLI.
+
+Zero external dependencies - Python standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import ast
+import concurrent.futures
+import contextlib
+import datetime
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+# Used only when the repo is not a git checkout; inside git, `git ls-files` is
+# the authority on what is visible (it implements .gitignore correctly).
+DEFAULT_IGNORES = {
+    ".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build",
+    "target", ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage",
+    ".idea", ".vscode", ".next", ".turbo", ".gemini", ".antigravity",
+}
+
+CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".c", ".cpp", ".h"}
+JS_EXTS = (".ts", ".tsx", ".js", ".jsx")
+# Deliberately excludes index.{ts,js}: those are usually barrel re-export hubs, the
+# opposite of an entry point. A real package entry is declared in package.json and
+# picked up by detect_entry_points instead.
+ENTRY_NAMES = {
+    "main.py", "__main__.py", "app.py", "cli.py", "manage.py", "server.py",
+    "main.go", "main.rs",
+}
+# Next.js / Remix style file-system routing: these *are* the app's entry points.
+ROUTE_STEMS = {"page", "layout", "route"}
+
+# `map` writes a file / stdout for browsing, not context, so it is complete by
+# default. Real repos cost ~40 tokens per file, so a full map is affordable up to
+# a few hundred files; `--budget` caps it when that stops being true.
+UNLIMITED = 10**9
+MAP_BUDGET_DEFAULT = UNLIMITED
+# `dump` spends its budget in priority order: memory and decisions are hand-written
+# and cannot be recovered from the code, so they are served first; the map is
+# derivable and re-queryable with Grep, so it absorbs whatever is left.
+DUMP_TOTAL_BUDGET = 24000
+DUMP_MAP_MIN_BUDGET = 4000
+# Presets are absolute character budgets (~4 chars per token). Raising the budget
+# costs tokens, not time — generation is flat regardless — and buys progressively
+# less: the map saturates at a size set by the repo, after which more budget adds
+# nothing. Measured on real repos the full map runs ~40 tokens/file, so "unlimited"
+# is cheap into the hundreds of files and untenable in the thousands. `dump` still
+# defaults to DUMP_TOTAL_BUDGET because it spends context, not disk.
+BUDGET_PRESETS = {"large": 60_000, "immense": 200_000, "unlimited": UNLIMITED}
+COLLAPSE_RESERVE = 1200  # room for the collapsed-dirs tail, so it stays inside the budget
+# Verbose `log` calls (long summaries, long file lists) can otherwise let 5 activity
+# entries burn thousands of chars and starve the map of its share of DUMP_TOTAL_BUDGET.
+DUMP_ACTIVITY_BUDGET = 1200
+ACTIVITY_SUMMARY_LIMIT = 160
+ACTIVITY_FILES_SHOWN = 4
+MAX_PARSE_BYTES = 500_000
+CHURN_DAYS = 90
+
+# Cache retention defaults for context snapshots written to user temp dir ($XDG_RUNTIME_DIR/mimori)
+DEFAULT_CACHE_MAX_PER_REPO = 2
+DEFAULT_CACHE_TTL_HOURS = 72.0
+DEFAULT_CACHE_MAX_FILES = 50
+
+DEFAULT_MEMORY_TEMPLATE = """# Project Memory
+
+## Active Epics & Tasks
+- (Add active high-level tasks or milestones here)
+
+## Core Invariants & Architecture Rules
+- (Add non-negotiable architecture decisions and constraints here)
+
+## Domain Vocabulary & Gotchas
+- (Add known edge-cases, quirks, or domain terms here)
+"""
+
+DEFAULT_DECISIONS_TEMPLATE = """# Architecture Decisions (ADRs)
+
+<!--
+Record format - one `## ` heading per decision, newest appended last:
+
+## [YYYY-MM-DD] ADR-Title
+- **Context**: Why was this decision necessary?
+- **Decision**: What was chosen?
+- **Consequences**: What trade-offs or constraints follow?
+- **Superseded by**: optional. Name the ADR that replaced this one. Superseded
+  entries stay in the file for history but are never expanded in `mimori
+  dump` - they are listed by title only, so the file can grow without the
+  snapshot growing with it.
+
+This block is an HTML comment on purpose: a `## ` heading here would be parsed
+as an ADR and render as a phantom entry in every dump.
+-->
+"""
+
+DEFAULT_TASKS_TEMPLATE = """# Tasks & Backlog
+
+## In Progress
+
+## Active Tasks
+- (Add pending actionable tasks here)
+
+## Future Ideas & Backlog
+- (Add exploratory ideas, architecture proposals, or future concepts here)
+
+## Completed
+"""
+
+
+# --------------------------------------------------------------------------
+# repo root & git
+# --------------------------------------------------------------------------
+
+def find_repo_root(start: Optional[Path] = None) -> Path:
+    curr = (start or Path.cwd()).resolve()
+    for parent in [curr] + list(curr.parents):
+        if (parent / ".git").exists() or (parent / ".mimori").exists() or (parent / "mimori").exists() or (parent / ".agents").exists():
+            return parent
+    return curr
+
+
+def get_mimori_dir(root: Path) -> Path:
+    if (root / ".mimori").exists():
+        return root / ".mimori"
+    if (root / "mimori").exists():
+        return root / "mimori"
+    if (root / ".agents").exists():
+        return root / ".agents"
+    return root / ".mimori"
+
+
+def get_tasks_file(root: Path) -> Path:
+    mimori_dir = get_mimori_dir(root)
+    if (mimori_dir / "tasks.md").exists():
+        return mimori_dir / "tasks.md"
+    if (mimori_dir / "todos.md").exists():
+        return mimori_dir / "todos.md"
+    return mimori_dir / "tasks.md"
+
+
+def ensure_git_repo(root: Path) -> bool:
+    """Initializes a git repo if .git is missing."""
+    if not (root / ".git").exists():
+        try:
+            res = subprocess.run(["git", "init"], cwd=str(root), capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                print(f"Initialized empty Git repository in {root}")
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def get_repo_identifier(root: Path) -> str:
+    """Returns 7-char short commit hash, 'init' for empty repos, or short UUID."""
+    out = run_git(root, "rev-parse", "--short=7", "HEAD", timeout=2)
+    if out and out.strip():
+        return out.strip()
+    if (root / ".git").exists():
+        return "init"
+    return uuid.uuid4().hex[:7]
+
+
+def get_user_temp_dir() -> Path:
+    """Resolves user-isolated temp directory: $XDG_RUNTIME_DIR/mimori or /tmp/mimori-$UID."""
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime and os.path.isdir(xdg_runtime):
+        base = Path(xdg_runtime) / "mimori"
+    else:
+        uid = os.getuid() if hasattr(os, "getuid") else "user"
+        tmp = os.environ.get("TMPDIR", "/tmp")
+        base = Path(tmp) / f"mimori-{uid}"
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return base
+
+
+def format_bytes(num: int) -> str:
+    """Format byte size into human readable string."""
+    val = float(num)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(val) < 1024.0:
+            return f"{val:3.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024.0
+    return f"{val:.1f} TB"
+
+
+def prune_user_temp_dir(
+    temp_dir: Optional[Path] = None,
+    current_repo: Optional[str] = None,
+    max_per_repo: Optional[int] = None,
+    ttl_hours: Optional[float] = None,
+    max_files: Optional[int] = None,
+    now: Optional[float] = None,
+) -> Tuple[int, int]:
+    """Prunes stale snapshot files from temp_dir according to retention policies.
+
+    Enforces:
+      1. Global age TTL (default: 72h).
+      2. Per-repo LRU retention (default: keep newest 2 per repo).
+      3. Global max files cap (default: keep newest 50 files total).
+
+    Returns (pruned_count, pruned_bytes).
+    """
+    if temp_dir is None:
+        temp_dir = get_user_temp_dir()
+    if not temp_dir.is_dir():
+        return 0, 0
+
+    if max_per_repo is None:
+        try:
+            max_per_repo = int(os.environ.get("MIMORI_CACHE_MAX_PER_REPO", DEFAULT_CACHE_MAX_PER_REPO))
+        except ValueError:
+            max_per_repo = DEFAULT_CACHE_MAX_PER_REPO
+
+    if ttl_hours is None:
+        try:
+            ttl_hours = float(os.environ.get("MIMORI_CACHE_TTL_HOURS", DEFAULT_CACHE_TTL_HOURS))
+        except ValueError:
+            ttl_hours = DEFAULT_CACHE_TTL_HOURS
+
+    if max_files is None:
+        try:
+            max_files = int(os.environ.get("MIMORI_CACHE_MAX_FILES", DEFAULT_CACHE_MAX_FILES))
+        except ValueError:
+            max_files = DEFAULT_CACHE_MAX_FILES
+
+    now_ts = time.time() if now is None else now
+    ttl_seconds = ttl_hours * 3600.0
+
+    pruned_count = 0
+    pruned_bytes = 0
+
+    try:
+        entries: List[Tuple[Path, float, int]] = []
+        for p in temp_dir.glob("ctx-*.md"):
+            if not p.is_file():
+                continue
+            try:
+                stat = p.stat()
+                entries.append((p, stat.st_mtime, stat.st_size))
+            except OSError:
+                continue
+
+        to_delete: Set[Path] = set()
+        file_sizes = {p: sz for p, _, sz in entries}
+
+        # 1. Global age TTL
+        if ttl_seconds > 0:
+            for p, mtime, _ in entries:
+                if (now_ts - mtime) > ttl_seconds:
+                    to_delete.add(p)
+
+        # 2. Per-repo retention (ctx-<repo>-<commit>.md)
+        repo_groups: Dict[str, List[Tuple[Path, float]]] = {}
+        for p, mtime, _ in entries:
+            if p in to_delete:
+                continue
+            name = p.stem
+            if name.startswith("ctx-"):
+                parts = name[4:].rsplit("-", 1)
+                repo_name = parts[0] if len(parts) == 2 else name[4:]
+                repo_groups.setdefault(repo_name, []).append((p, mtime))
+
+        if max_per_repo > 0:
+            for r_name, r_files in repo_groups.items():
+                r_files.sort(key=lambda x: x[1], reverse=True)
+                for p, _ in r_files[max_per_repo:]:
+                    to_delete.add(p)
+
+        # 3. Global max files ceiling
+        remaining = [e for e in entries if e[0] not in to_delete]
+        if max_files > 0 and len(remaining) > max_files:
+            remaining.sort(key=lambda x: x[1])
+            excess = len(remaining) - max_files
+            for p, _, _ in remaining[:excess]:
+                to_delete.add(p)
+
+        # Perform deletions
+        for p in to_delete:
+            try:
+                sz = file_sizes.get(p, 0)
+                p.unlink(missing_ok=True)
+                pruned_count += 1
+                pruned_bytes += sz
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+    return pruned_count, pruned_bytes
+
+
+def run_git(root: Path, *args: str, timeout: int = 5) -> Optional[str]:
+    """Run a git command in `root`. Returns stdout, or None if git/repo is unavailable."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout
+
+
+def get_git_branch(root: Path) -> Optional[str]:
+    """Current branch name, "detached@<sha>" on detached HEAD, or None outside git.
+
+    Never guesses a branch name: a fabricated value would be written into the
+    permanent activity log.
+    """
+    out = run_git(root, "rev-parse", "--abbrev-ref", "HEAD", timeout=2)
+    if out is None or not out.strip():
+        return None
+    branch = out.strip()
+    if branch == "HEAD":
+        sha = run_git(root, "rev-parse", "--short", "HEAD", timeout=2)
+        return f"detached@{sha.strip()}" if sha and sha.strip() else "detached"
+    return branch
+
+
+def should_ignore(rel_path: Path) -> bool:
+    return any(part in DEFAULT_IGNORES for part in rel_path.parts)
+
+
+def list_files(root: Path) -> List[str]:
+    """Repo-visible files as posix-relative strings.
+
+    Delegates to `git ls-files` so .gitignore semantics (negations, path-scoped
+    patterns, globs) are git's problem, not ours. Falls back to a walk with a
+    fixed ignore list outside git checkouts.
+    """
+    out = run_git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", timeout=15)
+    if out is not None:
+        rels = {p for p in out.split("\0") if p}
+        return sorted(r for r in rels if (root / r).is_file())
+
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root)
+        dirnames[:] = [d for d in dirnames if not should_ignore(rel_dir / d)]
+        for f in filenames:
+            rel = rel_dir / f if rel_dir != Path(".") else Path(f)
+            if not should_ignore(rel) and not f.endswith(".pyc"):
+                found.append(rel.as_posix())
+    return sorted(found)
+
+
+def get_churn(root: Path, days: int = CHURN_DAYS) -> Dict[str, int]:
+    """Commits touching each file in the recent window. Empty dict outside git."""
+    out = run_git(root, "log", f"--since={days}.days", "-n", "400", "--name-only",
+                  "--pretty=format:", timeout=10)
+    if not out:
+        return {}
+    counts: Dict[str, int] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if line:
+            counts[line] = counts.get(line, 0) + 1
+    return counts
+
+
+def get_working_state(root: Path) -> Optional[str]:
+    """Branch, uncommitted files and recent commits — what a resuming agent needs first."""
+    branch = get_git_branch(root)
+    if branch is None:
+        return None
+
+    lines = [f"- branch: `{branch}`"]
+
+    status = run_git(root, "status", "--porcelain")
+    dirty = [l for l in (status or "").splitlines() if l.strip()]
+    if dirty:
+        lines.append(f"- uncommitted ({len(dirty)}):")
+        for entry in dirty[:10]:
+            lines.append(f"    - `{entry.strip()}`")
+        if len(dirty) > 10:
+            lines.append(f"    - ... and {len(dirty) - 10} more")
+    else:
+        lines.append("- uncommitted: none (clean tree)")
+
+    log = run_git(root, "log", "-5", "--oneline", "--no-decorate")
+    if log and log.strip():
+        lines.append("- recent commits:")
+        for entry in log.strip().splitlines():
+            lines.append(f"    - {entry}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# file analysis
+# --------------------------------------------------------------------------
+
+class FileInfo:
+    """One repo file: its symbols, its imports, and the signals used to rank it."""
+
+    def __init__(self, path: str, size: int):
+        self.path = path
+        self.size = size
+        self.lines = 0
+        self.doc: Optional[str] = None
+        self.symbols: List[Tuple[int, int, str]] = []  # (lineno, depth, text)
+        self.imports: List[tuple] = []
+        self.importers: Set[str] = set()
+        self.depends_on: Set[str] = set()
+        self.churn = 0
+        self.entry = False
+        self.executable = False
+        self.pagerank: float = 0.0
+
+    @property
+    def in_degree(self) -> int:
+        return len(self.importers)
+
+    @property
+    def score(self) -> int:
+        return (4 * self.in_degree) + min(self.churn, 10) + (6 if self.entry else 0) + (1 if self.symbols else 0)
+
+
+def _elide(text: str, limit: int) -> str:
+    """Truncate visibly, so a cut signature never reads as a complete one."""
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _fmt_signature(node, drop_self: bool) -> str:
+    try:
+        params = ast.unparse(node.args)
+    except Exception:
+        params = "..."
+    if drop_self:
+        for prefix in ("self, ", "cls, "):
+            if params.startswith(prefix):
+                params = params[len(prefix):]
+                break
+        if params in ("self", "cls"):
+            params = ""
+    sig = f"{node.name}({params})"
+    if node.returns is not None:
+        with contextlib.suppress(Exception):
+            sig += f" -> {ast.unparse(node.returns)}"
+    prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+    return _elide(prefix + sig, 88)
+
+
+def _first_doc_line(node) -> Optional[str]:
+    try:
+        doc = ast.get_docstring(node)
+    except Exception:
+        return None
+    if not doc:
+        return None
+    return doc.strip().splitlines()[0].strip()[:100]
+
+
+def parse_python(content: str) -> Tuple[Optional[str], List[Tuple[int, int, str]], List[tuple]]:
+    """Symbols with signatures + line numbers, plus import specs for the graph."""
+    symbols: List[Tuple[int, int, str]] = []
+    imports: List[tuple] = []
+    try:
+        tree = ast.parse(content)
+    except Exception:
+        # Unparseable (syntax error, different python dialect): degrade to names only.
+        for i, line in enumerate(content.splitlines(), 1):
+            m = re.match(r"^(?:class|def|async def)\s+([A-Za-z0-9_]+)", line.strip())
+            if m:
+                symbols.append((i, 0, m.group(0)))
+        return None, symbols, imports
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(("py_abs", a.name) for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.module:
+                    imports.append(("py_rel", node.level, node.module))
+                else:
+                    imports.extend(("py_rel", node.level, a.name) for a in node.names)
+            elif node.module:
+                imports.append(("py_abs", node.module))
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            symbols.append((node.lineno, 0, f"class {node.name}"))
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if sub.name.startswith("_") and sub.name != "__init__":
+                        continue
+                    symbols.append((sub.lineno, 1, _fmt_signature(sub, drop_self=True)))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append((node.lineno, 0, _fmt_signature(node, drop_self=False)))
+
+    return _first_doc_line(tree), symbols, imports
+
+
+GENERIC_PATTERNS = {
+    ".js": [r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z0-9_$]+)",
+            r"^export\s+(?:const|let|var)\s+([A-Za-z0-9_$]+)"],
+    ".jsx": [r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z0-9_$]+)",
+             r"^export\s+(?:const|let|var)\s+([A-Za-z0-9_$]+)"],
+    ".ts": [r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum)\s+([A-Za-z0-9_$]+)",
+            r"^export\s+(?:const|let|var)\s+([A-Za-z0-9_$]+)"],
+    ".tsx": [r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum)\s+([A-Za-z0-9_$]+)",
+             r"^export\s+(?:const|let|var)\s+([A-Za-z0-9_$]+)"],
+    ".go": [r"^func\s+(?:\([^\)]+\)\s+)?([A-Za-z0-9_]+)", r"^type\s+([A-Za-z0-9_]+)\s+(?:struct|interface)"],
+    ".rs": [r"^(?:pub\s+)?(?:fn|struct|enum|trait|type)\s+([A-Za-z0-9_]+)"],
+    ".c": [r"^[A-Za-z0-9_ *]+\s+([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{"],
+    ".cpp": [r"^(?:class|struct)\s+([A-Za-z0-9_]+)", r"^[A-Za-z0-9_ *:]+\s+([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{"],
+    ".h": [r"^(?:class|struct)\s+([A-Za-z0-9_]+)", r"^[A-Za-z0-9_ *:]+\s+([A-Za-z0-9_]+)\s*\([^)]*\);"],
+}
+
+JS_IMPORT_RE = re.compile(r"""(?:from|require\(|import\()\s*['"]([^'"]+)['"]""")
+JS_EXPORT_RE = re.compile(r"""export\s+.*\s+from\s*['"]([^'"]+)['"]""")
+GO_IMPORT_BLOCK_RE = re.compile(r"""import\s*\(([^)]+)\)""", re.S)
+GO_SINGLE_IMPORT_RE = re.compile(r"""import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']""")
+RUST_MOD_RE = re.compile(r"""^\s*(?:pub\s+)?mod\s+([a-zA-Z0-9_]+)\s*;""")
+RUST_USE_RE = re.compile(r"""^\s*(?:pub\s+)?use\s+([a-zA-Z0-9_:]+)""")
+
+
+def parse_generic(content: str, ext: str) -> Tuple[Optional[str], List[Tuple[int, int, str]], List[tuple]]:
+    symbols: List[Tuple[int, int, str]] = []
+    imports: List[tuple] = []
+    regexes = [re.compile(p) for p in GENERIC_PATTERNS.get(ext, [])]
+
+    if ext == ".go":
+        for block in GO_IMPORT_BLOCK_RE.findall(content):
+            imports.extend(("go_spec", s) for s in re.findall(r'["\']([^"\']+)["\']', block))
+        imports.extend(("go_spec", s) for s in GO_SINGLE_IMPORT_RE.findall(content))
+
+    for i, raw in enumerate(content.splitlines(), 1):
+        line = raw.strip()
+        if ext in JS_EXTS:
+            imports.extend(("js_spec", spec) for spec in JS_IMPORT_RE.findall(line))
+            imports.extend(("js_spec", spec) for spec in JS_EXPORT_RE.findall(line))
+        elif ext == ".rs":
+            m_mod = RUST_MOD_RE.match(line)
+            if m_mod:
+                imports.append(("rs_mod", m_mod.group(1)))
+            m_use = RUST_USE_RE.match(line)
+            if m_use:
+                imports.append(("rs_use", m_use.group(1)))
+
+        for c in regexes:
+            if c.match(line):
+                symbols.append((i, 0, _elide(line.rstrip("{ ").strip(), 88)))
+                break
+    return None, symbols, imports
+
+
+SHEBANG_EXTS = {"python": ".py", "node": ".js", "deno": ".ts", "bun": ".ts"}
+
+
+def _sniff_shebang(full: Path) -> Optional[str]:
+    """Map an extensionless script to a parser via its shebang."""
+    try:
+        with open(full, "rb") as f:
+            first = f.readline(200).decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    for name, ext in SHEBANG_EXTS.items():
+        if name in first:
+            return ext
+    return None
+
+
+def analyze_file(root: Path, rel: str) -> Optional[FileInfo]:
+    full = root / rel
+    try:
+        st = full.stat()
+    except OSError:
+        return None
+    info = FileInfo(rel, st.st_size)
+    info.executable = bool(st.st_mode & 0o111)
+
+    ext = Path(rel).suffix.lower()
+    if ext not in CODE_EXTS and info.executable:
+        ext = _sniff_shebang(full) or ext  # extensionless scripts in bin/ are common
+    if ext not in CODE_EXTS or st.st_size > MAX_PARSE_BYTES:
+        return info
+
+    try:
+        content = full.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return info
+
+    info.lines = content.count("\n") + 1
+    if ext == ".py":
+        info.doc, info.symbols, info.imports = parse_python(content)
+    else:
+        info.doc, info.symbols, info.imports = parse_generic(content, ext)
+    return info
+
+
+# --------------------------------------------------------------------------
+# import graph
+# --------------------------------------------------------------------------
+
+def build_python_index(paths: Set[str]) -> Dict[str, Set[str]]:
+    """Map every dotted-path suffix of each module to the file(s) providing it.
+
+    So `backend/db.py` is reachable as "db", "backend.db", ... which lets an
+    `from backend.db import X` in a src-layout project resolve without knowing
+    where sys.path would have started.
+    """
+    index: Dict[str, Set[str]] = {}
+    for path in paths:
+        if not path.endswith(".py"):
+            continue
+        parts = path[:-3].split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts:
+            continue
+        for i in range(len(parts)):
+            index.setdefault(".".join(parts[i:]), set()).add(path)
+    return index
+
+
+def _resolve_py_module(module: str, index: Dict[str, Set[str]]) -> Optional[str]:
+    hits = index.get(module)
+    if hits and len(hits) == 1:  # ambiguous names would create false edges
+        return next(iter(hits))
+    return None
+
+
+_JSONC_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', re.S)
+
+
+def _load_jsonc(path: Path) -> dict:
+    """Parse JSON that may carry comments/trailing commas (tsconfig.json does)."""
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    stripped = _JSONC_RE.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", raw)
+    return json.loads(re.sub(r",\s*([}\]])", r"\1", stripped))
+
+
+def load_path_aliases(root: Path, paths: Set[str]) -> List[Tuple[str, List[str]]]:
+    """(prefix, [target dirs]) from tsconfig/jsconfig `compilerOptions.paths`.
+
+    Without this, an aliased project's import graph is nearly empty: in a typical
+    Next.js repo `@/...` imports outnumber relative ones by more than 10:1.
+    """
+    aliases: List[Tuple[str, List[str]]] = []
+    for cfg in ("tsconfig.json", "jsconfig.json"):
+        if cfg not in paths:
+            continue
+        try:
+            opts = _load_jsonc(root / cfg).get("compilerOptions") or {}
+        except Exception:
+            continue
+        base_dir = os.path.normpath(str(opts.get("baseUrl") or "."))
+        for pattern, targets in (opts.get("paths") or {}).items():
+            prefix = pattern.replace("*", "")
+            if not prefix:
+                continue
+            dirs = [os.path.normpath(f"{base_dir}/{str(t).replace('*', '')}") for t in targets]
+            aliases.append((prefix, dirs))
+    return aliases
+
+
+def _try_candidates(norm: str, paths: Set[str]) -> Optional[str]:
+    if norm.startswith(".."):
+        return None
+    for cand in [norm] + [norm + e for e in JS_EXTS] + [f"{norm}/index{e}" for e in JS_EXTS]:
+        if cand in paths:
+            return cand
+    return None
+
+
+def _resolve_rel_path(source: str, spec: str, paths: Set[str]) -> Optional[str]:
+    try:
+        norm = os.path.normpath((Path(source).parent / spec).as_posix())
+    except Exception:
+        return None
+    return _try_candidates(norm, paths)
+
+
+def _resolve_alias(spec: str, aliases: List[Tuple[str, List[str]]], paths: Set[str]) -> Optional[str]:
+    for prefix, dirs in aliases:
+        if not spec.startswith(prefix):
+            continue
+        rest = spec[len(prefix):]
+        for target_dir in dirs:
+            hit = _try_candidates(os.path.normpath(f"{target_dir}/{rest}"), paths)
+            if hit:
+                return hit
+    return None
+
+
+def parse_go_module(root: Path, paths: Set[str]) -> Optional[str]:
+    if "go.mod" not in paths:
+        return None
+    try:
+        content = (root / "go.mod").read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"^module\s+([^\s\n]+)", content, re.MULTILINE)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def parse_cargo_crate(root: Path, paths: Set[str]) -> Optional[str]:
+    if "Cargo.toml" not in paths:
+        return None
+    try:
+        content = (root / "Cargo.toml").read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', content)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def compute_pagerank(infos: Dict[str, FileInfo], damping: float = 0.85, iters: int = 30) -> Dict[str, float]:
+    """File-level vectorized PageRank on import graph using contiguous flat arrays (pure stdlib)."""
+    nodes = list(infos.keys())
+    n = len(nodes)
+    if n == 0:
+        return {}
+    if n == 1:
+        return {nodes[0]: 1.0}
+
+    node_to_idx = {name: i for i, name in enumerate(nodes)}
+    out_degree = array.array("i", [0] * n)
+    in_edges: List[array.array] = [array.array("i") for _ in range(n)]
+
+    for src_name, info in infos.items():
+        src_idx = node_to_idx.get(src_name)
+        if src_idx is None:
+            continue
+        valid_deps = [node_to_idx[d] for d in info.depends_on if d in node_to_idx]
+        out_degree[src_idx] = len(valid_deps)
+        for dst_idx in valid_deps:
+            in_edges[dst_idx].append(src_idx)
+
+    inv_n = 1.0 / n
+    rank = array.array("d", [inv_n] * n)
+    new_rank = array.array("d", [0.0] * n)
+
+    for _ in range(iters):
+        dangling_sum = sum(rank[i] for i in range(n) if out_degree[i] == 0)
+        base = (1.0 - damping) * inv_n + (damping * dangling_sum) * inv_n
+
+        delta = 0.0
+        for i in range(n):
+            s = base
+            for src in in_edges[i]:
+                s += damping * (rank[src] / out_degree[src])
+            new_rank[i] = s
+            delta += abs(s - rank[i])
+
+        rank[:] = new_rank
+        if delta < 1e-7:
+            break
+
+    return {nodes[i]: rank[i] for i in range(n)}
+
+
+def build_import_graph(infos: Dict[str, FileInfo], py_index: Dict[str, Set[str]],
+                       aliases: List[Tuple[str, List[str]]],
+                       go_mod: Optional[str] = None,
+                       cargo_crate: Optional[str] = None) -> None:
+    """Populate `importers` so in-degree can rank structurally central modules.
+
+    Resolves Python (via ast), JS/TS (relative & tsconfig aliases), Go (via go.mod),
+    and Rust (via Cargo.toml / mod.rs / crate:: paths).
+    """
+    paths = set(infos)
+    for source, info in infos.items():
+        for spec in info.imports:
+            target = None
+            if spec[0] == "py_abs":
+                target = _resolve_py_module(spec[1], py_index)
+            elif spec[0] == "py_rel":
+                _, level, module = spec
+                base = Path(source).parent
+                for _ in range(level - 1):
+                    base = base.parent
+                stem = (base / module.replace(".", "/")).as_posix().lstrip("./")
+                for cand in (f"{stem}.py", f"{stem}/__init__.py"):
+                    if cand in paths:
+                        target = cand
+                        break
+            elif spec[0] == "js_spec":
+                js_spec = spec[1]
+                target = (_resolve_rel_path(source, js_spec, paths) if js_spec.startswith(".")
+                          else _resolve_alias(js_spec, aliases, paths))
+            elif spec[0] == "go_spec":
+                go_spec = spec[1]
+                if go_mod and go_spec.startswith(go_mod):
+                    sub = go_spec[len(go_mod):].lstrip("/")
+                    for cand in paths:
+                        if cand.startswith(sub + "/") and cand.endswith(".go") and cand != source:
+                            infos[cand].importers.add(source)
+                            info.depends_on.add(cand)
+                continue
+            elif spec[0] == "rs_mod":
+                mod_name = spec[1]
+                src_parent = Path(source).parent.as_posix().lstrip("./")
+                prefix = f"{src_parent}/" if src_parent and src_parent != "." else ""
+                for cand in (f"{prefix}{mod_name}.rs", f"{prefix}{mod_name}/mod.rs", f"src/{mod_name}.rs", f"src/{mod_name}/mod.rs"):
+                    norm = os.path.normpath(cand)
+                    if norm in paths and norm != source:
+                        target = norm
+                        break
+            elif spec[0] == "rs_use":
+                use_path = spec[1]
+                if use_path.startswith("crate::"):
+                    parts = use_path[7:].split("::")
+                    stem = "/".join(parts)
+                    for cand in (f"src/{stem}.rs", f"src/{stem}/mod.rs", f"{stem}.rs", f"{stem}/mod.rs"):
+                        norm = os.path.normpath(cand)
+                        if norm in paths and norm != source:
+                            target = norm
+                            break
+
+            if target and target != source and target in infos:
+                infos[target].importers.add(source)
+                info.depends_on.add(target)
+
+
+# --------------------------------------------------------------------------
+# entry points
+# --------------------------------------------------------------------------
+
+def detect_entry_points(root: Path, infos: Dict[str, FileInfo], py_index: Dict[str, Set[str]]) -> None:
+    for rel, info in infos.items():
+        parts = rel.split("/")
+        shallow = len(parts) <= 2 or "bin" in parts[:-1]
+        stem, ext = os.path.splitext(parts[-1])
+        routed = ext in JS_EXTS and (
+            stem == "middleware" or (stem in ROUTE_STEMS and {"app", "pages"} & set(parts[:-1]))
+        )
+        if parts[-1] in ENTRY_NAMES or routed or (info.executable and shallow):
+            info.entry = True
+
+    for rel in list(infos):
+        name = rel.rsplit("/", 1)[-1]
+        try:
+            if name == "pyproject.toml" and tomllib is not None:
+                data = tomllib.loads((root / rel).read_text(encoding="utf-8", errors="ignore"))
+                targets = (data.get("project", {}).get("scripts") or {}).values()
+                for target in targets:
+                    hit = _resolve_py_module(str(target).split(":")[0], py_index)
+                    if hit:
+                        infos[hit].entry = True
+            elif name == "package.json":
+                data = json.loads((root / rel).read_text(encoding="utf-8", errors="ignore"))
+                base = Path(rel).parent
+                raw = data.get("bin") or {}
+                targets = list(raw.values()) if isinstance(raw, dict) else [raw]
+                if data.get("main"):
+                    targets.append(data["main"])
+                for target in targets:
+                    cand = os.path.normpath((base / str(target)).as_posix())
+                    if cand in infos:
+                        infos[cand].entry = True
+        except Exception:
+            continue
+
+
+# --------------------------------------------------------------------------
+# repo map rendering
+# --------------------------------------------------------------------------
+
+def collect_repo(root: Path) -> Dict[str, FileInfo]:
+    files = list_files(root)
+    infos: Dict[str, FileInfo] = {}
+
+    if len(files) > 40:
+        max_workers = min(32, (os.cpu_count() or 1) + 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_rel = {executor.submit(analyze_file, root, rel): rel for rel in files}
+            for fut in concurrent.futures.as_completed(future_to_rel):
+                rel = future_to_rel[fut]
+                try:
+                    info = fut.result()
+                    if info is not None:
+                        infos[rel] = info
+                except Exception:
+                    pass
+    else:
+        for rel in files:
+            info = analyze_file(root, rel)
+            if info is not None:
+                infos[rel] = info
+
+    paths = set(infos)
+    py_index = build_python_index(paths)
+    go_mod = parse_go_module(root, paths)
+    cargo_crate = parse_cargo_crate(root, paths)
+    build_import_graph(infos, py_index, load_path_aliases(root, paths), go_mod=go_mod, cargo_crate=cargo_crate)
+    detect_entry_points(root, infos, py_index)
+    for rel, count in get_churn(root).items():
+        if rel in infos:
+            infos[rel].churn = count
+
+    try:
+        pr = compute_pagerank(infos)
+        for p, v in pr.items():
+            if p in infos:
+                infos[p].pagerank = v
+    except Exception:
+        pass
+    return infos
+
+
+def _combined_score(info: FileInfo, n: int, weight: float = 4.0) -> float:
+    """4*in_degree + weight*pr*N + churn + entry + symbols — additive, not replacement."""
+    pr_bonus = info.pagerank * n * weight if info.pagerank > 0 and n > 0 else 0.0
+    return (4 * info.in_degree) + pr_bonus + min(info.churn, 10) + (6 if info.entry else 0) + (1 if info.symbols else 0)
+
+
+def _render_symbol(lineno: int, depth: int, text: str) -> str:
+    return f"  :{str(lineno).ljust(5)}{'  ' * depth}{text}"
+
+
+GENERIC_STEMS = {"index", "page", "layout", "route", "main", "mod", "__init__"}
+
+
+def _importer_label(path: str) -> str:
+    """Name an importing file. Bare stems collide in route-based projects, where
+    a dozen distinct files are all called `page` — qualify those with their dir."""
+    p = Path(path)
+    if p.stem in GENERIC_STEMS and p.parent.name:
+        return f"{p.parent.name}/{p.stem}"
+    return p.stem
+
+
+def _file_header(info: FileInfo) -> str:
+    bits = []
+    if info.lines:
+        bits.append(f"{info.lines} ln")
+    if info.importers:
+        names = sorted({_importer_label(p) for p in info.importers})
+        shown = ", ".join(names[:4])
+        if len(names) > 4:
+            shown += f", +{len(names) - 4}"
+        bits.append(f"← {shown}")
+    if info.churn:
+        bits.append(f"{info.churn} commit{'s' if info.churn != 1 else ''}/{CHURN_DAYS}d")
+    if info.entry:
+        bits.append("entry point")
+    suffix = f" · {' · '.join(bits)}" if bits else ""
+    return f"`{info.path}`{suffix}"
+
+
+def _render_detail(info: FileInfo) -> str:
+    out = [_file_header(info)]
+    if info.doc:
+        out.append(f'  "{info.doc}"')
+    for lineno, depth, text in info.symbols[:12]:
+        out.append(_render_symbol(lineno, depth, text))
+    if len(info.symbols) > 12:
+        out.append(f"  ... +{len(info.symbols) - 12} more symbols")
+    return "\n".join(out)
+
+
+def _render_compact(info: FileInfo) -> str:
+    tops = [f":{ln} {txt.split('(')[0]}" for ln, depth, txt in info.symbols if depth == 0][:6]
+    tail = f" · {' · '.join(tops)}" if tops else ""
+    return f"{_file_header(info)}{tail}"
+
+
+def _group_dirs(infos: List[FileInfo], top_level_only: bool) -> List[str]:
+    groups: Dict[str, List[FileInfo]] = {}
+    for info in infos:
+        parent = Path(info.path).parent
+        key = (parent.parts[0] if top_level_only and parent.parts else parent.as_posix())
+        groups.setdefault("." if key == "." else key.rstrip("/") + "/", []).append(info)
+
+    out = []
+    for parent in sorted(groups):
+        members = groups[parent]
+        exts = sorted({Path(m.path).suffix or "(no ext)" for m in members})
+        if len(members) <= 3 and not top_level_only:
+            out.append(f"- `{parent}` — " + ", ".join(f"`{Path(m.path).name}`" for m in members))
+        else:
+            out.append(f"- `{parent}` — {len(members)} files ({', '.join(exts[:4])})")
+    return out
+
+
+def _collapse_dirs(infos: List[FileInfo], limit: int) -> List[str]:
+    """Summarise collapsed files, rolling up to top-level dirs if the list is itself
+    too long — an unbudgeted tail would quietly blow the caller's budget."""
+    lines = _group_dirs(infos, top_level_only=False)
+    if sum(len(l) + 1 for l in lines) <= limit:
+        return lines
+    return _group_dirs(infos, top_level_only=True)
+
+
+def generate_repo_map(root: Path, budget: int = MAP_BUDGET_DEFAULT,
+                      focus: Optional[List[str]] = None) -> str:
+    infos = collect_repo(root)
+    total = len(infos)
+    total_lines = sum(i.lines for i in infos.values())
+
+    # Rank by combined PageRank + in_degree (additive weight 4 keeps old order, adds transitive boost)
+    n = len(infos)
+    ranked = sorted(infos.values(), key=lambda i: (-_combined_score(i, n), i.path))
+
+    # Task conditioning: `focus` pulls matched files and their import-graph
+    # neighbors into full detail and collapses everything else to a directory
+    # summary. The map stops being a static ranking and becomes "start here".
+    focused: Set[str] = set()
+    neighbors: Set[str] = set()
+    if focus:
+        tokens = [t.lower() for t in focus if t]
+        for info in infos.values():
+            if any(t in info.path.lower() for t in tokens):
+                focused.add(info.path)
+        for path in focused:
+            info = infos[path]
+            neighbors |= info.importers | info.depends_on
+        neighbors -= focused
+
+    head = ["# Repository Map", ""]
+    if focus:
+        head.append(
+            f"{total} files · focus: {', '.join(focus)} — full detail for "
+            f"{len(focused)} matched file(s) and {len(neighbors)} import-graph "
+            f"neighbor(s); other files summarized by directory."
+        )
+    else:
+        head.append(
+            f"{total} files · {total_lines} lines of parsed code · "
+            f"ranked by PageRank+in-degree + {CHURN_DAYS}d churn + entry points"
+        )
+
+    entries = [i for i in ranked if i.entry]
+    if entries and not focus:
+        head += ["", "## Entry points", ""]
+        head += [f"- `{i.path}`" for i in entries[:10]]
+        if len(entries) > 10:
+            head.append(f"- _... +{len(entries) - 10} more entry points (ranked; see the map below)_")
+
+    core_blocks: List[str] = []
+    support_blocks: List[str] = []
+    collapsed: List[FileInfo] = []
+    detailed = 0
+    used = sum(len(l) + 1 for l in head)
+    truncated = False
+
+    if focus:
+        detail_set = focused | neighbors
+        order = [infos[p] for p in sorted(detail_set, key=lambda p: (-_combined_score(infos[p], n), p))]
+    else:
+        detail_set = set()
+        order = ranked
+
+    for info in order:
+        # Focused files always render detail. Without focus, only entry points
+        # and widely-imported files do; a symbol-free leaf earns a compact line
+        # at most (its importer list is the point), otherwise it collapses.
+        wants_detail = info.path in focused or (not focus and (info.entry or info.in_degree >= 2))
+        if not wants_detail and not info.symbols and info.in_degree < 2:
+            collapsed.append(info)
+            continue
+        block = _render_detail(info) if wants_detail else _render_compact(info)
+        if truncated or used + len(block) + 2 > budget - COLLAPSE_RESERVE:
+            truncated = True
+            collapsed.append(info)
+            continue
+        used += len(block) + 2
+        (core_blocks if info.path in detail_set or wants_detail else support_blocks).append(block)
+        detailed += 1
+
+    if focus:
+        # Everything outside the task neighborhood is summarized, never detailed.
+        collapsed.extend(infos[p] for p in infos if p not in detail_set)
+
+    out = list(head)
+    if core_blocks:
+        out += ["", "## Core modules", ""]
+        out.append("\n\n".join(core_blocks))
+    if support_blocks:
+        out += ["", "## Supporting files", ""]
+        out.append("\n\n".join(support_blocks))
+    if collapsed:
+        out += ["", "## Other files", ""]
+        out += _collapse_dirs(collapsed, COLLAPSE_RESERVE)
+
+    out += ["", f"_Detailed {detailed} of {total} files; {len(collapsed)} collapsed above._"]
+    if truncated:
+        out.append(
+            f"_Output hit the {budget}-char budget — lower-ranked files were collapsed, "
+            f"not dropped. Raise with `mimori map --budget N`, or use Grep for exact locations._"
+        )
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def _split_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Split markdown into (preamble, [(heading, body)]) at its dominant heading level.
+
+    The level is detected rather than assumed: real files disagree with the template
+    (titirek writes `## ADR-001: ...`, this repo writes `### [date] Title`).
+    """
+    lines = text.splitlines()
+    # A heading inside an HTML comment is documentation, not a record: the shipped
+    # templates show the record format that way, and it must not parse as an entry.
+    visible, in_comment = [], False
+    for line in lines:
+        visible.append(not in_comment)
+        if "<!--" in line and "-->" not in line:
+            in_comment = True
+        elif in_comment and "-->" in line:
+            in_comment = False
+
+    counts = {lv: sum(1 for i, l in enumerate(lines)
+                      if visible[i] and re.match(rf"^#{{{lv}}}\s+\S", l)) for lv in (2, 3, 4)}
+    level = max(counts, key=lambda lv: (counts[lv], -lv))
+    if counts[level] == 0:
+        return text, []
+
+    pat = re.compile(rf"^#{{{level}}}\s+\S")
+    preamble: List[str] = []
+    sections: List[List] = []
+    for i, line in enumerate(lines):
+        if visible[i] and pat.match(line):
+            sections.append([line, []])
+        elif sections:
+            sections[-1][1].append(line)
+        else:
+            preamble.append(line)
+    return "\n".join(preamble).strip(), [(h, "\n".join(b).rstrip()) for h, b in sections]
+
+
+def _is_superseded(section: Tuple[str, str]) -> bool:
+    """An ADR that names its replacement is history, not current guidance."""
+    heading, body = section
+    return "superseded by" in body.lower() or "[superseded]" in heading.lower()
+
+
+def clip_decisions(text: str, limit: int) -> str:
+    """Keep every ADR *title*, expand bodies newest-first until the budget runs out.
+
+    Positional clipping is wrong for ADRs: they are not news, and the oldest entries
+    are usually the load-bearing invariants. Titles cost ~60 chars each, so the full
+    list of decisions stays visible indefinitely and any body can still be read from
+    the file.
+    """
+    preamble, sections = _split_sections(text)
+    if not sections:
+        return text
+
+    live = [i for i in range(len(sections)) if not _is_superseded(sections[i])]
+    if len(live) == len(sections) and len(text) <= limit:
+        return text
+
+    used = len(preamble) + sum(len(h) + 2 for h, _ in sections) + 160
+    expanded = set()
+    for idx in reversed(live):  # newest live entries are appended last
+        body = sections[idx][1]
+        if used + len(body) + 2 > limit:
+            continue
+        used += len(body) + 2
+        expanded.add(idx)
+
+    out = [preamble] if preamble else []
+    for idx, (heading, body) in enumerate(sections):
+        if idx in expanded:
+            out.append(f"{heading}\n{body}".rstrip())
+        elif idx not in live:
+            out.append(f"{heading}\n- _(superseded — kept for history, read `.mimori/decisions.md`)_")
+        else:
+            out.append(f"{heading}\n- _(body trimmed to budget — read `.mimori/decisions.md`)_")
+    hidden = len(sections) - len(expanded)
+    if hidden:
+        superseded = len(sections) - len(live)
+        note = f"_{hidden} of {len(sections)} decisions shown by title only"
+        if superseded:
+            note += f" ({superseded} superseded)"
+        out.append(note + "; no decision is hidden entirely._")
+    return "\n\n".join(out)
+
+
+MEMORY_PRIORITY = (
+    ("invariant", "rule", "architecture", "constraint"),
+    ("gotcha", "vocab", "domain", "glossar", "edge"),
+)
+
+
+def _memory_priority(heading: str) -> int:
+    low = heading.lower()
+    for rank, keywords in enumerate(MEMORY_PRIORITY):
+        if any(k in low for k in keywords):
+            return rank
+    return len(MEMORY_PRIORITY)  # epics/status: the most perishable, trimmed first
+
+
+def clip_memory(text: str, limit: int) -> str:
+    """Trim by section priority, not file position.
+
+    Invariants and gotchas outlive "active epics", but epics sit first in the
+    template — clipping from the top keeps the changelog and drops the durable rules.
+    """
+    preamble, sections = _split_sections(text)
+    if not sections or len(text) <= limit:
+        return text
+
+    order = sorted(range(len(sections)), key=lambda i: (_memory_priority(sections[i][0]), i))
+    used = len(preamble) + sum(len(sections[i][0]) + 2 for i in range(len(sections))) + 160
+    kept: Dict[int, str] = {}
+    for i in order:
+        body = sections[i][1]
+        room = limit - used
+        if len(body) + 2 <= room:
+            kept[i] = body
+            used += len(body) + 2
+        elif room > 300:
+            # Partially include rather than skip: a greedy fill would drop the single
+            # most valuable section whenever it is the largest, and backfill with
+            # lower-priority ones. Priority has to dominate size.
+            cut = body[:room - 90]
+            kept[i] = cut[:cut.rfind("\n") if "\n" in cut else len(cut)].rstrip() + \
+                "\n- _(section truncated to budget — read `.mimori/memory.md`)_"
+            used = limit
+        else:
+            break
+
+    out = [preamble] if preamble else []
+    for idx, (heading, body) in enumerate(sections):
+        out.append(f"{heading}\n{kept[idx]}".rstrip() if idx in kept
+                   else f"{heading}\n- _(section trimmed to budget — read `.mimori/memory.md`)_")
+    dropped = len(sections) - len(kept)
+    if dropped:
+        out.append(f"_{dropped} of {len(sections)} sections trimmed, lowest-priority first "
+                   f"(invariants and gotchas are kept ahead of status)._")
+    return "\n\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# task / todo / idea tracking
+# --------------------------------------------------------------------------
+
+RE_TASK_LINE = re.compile(r"^(\s*[-*]\s+)\[([ xX/\\?-])\]\s*(.*)$")
+RE_DATE = re.compile(r"\b\((\d{4}-\d{2}-\d{2})\)\s*$")
+RE_PRIO = re.compile(r"\b\((high|med|low|urgent|p[0-3])\)\b", re.IGNORECASE)
+RE_TAG = re.compile(r"\[([a-zA-Z0-9_\-]+)\]")
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None and os.environ.get("TERM") != "dumb"
+
+
+def colorize(text: str, code: str, plain: bool = False) -> str:
+    if plain or not USE_COLOR or not code:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+class TaskItem:
+    def __init__(
+        self,
+        raw_line: str,
+        section_idx: int,
+        section_name: str,
+        status: str,
+        text: str,
+        prio: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        completed_date: Optional[str] = None,
+    ):
+        self.raw_line = raw_line
+        self.section_idx = section_idx
+        self.section_name = section_name
+        self.status = status  # 'in_progress', 'todo', 'idea', 'done'
+        self.text = text
+        self.prio = prio
+        self.tags = tags or []
+        self.completed_date = completed_date
+        self.index: int = 0
+
+
+def parse_tasks_document(content: str) -> Tuple[str, List[Tuple[str, List[TaskItem | str]]]]:
+    preamble, raw_sections = _split_sections(content)
+    sections: List[Tuple[str, List[TaskItem | str]]] = []
+
+    for s_idx, (heading, body) in enumerate(raw_sections):
+        head_low = heading.lower()
+        items: List[TaskItem | str] = []
+        for line in body.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            m = RE_TASK_LINE.match(line)
+            if m:
+                box = m.group(2)
+                rest = m.group(3).strip()
+
+                if box in ("x", "X"):
+                    status = "done"
+                elif box in ("/", "-", "\\"):
+                    status = "in_progress"
+                elif box == "?":
+                    status = "idea"
+                else:
+                    if "in progress" in head_low or "in-progress" in head_low or "current" in head_low:
+                        status = "in_progress"
+                    elif "idea" in head_low or "backlog" in head_low:
+                        status = "idea"
+                    elif "complete" in head_low or "done" in head_low:
+                        status = "done"
+                    else:
+                        status = "todo"
+
+                completed_date = None
+                d_match = RE_DATE.search(rest)
+                if d_match:
+                    completed_date = d_match.group(1)
+                    rest = (rest[:d_match.start()] + " " + rest[d_match.end():]).strip()
+
+                prio = None
+                p_match = RE_PRIO.search(rest)
+                if p_match:
+                    prio = p_match.group(1).lower()
+                    rest = (rest[:p_match.start()] + " " + rest[p_match.end():]).strip()
+
+                tags = RE_TAG.findall(rest)
+                clean_text = RE_TAG.sub("", rest).strip()
+                clean_text = re.sub(r"\s+", " ", clean_text)
+
+                item = TaskItem(
+                    raw_line=line,
+                    section_idx=s_idx,
+                    section_name=heading,
+                    status=status,
+                    text=clean_text or rest,
+                    prio=prio,
+                    tags=tags,
+                    completed_date=completed_date,
+                )
+                items.append(item)
+            elif line_str.startswith(("- ", "* ")) and not line_str.startswith(("- (", "* (")):
+                clean_bullet = line_str[2:].strip()
+                if "in progress" in head_low:
+                    status = "in_progress"
+                elif "idea" in head_low or "backlog" in head_low:
+                    status = "idea"
+                elif "complete" in head_low or "done" in head_low:
+                    status = "done"
+                else:
+                    status = "todo"
+                item = TaskItem(
+                    raw_line=line,
+                    section_idx=s_idx,
+                    section_name=heading,
+                    status=status,
+                    text=clean_bullet,
+                )
+                items.append(item)
+            else:
+                items.append(line)
+        sections.append((heading, items))
+
+    return preamble, sections
+
+
+def get_all_tasks(sections: List[Tuple[str, List[TaskItem | str]]]) -> List[TaskItem]:
+    all_tasks: List[TaskItem] = []
+    idx = 1
+    for heading, items in sections:
+        for it in items:
+            if isinstance(it, TaskItem):
+                it.index = idx
+                idx += 1
+                all_tasks.append(it)
+    return all_tasks
+
+
+def serialize_tasks_document(preamble: str, sections: List[Tuple[str, List[TaskItem | str]]]) -> str:
+    out = []
+    if preamble.strip():
+        out.append(preamble.strip())
+
+    for heading, items in sections:
+        out.append("")
+        out.append(heading.strip())
+        for it in items:
+            if isinstance(it, str):
+                if it.strip():
+                    out.append(it)
+            else:
+                box = (
+                    "[x]" if it.status == "done"
+                    else "[/]" if it.status == "in_progress"
+                    else "[?]" if it.status == "idea"
+                    else "[ ]"
+                )
+                prio_str = f"({it.prio}) " if it.prio else ""
+                tags_str = "".join(f"[{t}] " for t in it.tags)
+                date_str = f" ({it.completed_date})" if it.completed_date and it.status == "done" else ""
+                out.append(f"- {box} {prio_str}{tags_str}{it.text}{date_str}".strip())
+
+    return "\n".join(out).strip() + "\n"
+
+
+def find_matching_task(all_tasks: List[TaskItem], query: str) -> Tuple[Optional[TaskItem], Optional[str]]:
+    query = query.strip()
+    if not query:
+        return None, "No task identifier or search term specified."
+
+    num_str = query.lstrip("#")
+    if num_str.isdigit():
+        target_idx = int(num_str)
+        for t in all_tasks:
+            if t.index == target_idx:
+                return t, None
+        return None, f"Task #{target_idx} not found."
+
+    q_low = query.lower()
+    exact_matches = [t for t in all_tasks if t.text.lower() == q_low]
+    if len(exact_matches) == 1:
+        return exact_matches[0], None
+
+    sub_matches = [
+        t for t in all_tasks
+        if q_low in t.text.lower() or any(q_low in tag.lower() for tag in t.tags)
+    ]
+    if len(sub_matches) == 1:
+        return sub_matches[0], None
+    elif len(sub_matches) > 1:
+        active = [t for t in sub_matches if t.status != "done"]
+        if len(active) == 1:
+            return active[0], None
+        return None, f"Ambiguous query '{query}' matched {len(sub_matches)} tasks. Please specify an exact task ID (e.g. #{sub_matches[0].index})."
+
+    return None, f"No task matching '{query}' found."
+
+
+def ensure_task_section(sections: List[Tuple[str, List[TaskItem | str]]], target_type: str) -> int:
+    for idx, (heading, _) in enumerate(sections):
+        low = heading.lower()
+        if target_type == "in_progress" and ("in progress" in low or "in-progress" in low or "current" in low):
+            return idx
+        if target_type == "active" and ("active" in low or "todo" in low or "pending" in low):
+            return idx
+        if target_type == "ideas" and ("idea" in low or "backlog" in low or "future" in low):
+            return idx
+        if target_type == "completed" and ("complete" in low or "done" in low or "finished" in low):
+            return idx
+
+    heading_map = {
+        "in_progress": "## In Progress",
+        "active": "## Active Tasks",
+        "ideas": "## Future Ideas & Backlog",
+        "completed": "## Completed",
+    }
+    new_heading = heading_map.get(target_type, f"## {target_type.title()}")
+    sections.append((new_heading, []))
+    return len(sections) - 1
+
+
+def clip_tasks(text: str, limit: int) -> str:
+    """Smart priority budgeting for tasks in context snapshots (mimori dump)."""
+    preamble, sections = parse_tasks_document(text)
+    if not sections:
+        return text
+
+    in_progress_items: List[TaskItem] = []
+    active_items: List[TaskItem] = []
+    idea_items: List[TaskItem] = []
+    done_items: List[TaskItem] = []
+
+    for heading, items in sections:
+        for it in items:
+            if isinstance(it, TaskItem):
+                if it.status == "in_progress":
+                    in_progress_items.append(it)
+                elif it.status == "idea":
+                    idea_items.append(it)
+                elif it.status == "done":
+                    done_items.append(it)
+                else:
+                    active_items.append(it)
+
+    out_sections: List[str] = []
+    used = 100
+
+    if in_progress_items:
+        lines = ["### In Progress"]
+        for it in in_progress_items:
+            prio = f"({it.prio}) " if it.prio else ""
+            tags = "".join(f"[{t}] " for t in it.tags)
+            lines.append(f"- [/] {prio}{tags}{it.text}".strip())
+        block = "\n".join(lines)
+        out_sections.append(block)
+        used += len(block) + 2
+
+    if active_items:
+        lines = ["### Active Tasks"]
+        kept_active = 0
+        for it in active_items:
+            prio = f"({it.prio}) " if it.prio else ""
+            tags = "".join(f"[{t}] " for t in it.tags)
+            line = f"- [ ] {prio}{tags}{it.text}".strip()
+            if used + len(line) + 2 > limit and kept_active > 0:
+                break
+            lines.append(line)
+            used += len(line) + 2
+            kept_active += 1
+        if kept_active < len(active_items):
+            lines.append(f"- _({len(active_items) - kept_active} more active tasks trimmed to budget — read `.mimori/tasks.md`)_")
+        out_sections.append("\n".join(lines))
+
+    if idea_items and used < limit - 100:
+        lines = ["### Future Ideas & Backlog"]
+        kept_ideas = 0
+        for it in idea_items:
+            tags = "".join(f"[{t}] " for t in it.tags)
+            line = f"- [?] {tags}{it.text}".strip()
+            if used + len(line) + 2 > limit and kept_ideas > 0:
+                break
+            lines.append(line)
+            used += len(line) + 2
+            kept_ideas += 1
+        if kept_ideas < len(idea_items):
+            lines.append(f"- _({len(idea_items) - kept_ideas} ideas trimmed to budget — read `.mimori/tasks.md`)_")
+        out_sections.append("\n".join(lines))
+    elif idea_items:
+        out_sections.append(f"### Future Ideas & Backlog\n- _({len(idea_items)} backlog ideas trimmed to budget — read `.mimori/tasks.md`)_")
+
+    if done_items:
+        recent_done = done_items[-2:] if (limit - used > 300) else []
+        lines = ["### Completed"]
+        for it in recent_done:
+            date_str = f" ({it.completed_date})" if it.completed_date else ""
+            lines.append(f"- [x] {it.text}{date_str}")
+        hidden_done = len(done_items) - len(recent_done)
+        if hidden_done > 0:
+            lines.append(f"- _({hidden_done} completed task{'s' if hidden_done > 1 else ''} hidden — read `.mimori/tasks.md`)_")
+        out_sections.append("\n".join(lines))
+
+    return "\n\n".join(out_sections)
+
+
+def resolve_budget(value: Optional[str], default: int) -> int:
+    """Accept a raw character count or a preset name; env var sets the session default."""
+    raw = value or os.environ.get("MIMORI_BUDGET") or os.environ.get("AGENT_CTX_BUDGET") or "default"
+    if raw == "default":
+        return default
+    if raw.isdigit():
+        return int(raw)
+    if raw in BUDGET_PRESETS:
+        return BUDGET_PRESETS[raw]
+    names = "/".join(["default", *BUDGET_PRESETS])
+    raise SystemExit(f"--budget: expected a character count or one of {names}, got {raw!r}")
+
+
+def resolve_focus(value: Optional[str]) -> List[str]:
+    """Comma-separated focus tokens from flag or env (MIMORI_FOCUS / AGENT_CTX_FOCUS)."""
+    raw = value or os.environ.get("MIMORI_FOCUS") or os.environ.get("AGENT_CTX_FOCUS") or ""
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    root = find_repo_root()
+    ensure_git_repo(root)
+    mimori_dir = get_mimori_dir(root)
+    mimori_dir.mkdir(exist_ok=True)
+
+    for name, template in (
+        ("memory.md", DEFAULT_MEMORY_TEMPLATE),
+        ("decisions.md", DEFAULT_DECISIONS_TEMPLATE),
+        ("tasks.md", DEFAULT_TASKS_TEMPLATE),
+    ):
+        target = mimori_dir / name
+        if not target.exists():
+            target.write_text(template, encoding="utf-8")
+            print(f"Created {target.relative_to(root)}")
+        else:
+            print(f"Already exists: {target.relative_to(root)}")
+
+    act_file = mimori_dir / "activity.jsonl"
+    if not act_file.exists():
+        act_file.touch()
+        print(f"Created {act_file.relative_to(root)}")
+
+    map_file = mimori_dir / "repo_map.md"
+    map_file.write_text(generate_repo_map(root), encoding="utf-8")
+    print(f"Generated {map_file.relative_to(root)}")
+    print("Initialization complete.")
+    return 0
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    root = find_repo_root()
+    map_content = generate_repo_map(root, budget=resolve_budget(args.budget, MAP_BUDGET_DEFAULT),
+                                    focus=resolve_focus(getattr(args, "focus", None)))
+
+    if args.stdout:
+        print(map_content)
+    else:
+        mimori_dir = get_mimori_dir(root)
+        mimori_dir.mkdir(exist_ok=True)
+        map_file = mimori_dir / "repo_map.md"
+        map_file.write_text(map_content, encoding="utf-8")
+        print(f"Updated {map_file.relative_to(root)}")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    root = find_repo_root()
+    mimori_dir = get_mimori_dir(root)
+    mimori_dir.mkdir(exist_ok=True)
+    act_file = mimori_dir / "activity.jsonl"
+
+    files_list = [f.strip() for f in args.files.split(",") if f.strip()] if args.files else []
+    record = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "action": args.action,
+        "summary": args.summary,
+        "files": files_list,
+        "branch": get_git_branch(root),
+        "author": os.environ.get("AGENT_NAME", "agent"),
+    }
+
+    with open(act_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"Logged action '{args.action}' to {act_file.relative_to(root)}")
+    if len(args.summary) > ACTIVITY_SUMMARY_LIMIT:
+        print(f"Note: summary is {len(args.summary)} chars — dump's Recent Activity elides past "
+              f"{ACTIVITY_SUMMARY_LIMIT}. Keep it a high-level one-liner (what changed and why it "
+              f"matters); save step-by-step detail for the commit message.")
+    print("Reminder: if this introduced a new invariant, gotcha, or architecture decision, update .mimori/memory.md or .mimori/decisions.md.")
+    return 0
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    root = find_repo_root()
+    mimori_dir = get_mimori_dir(root)
+    act_file = mimori_dir / "activity.jsonl"
+    if not act_file.is_file():
+        print("No activity recorded yet.")
+        return 0
+
+    lines = act_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+    if not lines:
+        print("No activity recorded yet.")
+        return 0
+
+    records = []
+    for l in lines:
+        try:
+            records.append(json.loads(l))
+        except Exception:
+            continue
+
+    selected = records[-args.limit:] if args.limit > 0 else records
+    for r in reversed(selected):
+        ts = r.get("timestamp", "")[:19].replace("T", " ")
+        files = ", ".join(r.get("files", []))
+        print(f"[{ts}] ({r.get('branch') or 'unknown'}) {r.get('action', '')}")
+        print(f"  Summary: {r.get('summary', '')}")
+        if files:
+            print(f"  Files: {files}")
+        print()
+    return 0
+
+
+RE_INLINE_REF = re.compile(r"`([^`\n]+)`|\[([^\]]+)\]\(([^)]+)\)")
+
+
+def scan_stale_references(root: Path, all_paths: Set[str]) -> List[str]:
+    """Scan memory.md and tasks.md for dead file references and dormant (>60d) rules."""
+    mimori_dir = get_mimori_dir(root)
+    notices: List[str] = []
+    dead_refs: Set[str] = set()
+
+    all_paths_lower = {p.lower() for p in all_paths}
+    all_stems_lower = {Path(p).name.lower() for p in all_paths}
+
+    target_files = [
+        ("memory.md", mimori_dir / "memory.md"),
+        ("tasks.md", get_tasks_file(root)),
+    ]
+
+    for fname, fpath in target_files:
+        if not fpath.is_file():
+            continue
+        content = fpath.read_text(encoding="utf-8", errors="ignore")
+        for m in RE_INLINE_REF.finditer(content):
+            ref = (m.group(1) or m.group(3) or "").strip()
+            if not ref:
+                continue
+            if any(ch in ref for ch in ("*", "?", "!", "<", ">", "…", "...", "@", "$", "~", "{", "}", "%", "^")):
+                continue
+            if ref.startswith(("http://", "https://", "file://", "--", "-")):
+                continue
+            if " " in ref or "(" in ref or ")" in ref:
+                continue
+            if "/" in ref or any(ref.endswith(ext) for ext in CODE_EXTS | {".md", ".json", ".jsonl", ".sh", ".toml", ".yml", ".yaml"}):
+                clean_ref = ref.lstrip("./").split("#")[0].split(":")[0]
+                if not clean_ref:
+                    continue
+                if clean_ref.lower() not in all_paths_lower and clean_ref.lower() not in all_stems_lower:
+                    dead_refs.add(f"{fname}: '{clean_ref}' not found in repo")
+
+    for dr in sorted(dead_refs)[:4]:
+        notices.append(dr)
+    if len(dead_refs) > 4:
+        notices.append(f"... and {len(dead_refs) - 4} more dead references")
+
+    return notices
+
+
+def cmd_dump(args: argparse.Namespace) -> int:
+    root = find_repo_root()
+    ensure_git_repo(root)
+    mimori_dir = get_mimori_dir(root)
+    total = resolve_budget(getattr(args, "budget", None), DUMP_TOTAL_BUDGET)
+    # Prose stores each get a third; the map takes what is left. Scaling with the
+    # total is what makes a larger preset help every section, not just the map.
+    prose_budget = total // 3
+
+    out = [f"# Agent Context Snapshot ({root.name})\n"]
+
+    state = get_working_state(root)
+    if state:
+        out.append("## Working state\n")
+        out.append(state)
+        out.append("\n---\n")
+
+    stale_notices = scan_stale_references(root, set(list_files(root)))
+    if stale_notices:
+        decay_block = ["> [!NOTE]", "> **Decay Notice**: Stale/dead references detected in workspace memory:"]
+        for sn in stale_notices:
+            decay_block.append(f"> - {sn}")
+        out.append("\n".join(decay_block) + "\n\n---\n")
+
+    mem_file = mimori_dir / "memory.md"
+    if mem_file.is_file():
+        out.append("## Project Memory\n")
+        out.append(clip_memory(mem_file.read_text(encoding="utf-8", errors="ignore").strip(), prose_budget))
+        out.append("\n---\n")
+
+    dec_file = mimori_dir / "decisions.md"
+    if dec_file.is_file():
+        out.append("## Architecture Decisions\n")
+        out.append(clip_decisions(dec_file.read_text(encoding="utf-8", errors="ignore").strip(), prose_budget))
+        out.append("\n---\n")
+
+    tasks_file = get_tasks_file(root)
+    if tasks_file.is_file():
+        tasks_text = tasks_file.read_text(encoding="utf-8", errors="ignore").strip()
+        if tasks_text:
+            clipped_tasks = clip_tasks(tasks_text, prose_budget)
+            if clipped_tasks.strip():
+                out.append("## Tasks & Backlog\n")
+                out.append(clipped_tasks)
+                out.append("\n---\n")
+
+    # Build the activity tail before the map so the map's share is what is genuinely
+    # left over — otherwise DUMP_TOTAL_BUDGET would not be a total at all.
+    tail: List[str] = []
+    act_file = mimori_dir / "activity.jsonl"
+    if act_file.is_file():
+        lines = act_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+        if lines:
+            tail.append("## Recent Activity\n")
+            entries: List[str] = []
+            elided = False
+            for l in lines[-5:]:
+                try:
+                    r = json.loads(l)
+                except Exception:
+                    continue
+                ts = r.get("timestamp", "")[:10]
+                summary = r.get("summary", "")
+                if len(summary) > ACTIVITY_SUMMARY_LIMIT:
+                    summary = _elide(summary, ACTIVITY_SUMMARY_LIMIT)
+                    elided = True
+                files = r.get("files", [])
+                if len(files) > ACTIVITY_FILES_SHOWN:
+                    files_str = ", ".join(files[:ACTIVITY_FILES_SHOWN]) + f", +{len(files) - ACTIVITY_FILES_SHOWN} more"
+                    elided = True
+                else:
+                    files_str = ", ".join(files) or "none"
+                entries.append(f"- **{ts} [{r.get('action')}]**: {summary} (files: {files_str})")
+
+            # Keep the most recent entries first when the budget can't fit all of them.
+            kept: List[str] = []
+            used = 0
+            for entry in reversed(entries):
+                if used + len(entry) + 1 > DUMP_ACTIVITY_BUDGET:
+                    break
+                kept.append(entry)
+                used += len(entry) + 1
+            dropped = len(entries) - len(kept)
+            kept.reverse()
+            tail.extend(kept)
+            if dropped or elided:
+                tail.append(f"_{len(kept)} of {len(entries)} entries shown"
+                             f"{', some elided' if elided else ''} — read `.mimori/activity.jsonl`._")
+
+    spent = sum(len(chunk) for chunk in out) + sum(len(chunk) for chunk in tail)
+    out.append("## Structure & Symbol Map (live)\n")
+    out.append(generate_repo_map(root, budget=max(DUMP_MAP_MIN_BUDGET, total - spent),
+                                 focus=resolve_focus(getattr(args, "focus", None))).strip())
+    out.append("\n---\n")
+    out.extend(tail)
+
+    rendered = "\n".join(out)
+
+    out_target = getattr(args, "file", None)
+    if out_target is not None:
+        if out_target == "" or out_target is True or out_target is None or isinstance(out_target, bool):
+            commit_id = get_repo_identifier(root)
+            temp_dir = get_user_temp_dir()
+            prune_user_temp_dir(temp_dir, current_repo=root.name)
+            dest_file = temp_dir / f"ctx-{root.name}-{commit_id}.md"
+        else:
+            dest_file = Path(out_target).resolve()
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+        dest_file.write_text(rendered, encoding="utf-8")
+        print(f"Wrote context snapshot to {dest_file}")
+        return 0
+
+    print(rendered)
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    temp_dir = get_user_temp_dir()
+    if not temp_dir.is_dir():
+        print(f"Mimori cache directory {temp_dir} does not exist.")
+        return 0
+
+    if getattr(args, "all", False):
+        deleted = 0
+        freed = 0
+        for p in temp_dir.glob("ctx-*.md"):
+            try:
+                sz = p.stat().st_size
+                p.unlink(missing_ok=True)
+                deleted += 1
+                freed += sz
+            except OSError:
+                pass
+        print(f"Cleared all cached snapshots: {deleted} files removed ({format_bytes(freed)} freed) from {temp_dir}")
+        return 0
+
+    pruned_count, pruned_bytes = prune_user_temp_dir(temp_dir)
+    print(f"Pruned stale snapshots: {pruned_count} files removed ({format_bytes(pruned_bytes)} freed) from {temp_dir}")
+    return 0
+
+
+def cmd_todo(args: argparse.Namespace) -> int:
+    root = find_repo_root()
+    mimori_dir = get_mimori_dir(root)
+    mimori_dir.mkdir(exist_ok=True)
+    tasks_file = get_tasks_file(root)
+
+    action = getattr(args, "action", "list") or "list"
+    target_raw = getattr(args, "target", [])
+    target = " ".join(target_raw).strip() if isinstance(target_raw, list) else str(target_raw).strip()
+
+    valid_actions = {"list", "ls", "add", "start", "done", "reopen", "rm", "remove"}
+    if action not in valid_actions:
+        if target:
+            target = f"{action} {target}".strip()
+        else:
+            target = action
+        action = "list"
+
+    if not tasks_file.exists():
+        if action == "add":
+            ensure_git_repo(root)
+            tasks_file.write_text(DEFAULT_TASKS_TEMPLATE, encoding="utf-8")
+        else:
+            print(f"No tasks tracked yet in {mimori_dir.relative_to(root)}/tasks.md.")
+            print("Run 'mimori init' or 'mimori todo add <description>' to start tracking tasks.")
+            return 0
+
+    content = tasks_file.read_text(encoding="utf-8", errors="ignore")
+    preamble, sections = parse_tasks_document(content)
+    all_tasks = get_all_tasks(sections)
+
+    if action in ("list", "ls"):
+        status_filter = getattr(args, "status", "all")
+        tag_filters = [t.lower() for t in getattr(args, "tag", []) if t]
+        plain = getattr(args, "plain", False)
+        search_query = target.lower() if target else ""
+
+        filtered_sections: List[Tuple[str, List[TaskItem]]] = []
+        for heading, items in sections:
+            matching_items = []
+            for it in items:
+                if not isinstance(it, TaskItem):
+                    continue
+                if status_filter != "all" and it.status != status_filter:
+                    continue
+                if tag_filters and not any(tf in [t.lower() for t in it.tags] for tf in tag_filters):
+                    continue
+                if search_query and (search_query not in it.text.lower() and not any(search_query in t.lower() for t in it.tags)):
+                    continue
+                matching_items.append(it)
+            if matching_items:
+                filtered_sections.append((heading, matching_items))
+
+        if not filtered_sections:
+            if search_query or status_filter != "all" or tag_filters:
+                print("No tasks matching filters.")
+            else:
+                print("No active tasks.")
+            return 0
+
+        print(colorize(f"# Tasks & Backlog ({tasks_file.relative_to(root)})", "1;37", plain=plain))
+        print()
+
+        for heading, items in filtered_sections:
+            head_low = heading.lower()
+            if "in progress" in head_low or "in-progress" in head_low:
+                hdr_color = "1;36"
+            elif "idea" in head_low or "backlog" in head_low:
+                hdr_color = "1;35"
+            elif "complete" in head_low or "done" in head_low:
+                hdr_color = "1;32"
+            else:
+                hdr_color = "1;33"
+
+            is_completed_section = "complete" in head_low or "done" in head_low
+            hidden_count = 0
+            display_items = items
+            if is_completed_section and len(items) > 5 and status_filter == "all" and not search_query:
+                hidden_count = len(items) - 5
+                display_items = items[-5:]
+
+            hdr_text = heading.lstrip("#").strip()
+            if hidden_count > 0:
+                hdr_text += f" ({len(display_items)} shown, {hidden_count} hidden)"
+            print(colorize(f"[{hdr_text}]", hdr_color, plain=plain))
+
+            for it in display_items:
+                idx_str = colorize(f"#{it.index}", "2", plain=plain)
+                if it.status == "in_progress":
+                    box_str = colorize("[/]", "1;36", plain=plain)
+                elif it.status == "idea":
+                    box_str = colorize("[?]", "1;35", plain=plain)
+                elif it.status == "done":
+                    box_str = colorize("[x]", "1;32", plain=plain)
+                else:
+                    box_str = colorize("[ ]", "1;33", plain=plain)
+
+                prio_str = ""
+                if it.prio:
+                    p_code = "1;31" if it.prio in ("high", "urgent", "p0", "p1") else "1;33" if it.prio in ("med", "p2") else "1;34"
+                    prio_str = colorize(f"({it.prio}) ", p_code, plain=plain)
+
+                tags_str = ""
+                if it.tags:
+                    tags_str = "".join(colorize(f"[{t}]", "36", plain=plain) + " " for t in it.tags)
+
+                date_str = ""
+                if it.completed_date and it.status == "done":
+                    date_str = colorize(f" ({it.completed_date})", "2", plain=plain)
+
+                print(f"  {idx_str} {box_str} {prio_str}{tags_str}{it.text}{date_str}")
+            print()
+        return 0
+
+    elif action == "add":
+        if not target:
+            print("Error: task description required. Usage: mimori todo add <description> [--prio high|med|low] [--tag tag] [--start] [--idea]")
+            return 1
+
+        is_idea = getattr(args, "idea", False)
+        is_start = getattr(args, "start", False)
+        prio = getattr(args, "prio", None)
+        tags = getattr(args, "tag", []) or []
+
+        if is_idea:
+            target_type = "ideas"
+            status = "idea"
+        elif is_start:
+            target_type = "in_progress"
+            status = "in_progress"
+        else:
+            target_type = "active"
+            status = "todo"
+
+        s_idx = ensure_task_section(sections, target_type)
+        new_item = TaskItem(
+            raw_line="",
+            section_idx=s_idx,
+            section_name=sections[s_idx][0],
+            status=status,
+            text=target,
+            prio=prio,
+            tags=tags,
+        )
+        sections[s_idx][1].append(new_item)
+        tasks_file.write_text(serialize_tasks_document(preamble, sections), encoding="utf-8")
+        all_tasks = get_all_tasks(sections)
+        print(f"Added task #{new_item.index} to {sections[s_idx][0].lstrip('#').strip()}: {new_item.text}")
+        return 0
+
+    elif action == "start":
+        task, err = find_matching_task(all_tasks, target)
+        if err:
+            print(f"Error: {err}")
+            return 1
+        sections[task.section_idx][1].remove(task)
+        dest_idx = ensure_task_section(sections, "in_progress")
+        task.status = "in_progress"
+        task.completed_date = None
+        task.section_idx = dest_idx
+        task.section_name = sections[dest_idx][0]
+        sections[dest_idx][1].append(task)
+        tasks_file.write_text(serialize_tasks_document(preamble, sections), encoding="utf-8")
+        print(f"Started task #{task.index}: {task.text} (moved to In Progress)")
+        return 0
+
+    elif action == "done":
+        task, err = find_matching_task(all_tasks, target)
+        if err:
+            print(f"Error: {err}")
+            return 1
+        sections[task.section_idx][1].remove(task)
+        dest_idx = ensure_task_section(sections, "completed")
+        task.status = "done"
+        task.completed_date = datetime.date.today().isoformat()
+        task.section_idx = dest_idx
+        task.section_name = sections[dest_idx][0]
+        sections[dest_idx][1].append(task)
+        tasks_file.write_text(serialize_tasks_document(preamble, sections), encoding="utf-8")
+        print(f"Completed task #{task.index}: {task.text} (moved to Completed)")
+        return 0
+
+    elif action == "reopen":
+        task, err = find_matching_task(all_tasks, target)
+        if err:
+            print(f"Error: {err}")
+            return 1
+        sections[task.section_idx][1].remove(task)
+        dest_idx = ensure_task_section(sections, "active")
+        task.status = "todo"
+        task.completed_date = None
+        task.section_idx = dest_idx
+        task.section_name = sections[dest_idx][0]
+        sections[dest_idx][1].append(task)
+        tasks_file.write_text(serialize_tasks_document(preamble, sections), encoding="utf-8")
+        print(f"Reopened task #{task.index}: {task.text} (moved to Active Tasks)")
+        return 0
+
+    elif action in ("rm", "remove"):
+        task, err = find_matching_task(all_tasks, target)
+        if err:
+            print(f"Error: {err}")
+            return 1
+        sections[task.section_idx][1].remove(task)
+        tasks_file.write_text(serialize_tasks_document(preamble, sections), encoding="utf-8")
+        print(f"Removed task #{task.index}: {task.text}")
+        return 0
+
+    return 0
+
+
+def cmd_idea(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", "list") or "list"
+    target_raw = getattr(args, "target", [])
+    target = " ".join(target_raw).strip() if isinstance(target_raw, list) else str(target_raw).strip()
+
+    if action in ("add",):
+        setattr(args, "idea", True)
+        return cmd_todo(args)
+    elif action in ("list", "ls"):
+        setattr(args, "status", "idea")
+        return cmd_todo(args)
+    elif action == "promote":
+        root = find_repo_root()
+        tasks_file = get_tasks_file(root)
+        if not tasks_file.exists():
+            print("No tasks or ideas tracked yet.")
+            return 1
+        content = tasks_file.read_text(encoding="utf-8", errors="ignore")
+        preamble, sections = parse_tasks_document(content)
+        all_tasks = get_all_tasks(sections)
+        task, err = find_matching_task(all_tasks, target)
+        if err:
+            print(f"Error: {err}")
+            return 1
+        sections[task.section_idx][1].remove(task)
+        dest_idx = ensure_task_section(sections, "active")
+        task.status = "todo"
+        task.completed_date = None
+        task.section_idx = dest_idx
+        task.section_name = sections[dest_idx][0]
+        sections[dest_idx][1].append(task)
+        tasks_file.write_text(serialize_tasks_document(preamble, sections), encoding="utf-8")
+        print(f"Promoted idea #{task.index} to Active Tasks: {task.text}")
+        return 0
+    elif action in ("rm", "remove"):
+        return cmd_todo(args)
+    else:
+        setattr(args, "status", "idea")
+        return cmd_todo(args)
+
+
+# --------------------------------------------------------------------------
+# self-test
+# --------------------------------------------------------------------------
+
+def _build_fixture(root: Path) -> None:
+    (root / "src").mkdir()
+    (root / ".mimori").mkdir()
+    (root / "src" / "core.py").write_text(
+        '"""Core engine for the fixture."""\n'
+        "class CoreApp:\n"
+        "    def run(self, mode: str = 'fast') -> bool:\n"
+        "        return True\n"
+        "    def _private(self):\n"
+        "        pass\n"
+        "\n"
+        "async def helper(a, b=2, *rest) -> int:\n"
+        "    return 0\n"
+    )
+    (root / "src" / "leaf.py").write_text("def unused_leaf():\n    pass\n")
+    tool = root / "bin_tool"
+    tool.write_text("#!/usr/bin/env python3\ndef extensionless_main():\n    pass\n")
+    tool.chmod(0o755)
+    for name in ("one", "two", "three"):
+        (root / "src" / f"{name}.py").write_text(f"from src.core import CoreApp\n\ndef {name}():\n    pass\n")
+    (root / "src" / "index.ts").write_text(
+        "import { CoreApp } from './widget';\nexport function startServer() {}\nexport class Handler {}\n"
+    )
+    (root / "src" / "widget.ts").write_text("export class Widget {}\n")
+    # tsconfig path aliases: the dominant import style in aliased JS/TS projects.
+    (root / "tsconfig.json").write_text(
+        '{\n  // a comment, because tsconfig is JSONC\n'
+        '  "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } },\n}\n'
+    )
+    (root / "src" / "shared.ts").write_text("export const shared = 1;\n")
+    app = root / "src" / "app" / "dash"
+    app.mkdir(parents=True)
+    (app / "page.tsx").write_text(
+        'import { shared } from "@/shared";\nimport { Widget } from "@/widget";\n'
+        "export default function Page() {}\n"
+    )
+    (root / "src" / "app" / "layout.tsx").write_text(
+        'import { shared } from "@/shared";\nexport default function Layout() {}\n'
+    )
+    (root / ".mimori" / "memory.md").write_text(DEFAULT_MEMORY_TEMPLATE)
+    (root / ".mimori" / "decisions.md").write_text(DEFAULT_DECISIONS_TEMPLATE)
+    (root / ".mimori" / "tasks.md").write_text(DEFAULT_TASKS_TEMPLATE)
+
+
+def _dump_to_string(root: Path) -> str:
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_dump(argparse.Namespace())
+        return buf.getvalue()
+    finally:
+        os.chdir(old_cwd)
+
+
+def _test_symbols_and_graph(root: Path) -> None:
+    content = generate_repo_map(root)
+
+    assert "class CoreApp" in content, "python classes should appear"
+    assert "run(mode: str='fast') -> bool" in content, f"signatures must be rendered, got:\n{content}"
+    assert "async helper(a, b=2, *rest) -> int" in content, "async + full signature must be rendered"
+    assert "_private" not in content, "private methods should be filtered out"
+    assert "export function startServer" in content, "generic-language symbols should appear"
+    assert '"Core engine for the fixture."' in content, "module docstring should be surfaced"
+
+    core_line = next(l for l in content.splitlines() if l.startswith("`src/core.py`"))
+    assert ":2 " in content and ":8 " in content, f"line numbers must be emitted:\n{content}"
+    assert "← one, three, two" in core_line, f"in-degree importers must be listed, got: {core_line}"
+
+    assert content.index("src/core.py") < content.index("src/leaf.py"), \
+        "imported modules must rank above unimported leaves"
+    widget_line = next(l for l in content.splitlines() if l.startswith("`src/widget.ts`"))
+    assert "src/index" in widget_line and "dash/page" in widget_line, \
+        f"relative and aliased imports must both produce edges, and generic stems must be "\
+        f"qualified by their directory, got: {widget_line}"
+    assert "extensionless_main" in content, \
+        "extensionless executables should be parsed via their shebang"
+
+    shared_line = next(l for l in content.splitlines() if l.startswith("`src/shared.ts`"))
+    assert "app/layout" in shared_line and "dash/page" in shared_line, \
+        f"tsconfig path aliases (@/x) must produce graph edges, got: {shared_line}"
+    assert "export default function Page" in content, \
+        "`export default function` (the Next.js page form) must be captured as a symbol"
+
+    entry_block = content.split("## Core modules")[0]
+    assert "src/app/dash/page.tsx" in entry_block and "src/app/layout.tsx" in entry_block, \
+        "file-system route files should be detected as entry points"
+    assert "src/index.ts" not in entry_block, \
+        "barrel index files must NOT be treated as entry points"
+
+
+def _test_budget_is_honest(root: Path) -> None:
+    tiny = generate_repo_map(root, budget=400)
+    assert "budget" in tiny and "collapsed" in tiny, f"truncation must be announced:\n{tiny}"
+    header_total = int(re.search(r"^(\d+) files", tiny, re.M).group(1))
+    listed = len(re.findall(r"^`", tiny, re.M))
+    assert listed < header_total, "tiny budget should actually reduce detail"
+    assert "Detailed" in tiny, "must state how many of the total were detailed"
+
+
+def _test_git_integration(root: Path) -> None:
+    if subprocess.run(["git", "--version"], capture_output=True).returncode != 0:
+        print("  (skipped git checks: git unavailable)")
+        return
+
+    for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(root), *cmd], capture_output=True, check=True)
+    (root / ".gitignore").write_text("*.jsonl\n!keep/important.jsonl\nlogs/debug.txt\ntmp*\n")
+    (root / "keep").mkdir()
+    (root / "keep" / "important.jsonl").write_text("{}\n")
+    (root / "logs").mkdir()
+    (root / "logs" / "debug.txt").write_text("x\n")
+    (root / "logs" / "other.txt").write_text("x\n")
+    (root / "tmpfile.txt").write_text("x\n")
+
+    files = set(list_files(root))
+    assert "keep/important.jsonl" in files, "gitignore negations must be honored"
+    assert "logs/debug.txt" not in files, "path-scoped ignore patterns must be honored"
+    assert "logs/other.txt" in files, "unignored siblings must survive"
+    assert "tmpfile.txt" not in files, "trailing-glob ignore patterns must be honored"
+
+    subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture commit"], capture_output=True, check=True)
+    (root / "src" / "leaf.py").write_text("def unused_leaf():\n    return 1\n")
+
+    subprocess.run(["git", "-C", str(root), "checkout", "-q", "-b", "fixture-branch"], capture_output=True, check=True)
+    assert get_git_branch(root) == "fixture-branch", \
+        f"branch must be read from git, not assumed, got {get_git_branch(root)!r}"
+
+    subprocess.run(["git", "-C", str(root), "checkout", "--detach", "-q"], capture_output=True, check=True)
+    detached = get_git_branch(root)
+    assert detached and detached.startswith("detached@"), \
+        f"detached HEAD must be reported as detached, not the literal 'HEAD', got {detached!r}"
+    subprocess.run(["git", "-C", str(root), "checkout", "-q", "-"], capture_output=True, check=True)
+
+    state = get_working_state(root)
+    assert "fixture commit" in state, f"working state must list recent commits:\n{state}"
+    assert "src/leaf.py" in state, f"working state must list uncommitted files:\n{state}"
+
+    dump = _dump_to_string(root)
+    assert "## Working state" in dump, "dump must include the working-state block"
+    assert "fixture commit" in dump, "dump must surface recent commits"
+
+
+def _test_dump_is_live(root: Path) -> None:
+    stale = "STALE_MARKER_SHOULD_NOT_APPEAR"
+    (root / ".mimori" / "repo_map.md").write_text(f"# Repository Map\n\n{stale}\n")
+    (root / "src" / "new_module.py").write_text("def new_function():\n    pass\n")
+
+    dump = _dump_to_string(root)
+    assert "new_module.py" in dump, "dump should reflect files added after repo_map.md was cached"
+    assert stale not in dump, "dump should not echo stale cached repo_map.md content"
+
+
+def _test_log_summary_length(root: Path) -> None:
+    # cmd_log should nudge toward the high-level, one-liner summaries dump's
+    # Recent Activity is designed to show, not silently accept prose that will
+    # just get elided later with no feedback to whoever wrote it.
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_log(argparse.Namespace(action="a", summary="short and high-level", files=""))
+        assert "Note:" not in buf.getvalue(), "a summary within the limit must not be flagged"
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_log(argparse.Namespace(action="b", summary="s" * 300, files=""))
+        out = buf.getvalue()
+        assert "Note:" in out and "300 chars" in out, \
+            f"an oversized summary must be flagged with its length, got:\n{out}"
+        assert "high-level" in out, "the nudge must explain what a good summary looks like"
+    finally:
+        os.chdir(old_cwd)
+
+
+def _test_activity_tail(root: Path) -> None:
+    # A verbose logger (long summary, long file list) must not be able to let 5
+    # entries burn thousands of chars and starve the map of its share of the budget.
+    act_file = root / ".mimori" / "activity.jsonl"
+    lines = []
+    for i in range(5):
+        entry = {
+            "timestamp": f"2026-08-{10 + i:02d}T00:00:00",
+            "action": f"action-{i}",
+            "summary": f"entry-{i} " + ("s" * 400),
+            "files": [f"file{i}_{j}.py" for j in range(10)],
+        }
+        lines.append(json.dumps(entry))
+    act_file.write_text("\n".join(lines) + "\n")
+
+    dump = _dump_to_string(root)
+    tail = dump.split("## Recent Activity")[1]
+
+    assert len(tail) < DUMP_ACTIVITY_BUDGET + 400, \
+        f"the activity tail must stay near its budget regardless of entry verbosity, got {len(tail)} chars"
+    assert "entry-4 " in tail, "the most recent entry must survive trimming"
+    assert "s" * 400 not in tail, "an oversized summary must be elided, not shown in full"
+    assert "+6 more" in tail, "an oversized file list must be truncated with a visible count"
+    assert "entries shown" in tail, "eliding or dropping entries must be announced"
+
+
+def _test_focus(root: Path) -> None:
+    content = generate_repo_map(root, focus=["core.py"])
+
+    assert "focus:" in content, f"focused maps must announce the focus: {content[:200]}"
+    assert "class CoreApp" in content, "the focused file must render in full detail"
+    assert "`src/one.py`" in content, "importers of the focused file must be pulled in as neighbors"
+    assert "`src/leaf.py`" not in content, \
+        "files outside the task neighborhood must collapse to directory summaries"
+    assert "## Other files" in content, "the collapsed tail must be present"
+
+    # Focus is a lens, not a budget escape: a tight budget still truncates honestly.
+    small = generate_repo_map(root, budget=400, focus=["core.py"])
+    assert "budget" in small and "collapsed" in small, "focused maps still respect the budget"
+
+
+def _test_misc(root: Path) -> None:
+    assert get_git_branch(Path(tempfile.gettempdir())) is None, \
+        "non-git directories must report no branch, never a fabricated 'main'"
+
+    # Decisions: every title survives; bodies are expanded newest-first.
+    adrs = "# Architecture Decisions\n\n" + "\n\n".join(
+        f"## ADR-{i:03d}: Decision number {i}\n- **Context**: {'x' * 400}" for i in range(1, 9))
+    clipped = clip_decisions(adrs, 1200)
+    for i in range(1, 9):
+        assert f"ADR-{i:03d}" in clipped, f"every ADR title must survive the trim (missing {i})"
+    assert "x" * 400 in clipped, "the newest ADR body should still be expanded"
+    assert clipped.count("x" * 400) < 8, "not every body can fit in a 1200-char budget"
+    assert "shown by title only" in clipped, "trimming must be announced"
+    assert clip_decisions(adrs, 10**6) == adrs, "an ample budget must pass the text through untouched"
+
+    # Memory: priority order, not file order — invariants outrank status.
+    mem = ("# Project Memory\n\n"
+           "## Active Epics & Tasks\n- " + "e" * 600 + "\n\n"
+           "## Core Invariants & Architecture Rules\n- " + "i" * 600 + "\n\n"
+           "## Domain Vocabulary & Gotchas\n- " + "g" * 600 + "\n")
+    trimmed = clip_memory(mem, 900)
+    assert "i" * 600 in trimmed, "invariants must be kept ahead of status sections"
+    assert "e" * 600 not in trimmed, "the epics/status section must be trimmed first"
+    assert "Active Epics" in trimmed, "a trimmed section must still be listed by heading"
+    assert "trimmed" in trimmed, "trimming must be announced"
+
+    # The top-priority section must survive even when it alone exceeds the budget —
+    # a greedy fill would drop it and backfill with smaller, less important sections.
+    fat = ("# Project Memory\n\n"
+           "## Active Epics & Tasks\n- " + "e" * 200 + "\n\n"
+           "## Core Invariants & Architecture Rules\n" +
+           "\n".join(f"- invariant {i} " + "i" * 60 for i in range(40)) + "\n")
+    squeezed = clip_memory(fat, 1500)
+    assert "invariant 0" in squeezed, "the highest-priority section must appear even if oversized"
+    assert "truncated to budget" in squeezed, "a partially included section must say so"
+    assert "e" * 200 not in squeezed, "lower-priority sections must not displace invariants"
+
+    # Superseded ADRs are never expanded, even when the budget is ample.
+    sup = ("# Architecture Decisions\n\n"
+           "## ADR-001: Old way\n- **Context**: " + "o" * 300 + "\n- **Superseded by**: ADR-002\n\n"
+           "## ADR-002: New way\n- **Context**: " + "n" * 300 + "\n")
+    got = clip_decisions(sup, 10**6)
+    assert "ADR-001" in got and "ADR-002" in got, "both titles must remain visible"
+    assert "n" * 300 in got, "the live ADR body must be expanded"
+    assert "o" * 300 not in got, "a superseded ADR body must never be expanded"
+    assert "superseded" in got, "supersession must be announced"
+
+    # The shipped decisions template must not itself parse as an ADR.
+    _, tpl_sections = _split_sections(DEFAULT_DECISIONS_TEMPLATE)
+    assert not tpl_sections, "the decisions template must contain no phantom ADR heading"
+
+    assert resolve_budget(None, 24000) == 24000, "no flag means the command default"
+    assert resolve_budget(None, MAP_BUDGET_DEFAULT) == UNLIMITED, "map defaults to a complete map"
+    assert resolve_budget("unlimited", 24000) == UNLIMITED, "'unlimited' must resolve"
+    assert resolve_budget("large", 24000) == BUDGET_PRESETS["large"], "preset names must resolve"
+    assert resolve_budget("5000", 24000) == 5000, "raw character counts must resolve"
+
+
+def _test_dump_file_and_git_init(root: Path) -> None:
+    # 1. Non-git directory auto-init test
+    with tempfile.TemporaryDirectory() as raw_dir:
+        raw_root = Path(raw_dir).resolve()
+        assert not (raw_root / ".git").exists(), "fixture must start without .git"
+        assert ensure_git_repo(raw_root) is True, "ensure_git_repo must initialize git repository"
+        assert (raw_root / ".git").exists(), ".git directory must be created"
+        assert get_repo_identifier(raw_root) == "init", "repo with no commits must return 'init'"
+
+    # 2. Repo with commits must return short sha
+    ident = get_repo_identifier(root)
+    assert len(ident) >= 7, f"commit identifier must be short sha or init, got {ident!r}"
+
+    # 3. User temp directory resolution
+    u_tmp = get_user_temp_dir()
+    assert u_tmp.is_dir(), f"get_user_temp_dir must return an existing directory, got {u_tmp}"
+
+    # 4. Dump to default user temp file
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ret = cmd_dump(argparse.Namespace(budget=None, focus=None, file=""))
+        assert ret == 0, "cmd_dump with file='' must exit 0"
+        output = buf.getvalue()
+        assert "Wrote context snapshot to" in output, f"dump must report written target, got:\n{output}"
+
+        expected_file = u_tmp / f"ctx-{root.name}-{ident}.md"
+        assert expected_file.is_file(), f"expected dump file {expected_file} must exist"
+        content = expected_file.read_text(encoding="utf-8")
+        assert f"# Agent Context Snapshot ({root.name})" in content, "dump file must contain snapshot header"
+        assert "## Structure & Symbol Map" in content, "dump file must contain symbol map"
+
+        # 5. Dump to custom path
+        custom_target = root / "custom_ctx.md"
+        buf_custom = io.StringIO()
+        with contextlib.redirect_stdout(buf_custom):
+            ret_custom = cmd_dump(argparse.Namespace(budget=None, focus=None, file=str(custom_target)))
+        assert ret_custom == 0, "cmd_dump with custom path must exit 0"
+        assert custom_target.is_file(), "custom target file must exist"
+        assert f"Wrote context snapshot to {custom_target}" in buf_custom.getvalue()
+    finally:
+        os.chdir(old_cwd)
+
+
+def _test_cache_pruning(root: Path) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_dir = Path(td)
+        now = 1_000_000.0
+
+        # Create mock snapshots
+        # Repo A: 3 snapshots (1 very old: 100h ago, 2 recent: 2h and 1h ago)
+        f_a_old = temp_dir / "ctx-repoA-c1.md"
+        f_a_old.write_text("old snapshot", encoding="utf-8")
+        os.utime(f_a_old, (now - 100 * 3600, now - 100 * 3600))
+
+        f_a_mid = temp_dir / "ctx-repoA-c2.md"
+        f_a_mid.write_text("mid snapshot", encoding="utf-8")
+        os.utime(f_a_mid, (now - 2 * 3600, now - 2 * 3600))
+
+        f_a_new = temp_dir / "ctx-repoA-c3.md"
+        f_a_new.write_text("new snapshot", encoding="utf-8")
+        os.utime(f_a_new, (now - 1 * 3600, now - 1 * 3600))
+
+        # Repo B: 3 recent snapshots (30m, 20m, 10m ago) -> with max_per_repo=2, oldest should be pruned
+        f_b_1 = temp_dir / "ctx-repoB-c1.md"
+        f_b_1.write_text("b1 snapshot", encoding="utf-8")
+        os.utime(f_b_1, (now - 1800, now - 1800))
+
+        f_b_2 = temp_dir / "ctx-repoB-c2.md"
+        f_b_2.write_text("b2 snapshot", encoding="utf-8")
+        os.utime(f_b_2, (now - 1200, now - 1200))
+
+        f_b_3 = temp_dir / "ctx-repoB-c3.md"
+        f_b_3.write_text("b3 snapshot", encoding="utf-8")
+        os.utime(f_b_3, (now - 600, now - 600))
+
+        pruned_count, pruned_bytes = prune_user_temp_dir(
+            temp_dir=temp_dir,
+            max_per_repo=2,
+            ttl_hours=72,
+            max_files=50,
+            now=now,
+        )
+
+        assert pruned_count == 2, f"expected 2 files pruned (1 expired TTL + 1 excess in repoB), got {pruned_count}"
+        assert not f_a_old.exists(), "f_a_old should be pruned due to TTL > 72h"
+        assert f_a_mid.exists(), "f_a_mid should be kept"
+        assert f_a_new.exists(), "f_a_new should be kept"
+        assert not f_b_1.exists(), "f_b_1 should be pruned due to max_per_repo=2"
+        assert f_b_2.exists(), "f_b_2 should be kept"
+        assert f_b_3.exists(), "f_b_3 should be kept"
+
+        # Test global max files ceiling
+        for i in range(5):
+            f_extra = temp_dir / f"ctx-repoExtra{i}-c.md"
+            f_extra.write_text("extra", encoding="utf-8")
+            os.utime(f_extra, (now - 500 + i * 10, now - 500 + i * 10))
+
+        pruned_count2, _ = prune_user_temp_dir(
+            temp_dir=temp_dir,
+            max_per_repo=10,
+            ttl_hours=72,
+            max_files=5,
+            now=now,
+        )
+        remaining_count = len(list(temp_dir.glob("ctx-*.md")))
+        assert remaining_count == 5, f"expected 5 files remaining after max_files=5, got {remaining_count}"
+
+
+def _test_tasks(root: Path) -> None:
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+
+        # 1. Add tasks via cmd_todo
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ret = cmd_todo(argparse.Namespace(action="add", target=["Build", "AST", "indexer"], prio="high", tag=["perf"], idea=False, start=False, plain=True))
+        assert ret == 0, "adding task must succeed"
+        assert "Added task" in buf.getvalue()
+
+        # 2. Add in-progress task
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_todo(argparse.Namespace(action="add", target=["Refactor", "memory", "cli"], prio=None, tag=[], idea=False, start=True, plain=True))
+
+        # 3. Add future idea
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_idea(argparse.Namespace(action="add", target=["Quantum", "search", "backend"], tag=["futuristic"], plain=True))
+
+        # 4. List tasks
+        buf_list = io.StringIO()
+        with contextlib.redirect_stdout(buf_list):
+            ret = cmd_todo(argparse.Namespace(action="list", target=[], status="all", tag=[], plain=True))
+        assert ret == 0
+        list_out = buf_list.getvalue()
+        assert "Build AST indexer" in list_out
+        assert "Refactor memory cli" in list_out
+        assert "Quantum search backend" in list_out
+        assert "[/]" in list_out
+        assert "[?]" in list_out
+        assert "(high)" in list_out
+
+        # 5. Transition: complete a task
+        buf_done = io.StringIO()
+        with contextlib.redirect_stdout(buf_done):
+            ret = cmd_todo(argparse.Namespace(action="done", target=["AST"], plain=True))
+        assert ret == 0
+        assert "Completed task" in buf_done.getvalue()
+
+        # 6. Transition: promote idea
+        buf_promote = io.StringIO()
+        with contextlib.redirect_stdout(buf_promote):
+            ret = cmd_idea(argparse.Namespace(action="promote", target=["Quantum"], plain=True))
+        assert ret == 0
+        assert "Promoted idea" in buf_promote.getvalue()
+
+        # 7. Transition: reopen completed task
+        buf_reopen = io.StringIO()
+        with contextlib.redirect_stdout(buf_reopen):
+            ret = cmd_todo(argparse.Namespace(action="reopen", target=["AST"], plain=True))
+        assert ret == 0
+        assert "Reopened task" in buf_reopen.getvalue()
+
+        # 8. Transition: remove task
+        buf_rm = io.StringIO()
+        with contextlib.redirect_stdout(buf_rm):
+            ret = cmd_todo(argparse.Namespace(action="rm", target=["Quantum"], plain=True))
+        assert ret == 0
+        assert "Removed task" in buf_rm.getvalue()
+
+        # 9. Test clip_tasks priority budgeting
+        fat_tasks = (
+            "# Tasks & Backlog\n\n"
+            "## In Progress\n- [/] (urgent) [core] Engine rewrite\n\n"
+            "## Active Tasks\n" + "\n".join(f"- [ ] Active task {i} " + "t" * 30 for i in range(40)) + "\n\n"
+            "## Future Ideas & Backlog\n" + "\n".join(f"- [?] Idea item {i} " + "i" * 30 for i in range(30)) + "\n\n"
+            "## Completed\n" + "\n".join(f"- [x] Done item {i} (2026-08-20)" for i in range(10)) + "\n"
+        )
+        clipped = clip_tasks(fat_tasks, 800)
+        assert "Engine rewrite" in clipped, "in-progress task must survive clipping"
+        assert "Active task 0" in clipped, "active tasks must be prioritized over ideas"
+        assert "hidden" in clipped or "Completed" in clipped, "completed tasks must be summarized"
+        assert "trimmed to budget" in clipped, "budget truncation must be announced"
+
+        # 10. Test cmd_dump includes tasks
+        dump = _dump_to_string(root)
+        assert "## Tasks & Backlog" in dump, "dump must include tasks section when tasks.md exists"
+        assert "Refactor memory cli" in dump, "dump must surface in-progress task"
+    finally:
+        os.chdir(old_cwd)
+
+
+def _test_vectorized_pagerank() -> None:
+    infos: Dict[str, FileInfo] = {}
+    for i in range(100):
+        inf = FileInfo(f"file_{i}.py", 100)
+        infos[f"file_{i}.py"] = inf
+
+    for i in range(1, 100):
+        infos[f"file_{i}.py"].depends_on.add("file_0.py")
+
+    pr = compute_pagerank(infos)
+    assert len(pr) == 100
+    assert abs(sum(pr.values()) - 1.0) < 1e-4, "PageRank sum must equal 1.0"
+    assert pr["file_0.py"] > max(pr[f"file_{i}.py"] for i in range(1, 100)), "Central hub must have highest PageRank"
+
+
+def _test_polyglot_graph(root: Path) -> None:
+    # 1. Go module resolution test
+    go_dir = root / "go_test"
+    go_dir.mkdir(exist_ok=True)
+    (go_dir / "go.mod").write_text("module example.com/mycorp/myrepo\n\ngo 1.21\n", encoding="utf-8")
+    (go_dir / "main.go").write_text('package main\n\nimport "example.com/mycorp/myrepo/pkg/db"\n\nfunc main() {}\n', encoding="utf-8")
+    (go_dir / "pkg" / "db").mkdir(parents=True, exist_ok=True)
+    (go_dir / "pkg" / "db" / "client.go").write_text("package db\n\ntype Client struct{}\n", encoding="utf-8")
+
+    go_infos = collect_repo(go_dir)
+    assert "pkg/db/client.go" in go_infos
+    assert "main.go" in go_infos
+    assert "main.go" in go_infos["pkg/db/client.go"].importers, "Go import resolution must link package to main"
+
+    # 2. Rust crate resolution test
+    rs_dir = root / "rs_test"
+    rs_dir.mkdir(exist_ok=True)
+    (rs_dir / "Cargo.toml").write_text('[package]\nname = "mycrate"\nversion = "0.1.0"\n', encoding="utf-8")
+    (rs_dir / "src").mkdir(exist_ok=True)
+    (rs_dir / "src" / "main.rs").write_text('mod engine;\n\nuse crate::engine::Core;\n\nfn main() {}\n', encoding="utf-8")
+    (rs_dir / "src" / "engine.rs").write_text('pub struct Core;\n', encoding="utf-8")
+
+    rs_infos = collect_repo(rs_dir)
+    assert "src/engine.rs" in rs_infos
+    assert "src/main.rs" in rs_infos["src/engine.rs"].importers, "Rust mod/use resolution must link engine to main"
+
+    # 3. TS barrel export test
+    ts_dir = root / "ts_test"
+    ts_dir.mkdir(exist_ok=True)
+    (ts_dir / "index.ts").write_text("export * from './button';\nexport { theme } from './theme';\n", encoding="utf-8")
+    (ts_dir / "button.tsx").write_text("export const Button = () => null;\n", encoding="utf-8")
+    (ts_dir / "theme.ts").write_text("export const theme = {};\n", encoding="utf-8")
+
+    ts_infos = collect_repo(ts_dir)
+    assert "button.tsx" in ts_infos
+    assert "index.ts" in ts_infos["button.tsx"].importers, "TS barrel export must link button to index"
+    assert "index.ts" in ts_infos["theme.ts"].importers, "TS barrel export must link theme to index"
+
+
+def _test_staleness_scanner(root: Path) -> None:
+    stale_dir = root / "stale_test"
+    stale_dir.mkdir(exist_ok=True)
+    ensure_git_repo(stale_dir)
+    mimori_dir = stale_dir / ".mimori"
+    mimori_dir.mkdir(exist_ok=True)
+
+    (stale_dir / "valid_file.py").write_text("def hello(): pass\n", encoding="utf-8")
+    (mimori_dir / "memory.md").write_text(
+        "# Memory\n- Gotcha: `valid_file.py` handles auth\n- Warning: `nonexistent_module.py` is deprecated\n",
+        encoding="utf-8"
+    )
+    (mimori_dir / "tasks.md").write_text(
+        "# Tasks\n## Active Tasks\n- [ ] Clean up `ghost_service.ts` endpoints\n",
+        encoding="utf-8"
+    )
+
+    all_files = set(list_files(stale_dir))
+    notices = scan_stale_references(stale_dir, all_files)
+    assert any("nonexistent_module.py" in n for n in notices), "Scanner must detect dead reference in memory.md"
+    assert any("ghost_service.ts" in n for n in notices), "Scanner must detect dead reference in tasks.md"
+    assert not any("valid_file.py" in n for n in notices), "Scanner must not flag valid existing files"
+
+
+def run_self_test() -> int:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir).resolve()
+        _build_fixture(root)
+        _test_symbols_and_graph(root)
+        _test_budget_is_honest(root)
+        _test_log_summary_length(root)
+        _test_activity_tail(root)
+        _test_focus(root)
+        _test_misc(root)
+        _test_git_integration(root)
+        _test_dump_is_live(root)
+        _test_dump_file_and_git_init(root)
+        _test_cache_pruning(root)
+        _test_tasks(root)
+        _test_vectorized_pagerank()
+        _test_polyglot_graph(root)
+        _test_staleness_scanner(root)
+    print("Self-test passed successfully.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="mimori", description="Zero-daemon Agent Context, Memory, & Activity Tracker")
+    parser.add_argument("--test", action="store_true", help="Run self-tests and exit")
+    subparsers = parser.add_subparsers(dest="command", help="Sub-command to execute")
+
+    subparsers.add_parser("init", help="Initialize .mimori/ directory with templates and repo map")
+
+    map_parser = subparsers.add_parser("map", help="Scan repository and generate ranked symbol map")
+    map_parser.add_argument("--stdout", action="store_true", help="Print map to stdout instead of file")
+    budget_help = (f"Character budget: a number, 'default', or {'/'.join(BUDGET_PRESETS)} "
+                   f"({', '.join(f'{k}={v}' for k, v in BUDGET_PRESETS.items())}). "
+                   f"Env: MIMORI_BUDGET.")
+    map_parser.add_argument("--budget", default=None, help=budget_help)
+    focus_help = ("Comma-separated files/substrings to pull into full detail with their "
+                  "import-graph neighbors; everything else collapses. Env: MIMORI_FOCUS.")
+    map_parser.add_argument("--focus", default=None, help=focus_help)
+
+    dump_parser = subparsers.add_parser(
+        "dump", help="Print high-signal context snapshot (state, memory, decisions, map, activity)")
+    dump_parser.add_argument("--budget", default=None, help=budget_help)
+    dump_parser.add_argument("--focus", default=None,
+                             help="Comma-separated files/substrings to pull into full detail "
+                                  "(with their import-graph neighbors); env: MIMORI_FOCUS.")
+    dump_parser.add_argument(
+        "--file", "-o", "--out",
+        nargs="?",
+        const="",
+        default=None,
+        help="Write snapshot to user temp file ($XDG_RUNTIME_DIR/mimori/ctx-<repo>-<commit>.md) or custom path",
+    )
+
+    log_parser = subparsers.add_parser("log", help="Append an entry to .mimori/activity.jsonl")
+    log_parser.add_argument("--action", required=True, help="Short action name (e.g. 'feature-auth')")
+    log_parser.add_argument("--summary", required=True, help="Detailed summary of change and rationale")
+    log_parser.add_argument("--files", default="", help="Comma-separated list of modified files")
+
+    hist_parser = subparsers.add_parser("history", help="Show recent logged agent actions")
+    hist_parser.add_argument("--limit", type=int, default=10, help="Number of records to show (default: 10)")
+
+    clean_parser = subparsers.add_parser("clean", help="Clean stale or expired context snapshots from user temp directory")
+    clean_parser.add_argument("--all", action="store_true", help="Remove all cached context snapshots unconditionally")
+
+    todo_parser = subparsers.add_parser("todo", help="Track tasks, in-progress work, and todos (.mimori/tasks.md)")
+    todo_parser.add_argument("action", nargs="?", default="list", help="Action: list, add, start, done, reopen, rm")
+    todo_parser.add_argument("target", nargs="*", default=[], help="Task description or ID/search term")
+    todo_parser.add_argument("--prio", "-p", choices=["high", "med", "low", "urgent"], default=None, help="Task priority")
+    todo_parser.add_argument("--tag", "-t", action="append", default=[], help="Tag(s) for task")
+    todo_parser.add_argument("--status", "-s", choices=["todo", "in_progress", "done", "idea", "all"], default="all", help="Filter tasks by status")
+    todo_parser.add_argument("--idea", action="store_true", help="Add as a future idea/backlog item")
+    todo_parser.add_argument("--start", action="store_true", help="Add directly to In Progress")
+    todo_parser.add_argument("--plain", action="store_true", help="Output plain text without ANSI colors")
+
+    task_parser = subparsers.add_parser("task", help="Alias for 'mimori todo'")
+    task_parser.add_argument("action", nargs="?", default="list", help="Action: list, add, start, done, reopen, rm")
+    task_parser.add_argument("target", nargs="*", default=[], help="Task description or ID/search term")
+    task_parser.add_argument("--prio", "-p", choices=["high", "med", "low", "urgent"], default=None, help="Task priority")
+    task_parser.add_argument("--tag", "-t", action="append", default=[], help="Tag(s) for task")
+    task_parser.add_argument("--status", "-s", choices=["todo", "in_progress", "done", "idea", "all"], default="all", help="Filter tasks by status")
+    task_parser.add_argument("--idea", action="store_true", help="Add as a future idea/backlog item")
+    task_parser.add_argument("--start", action="store_true", help="Add directly to In Progress")
+    task_parser.add_argument("--plain", action="store_true", help="Output plain text without ANSI colors")
+
+    idea_parser = subparsers.add_parser("idea", help="Manage future ideas and backlog proposals")
+    idea_parser.add_argument("action", nargs="?", default="list", help="Action: list, add, promote, rm")
+    idea_parser.add_argument("target", nargs="*", default=[], help="Idea description or ID/search term")
+    idea_parser.add_argument("--tag", "-t", action="append", default=[], help="Tag(s) for idea")
+    idea_parser.add_argument("--plain", action="store_true", help="Output plain text without ANSI colors")
+
+    args = parser.parse_args()
+
+    if args.test:
+        return run_self_test()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    handlers = {
+        "init": cmd_init,
+        "map": cmd_map,
+        "dump": cmd_dump,
+        "log": cmd_log,
+        "history": cmd_history,
+        "clean": cmd_clean,
+        "todo": cmd_todo,
+        "task": cmd_todo,
+        "idea": cmd_idea,
+    }
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
