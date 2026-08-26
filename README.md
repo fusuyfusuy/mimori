@@ -40,10 +40,16 @@
    - Maintains immutable ADRs in `.mimori/decisions.md` following the Context → Decision → Consequences pattern.
    - Automatically surfaces active architectural invariants while keeping superseded decisions compact.
 
-6. **1-Line Caveman Activity Logging (`mimori log`)**:
-   - Machine-action telemetry recorded into `.mimori/activity.jsonl` with author metadata, modified files, and concise caveman summaries.
+6. **1-Line Caveman Action Logging (`mimori log`)**:
+   - Machine-action telemetry recorded into `.mimori/activity.jsonl` with author metadata, modified files, and concise caveman summaries for all repository actions and tooling runs.
 
-7. **Self-Cleaning Temp Cache (`mimori clean`)**:
+7. **Ponytail Technical Debt Scanner & Reconciler (`mimori debt`)**:
+   - Zero-daemon 2-pass scanner for in-code `# ponytail:` / `// ponytail:` deferral comments.
+   - Parses multi-line ceilings and upgrade triggers, flagging `[no-trigger]` and `[duplicate]` issues.
+   - `mimori debt sync`: Synchronizes code markers into `.mimori/memory.md` (`## KNOWN DEBT`), automatically pruning resolved debt while honoring the 30-line cap and preserving manual entries.
+   - `mimori debt check`: CI validation gate (exits 0 if clean, 1 if broken triggers exist).
+
+8. **Self-Cleaning Temp Cache (`mimori clean`)**:
    - Opportunistic in-flight garbage collection on `dump --file`: retains the 2 newest snapshots per repo, auto-expires files older than 72h, and caps total temp files.
 
 ---
@@ -95,7 +101,7 @@ mimori map
 # Focused map on a specific subsystem
 mimori map --stdout --focus "auth.py,api"
 
-# Record a completed task (1-line caveman style)
+# Record a completed action or tooling execution (1-line caveman style)
 mimori log --action "add-auth" --summary "Added JWT auth middleware" --files "auth.py,server.py"
 
 # View recent session history

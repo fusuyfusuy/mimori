@@ -30,6 +30,10 @@ jobs:
         run: |
           python mimori --test
 
+      - name: Run mimori integration & concurrency test suite
+        run: |
+          python test_mimori.py
+
       - name: Test installer script syntax
         run: |
           bash -n install.sh
