@@ -15,6 +15,30 @@
 
 ---
 
+## 📖 About mimori
+
+### Why mimori?
+When AI coding agents enter a codebase, they typically suffer from two extremes:
+1. **Blind Exploration Waste**: Agents fire dozens of unfocused `grep`, `find`, or `ls -R` commands, burning **20,000–50,000 tokens** before writing a single line of code.
+2. **Heavy Daemon Bloat**: External vector databases, LSP daemons, or background indexers consume gigabytes of RAM, fail silently, drift out of sync with git branches, and require complex external dependencies.
+
+`mimori` was created to solve this with a radically minimalist approach: **Deterministic computation over probabilistic retrieval, standard library over external dependencies, and pure markdown stores over opaque vector databases.**
+
+### Core Design Philosophy
+- **Zero Daemon, Zero Dependencies**: Written in 100% pure Python standard library (`ast`, `tokenize`, `urllib`, `array`). Single standalone executable. No background processes, no RAM overhead, and no installation hurdles.
+- **Compute, Don't Read**: Instead of hallucinating relevance through vector similarity, `mimori` parses ASTs and executes vectorized **PageRank iterations** in microseconds to mathematically calculate which modules serve as the real architectural hubs of your repository.
+- **Git-Native Project Memory**: All invariants, architecture decision records (ADRs), in-flight tasks, and activity journals live directly inside `.mimori/` in standard human-readable Markdown and JSON Lines.
+- **Strict Character Budgeting & Anti-Decay**: Output scales intelligently with token budgets (`--budget default|large|immense`), gracefully collapsing peripheral modules without silent omissions, and actively warns when file references rot.
+- **Ponytail & Caveman DNA**: Built on the **Ponytail** principle of ruthless minimalism (boring over clever, smallest diff wins) and **Caveman** compression (high-signal, zero-filler communication).
+
+### Name Origin
+**Mimori (三森)** translates to *"Three Forests"* in Japanese, representing the three foundational layers of structural agent context:
+- 🌲 **Memory**: Repository invariants, gotchas, domain rules, and technical debt.
+- 🌳 **Structure**: The live AST symbol topology and PageRank-weighted dependency graph.
+- 🌴 **Action**: Immutable architecture decisions (ADRs), active task lifecycle, and session activity logs.
+
+---
+
 ## ⚡ Key Features
 
 1. **Instant Session Warmup (`mimori dump`)**:
