@@ -166,6 +166,36 @@ def test_tiered_ast_parser_resilience(tmp_dir: Path) -> None:
     print("[PASS] Tiered polyglot AST parser resilience verified.")
 
 
+def test_stale_reference_scanner(tmp_dir: Path) -> None:
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=str(tmp_dir), capture_output=True, check=True)
+    res = run_mimori(["init"], cwd=tmp_dir)
+    assert res.returncode == 0
+
+    sub_dir = tmp_dir / "src" / "pkg"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    (sub_dir / "app.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    mem_file = tmp_dir / ".mimori" / "memory.md"
+    mem_file.write_text(
+        "# Project Memory\n\n"
+        "- Dotdir valid: `.mimori/activity.jsonl` should not be flagged\n"
+        "- Subdir valid: `src/pkg/` directory reference should not be flagged\n"
+        "- Slash command: `/goal` and `/list` commands should not be flagged\n"
+        "- Dead ref: `nonexistent_module.py` must be flagged\n",
+        encoding="utf-8",
+    )
+
+    res = run_mimori(["dump"], cwd=tmp_dir)
+    assert res.returncode == 0, f"mimori dump failed: {res.stderr}"
+    assert "memory.md: 'nonexistent_module.py' not found in repo" in res.stdout
+    assert "mimori/activity.jsonl' not found in repo" not in res.stdout
+    assert "'goal' not found in repo" not in res.stdout
+    assert "'list' not found in repo" not in res.stdout
+    assert "'src/pkg' not found in repo" not in res.stdout
+    print("[PASS] Stale reference scanner resilience verified.")
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -173,6 +203,7 @@ def main() -> None:
         test_atomic_writes_and_concurrency(root / "repo2")
         test_todo_and_idea_lifecycle(root / "repo3")
         test_tiered_ast_parser_resilience(root / "repo4")
+        test_stale_reference_scanner(root / "repo5")
     print("All mimori verification checks passed (exit 0).")
 
 

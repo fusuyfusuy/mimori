@@ -6,7 +6,7 @@ Zero external dependencies - Python standard library only.
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import argparse
 import array
@@ -1941,9 +1941,16 @@ def scan_stale_references(root: Path, all_paths: Set[str]) -> List[str]:
                 continue
             if " " in ref or "(" in ref or ")" in ref:
                 continue
-            if "/" in ref or any(ref.endswith(ext) for ext in CODE_EXTS | {".md", ".json", ".jsonl", ".sh", ".toml", ".yml", ".yaml"}):
-                clean_ref = ref.lstrip("./").split("#")[0].split(":")[0]
+            has_ext = any(ref.endswith(ext) for ext in CODE_EXTS | {".md", ".json", ".jsonl", ".sh", ".toml", ".yml", ".yaml"})
+            if "/" in ref or has_ext:
+                clean_ref = ref.removeprefix("./").rstrip("/").split("#")[0].split(":")[0]
                 if not clean_ref:
+                    continue
+                if ref.startswith("/") and not has_ext:
+                    continue
+                if ref.startswith("/") and Path(ref).exists():
+                    continue
+                if (root / clean_ref).is_dir() or (root / clean_ref).is_file():
                     continue
                 if clean_ref.lower() not in all_paths_lower and clean_ref.lower() not in all_stems_lower:
                     dead_refs.add(f"{fname}: '{clean_ref}' not found in repo")
