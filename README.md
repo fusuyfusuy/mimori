@@ -129,22 +129,69 @@ Inside your workspace, `mimori` stores local state in pure markdown and JSON lin
 
 ---
 
-## 🤖 Using with AI Agents
+## 🤖 Using with AI Agents (`AGENTS.md` Integration)
 
-### Antigravity / Claude Code / Pi Skills
-Copy `SKILL.md` into your agent skills directory (e.g. `~/.gemini/antigravity-cli/skills/mimori/` or `~/.claude/skills/mimori/`):
+`mimori` is designed to be the operational backbone for AI coding agents (Antigravity, Claude Code, Pi, OpenCode, Cursor, Roo Code, Aider).
+
+### 1. Install the Agent Skill
+Copy `SKILL.md` into your agent skills directory:
 
 ```bash
+# Antigravity CLI (agy)
 mkdir -p ~/.gemini/antigravity-cli/skills/mimori
 cp SKILL.md ~/.gemini/antigravity-cli/skills/mimori/
+
+# Claude Code
+mkdir -p ~/.claude/skills/mimori
+cp SKILL.md ~/.claude/skills/mimori/
+
+# Pi / OpenCode / Custom Harness
+mkdir -p ~/.pi/skills/mimori
+cp SKILL.md ~/.pi/skills/mimori/
 ```
 
-Add the session warmup directive to your `AGENTS.md` / `CLAUDE.md`:
+---
+
+### 2. Drop-in `AGENTS.md` / `CLAUDE.md` Settings Section
+
+Paste this configuration into your project root's `AGENTS.md` or `CLAUDE.md` to establish strict memory hygiene, surgical context exploration, and debt governance:
+
 ```markdown
-## Project Context & Memory (mimori)
-- **Session Start / Warmup**: Run `mimori dump --file` & view output file (live PageRank symbol map + memory + ADRs + tasks in user-isolated temp).
-- **Task Tracking & Completion**: Track pending/in-flight tasks with `mimori todo` / `mimori idea`. Log completed milestones with `mimori log --action <act> --summary <1-line-caveman> --files <f1,f2>`.
+## Project Memory & Lifecycle Protocol (mimori)
+
+### 1. Explore -> Plan -> Approve -> Execute -> Verify
+- **Explore**: Orient surgically without reading full files.
+  - Snapshot full workspace context: `mimori dump --file`
+  - Focus on a specific subsystem: `mimori dump --focus "auth,api"`
+  - Live AST call/import inspection: `mimori map --stdout --focus "<target>"`
+- **Plan**: Track multi-step tasks in `mimori todo` (e.g. `mimori todo add "Refactor parser" --start`).
+- **Approve**: Multi-file, API-modifying, or dependency changes require plan review before execution.
+- **Execute**: Deliver shortest working diff. Mark intentional shortcuts with `# ponytail: <what> <- <ceiling> -> <trigger>`.
+- **Verify & Gate**: Run machine-verifiable tests. Ensure zero broken debt markers with `mimori debt check` (exit 0).
+- **Log**: Record completed repository actions via `mimori log --action <act> --summary <caveman> --files <f1,f2>` (<160 chars).
+
+### 2. Session Warmup & Hygiene
+- **Warmup**: Run `mimori dump --file` at session start. Never read `.mimori/repo_map.md` directly.
+- **Decay Pruning**: Remove stale/dead file references reported in `mimori dump` decay notices from `.mimori/memory.md`.
+- **Subagent Kickoff**: Scope worker subagents with targeted context: `mimori dump --file --focus "<area>"`.
+
+### 3. Debt Governance & Memory Writing Style
+- **Writing Style**: Use Caveman compression (drop filler/articles, retain exact code, paths, numbers, and negations) in `.mimori/memory.md` and ADRs.
+- **Debt Sync**: Reconcile in-code `# ponytail:` markers with `mimori debt sync`; gate CI with `mimori debt check`.
 ```
+
+---
+
+### 3. Agent Lifecycle Workflow Matrix
+
+| Phase | Agent Action | CLI Command | Context Impact |
+| :--- | :--- | :--- | :--- |
+| **Session Start** | Cold-start warmup & decay check | `mimori dump --file` | ~12k–24k chars cached in temp (saves 50k tokens) |
+| **Subsystem Exploration** | Surgical AST & dependency lookup | `mimori map --stdout --focus "auth"` | Precise top-ranked symbols & callers only |
+| **Task Planning** | Create & activate action items | `mimori todo add "<task>" --start` | Structured state in `.mimori/tasks.md` |
+| **Subagent Scoping** | Isolated worker kickoff context | `mimori dump --file --focus "<target>"` | Minimal targeted context window |
+| **Pre-Commit Verification** | Validate debt triggers | `mimori debt check` | Deterministic CI gate (exit 0 / 1) |
+| **Post-Action Journal** | Log discrete repo action | `mimori log --action <a> --summary <s>` | Append to `.mimori/activity.jsonl` |
 
 ---
 
