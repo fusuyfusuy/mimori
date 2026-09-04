@@ -1,4 +1,5 @@
 use crate::graph::SymbolGraph;
+use crate::model::Coordinate;
 use crate::model::Symbol;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -77,12 +78,12 @@ impl BlastResult {
 
 pub fn calculate_blast_radius(
     graph: &SymbolGraph,
-    target: &str,
+    coord: &Coordinate,
     depth_limit: usize,
 ) -> Result<BlastResult> {
-    let indices = graph.find_symbol_indices(target);
+    let indices = graph.resolve_all(coord);
     if indices.is_empty() {
-        bail!("Target symbol '{}' not found in workspace.", target);
+        bail!("Target symbol '{}' not found in workspace.", coord);
     }
 
     let mut queue = VecDeque::new();
@@ -136,7 +137,7 @@ pub fn calculate_blast_radius(
     }
 
     Ok(BlastResult {
-        target: target.to_string(),
+        target: coord.to_string(),
         depth_limit,
         affected,
         entry_points,

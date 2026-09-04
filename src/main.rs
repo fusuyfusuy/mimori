@@ -1,7 +1,11 @@
+use anyhow::Result;
 use clap::Parser;
 use mimori::cli::{Cli, Commands};
 use mimori::graph::map::generate_map;
+use mimori::graph::{slice_line_coordinate, SymbolGraph};
+use mimori::model::Coordinate;
 use mimori::storage::{clean_cache, get_or_sync_graph};
+use mimori::workspace::walker::find_workspace_root;
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -14,16 +18,30 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Slice(args) => {
-            let root_dir = get_target_root(&args.target, &current_dir);
-            let graph = match get_or_sync_graph(&root_dir) {
-                Ok(g) => g,
+            let coord = match Coordinate::parse(&args.target) {
+                Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Error syncing workspace: {}", e);
+                    eprintln!("Error: {}", e);
                     return ExitCode::FAILURE;
                 }
             };
 
-            match graph.build_slice(&args.target, args.follow_local, args.with_imports) {
+            // A line range is read straight off disk; it needs no index.
+            let built = if let Coordinate::Lines { file, start, end } = &coord {
+                slice_line_coordinate(file, *start, *end, args.with_imports)
+            } else {
+                match prepare(coord, &current_dir) {
+                    Ok((graph, coord)) => {
+                        graph.build_slice(&coord, args.follow_local, args.with_imports)
+                    }
+                    Err(e) => {
+                        eprintln!("Error syncing workspace: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+
+            match built {
                 Ok(slice) => {
                     if cli.json {
                         match serde_json::to_string_pretty(&slice) {
@@ -72,22 +90,21 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Up(args) => {
-            let root_dir = get_target_root(&args.target, &current_dir);
-            let graph = match get_or_sync_graph(&root_dir) {
-                Ok(g) => g,
+            let (graph, coord) = match parse_and_prepare(&args.target, &current_dir) {
+                Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("Error syncing workspace: {}", e);
+                    eprintln!("Error: {}", e);
                     return ExitCode::FAILURE;
                 }
             };
 
-            let callers = graph.callers(&args.target);
+            let callers = graph.callers(&coord);
 
             if cli.json {
                 let json_callers: Vec<_> = callers.iter().map(|s| s.coordinate()).collect();
-                println!("{}", json!({ "target": args.target, "callers": json_callers }));
+                println!("{}", json!({ "target": coord.to_string(), "callers": json_callers }));
             } else {
-                println!("### Upstream Callers: `{}` ({} callers)\n", args.target, callers.len());
+                println!("### Upstream Callers: `{}` ({} callers)\n", coord, callers.len());
                 if callers.is_empty() {
                     println!("No upstream callers found.");
                 } else {
@@ -99,22 +116,21 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Down(args) => {
-            let root_dir = get_target_root(&args.target, &current_dir);
-            let graph = match get_or_sync_graph(&root_dir) {
-                Ok(g) => g,
+            let (graph, coord) = match parse_and_prepare(&args.target, &current_dir) {
+                Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("Error syncing workspace: {}", e);
+                    eprintln!("Error: {}", e);
                     return ExitCode::FAILURE;
                 }
             };
 
-            let callees = graph.callees(&args.target);
+            let callees = graph.callees(&coord);
 
             if cli.json {
                 let json_callees: Vec<_> = callees.iter().map(|s| s.coordinate()).collect();
-                println!("{}", json!({ "target": args.target, "callees": json_callees }));
+                println!("{}", json!({ "target": coord.to_string(), "callees": json_callees }));
             } else {
-                println!("### Downstream Callees: `{}` ({} callees)\n", args.target, callees.len());
+                println!("### Downstream Callees: `{}` ({} callees)\n", coord, callees.len());
                 if callees.is_empty() {
                     println!("No downstream callees found.");
                 } else {
@@ -135,7 +151,13 @@ fn main() -> ExitCode {
             };
 
             if let Some(focus_target) = &args.focus {
-                graph.compute_personalized_pagerank(focus_target);
+                match Coordinate::parse(focus_target) {
+                    Ok(c) => graph.compute_personalized_pagerank(&c.normalize_against(&current_dir)),
+                    Err(e) => {
+                        eprintln!("Error: invalid --focus target: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
 
             let map_result = generate_map(&graph, args.scope.as_deref(), args.focus.as_deref());
@@ -154,16 +176,15 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Blast(args) => {
-            let root_dir = get_target_root(&args.target, &current_dir);
-            let graph = match get_or_sync_graph(&root_dir) {
-                Ok(g) => g,
+            let (graph, coord) = match parse_and_prepare(&args.target, &current_dir) {
+                Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("Error syncing workspace: {}", e);
+                    eprintln!("Error: {}", e);
                     return ExitCode::FAILURE;
                 }
             };
 
-            match mimori::graph::blast::calculate_blast_radius(&graph, &args.target, args.depth) {
+            match mimori::graph::blast::calculate_blast_radius(&graph, &coord, args.depth) {
                 Ok(blast_res) => {
                     if cli.json {
                         match serde_json::to_string_pretty(&blast_res) {
@@ -295,14 +316,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn get_target_root(target: &str, default_dir: &Path) -> std::path::PathBuf {
-    if let Some((target_file, _)) = target.split_once(':') {
-        let p = Path::new(target_file);
-        if p.is_absolute() {
-            if let Some(parent) = p.parent() {
-                return parent.to_path_buf();
-            }
-        }
-    }
-    default_dir.to_path_buf()
+/// Parse a raw target, locate the workspace root from it, load the index, and
+/// return the coordinate normalized onto the paths the index stores.
+fn parse_and_prepare(raw: &str, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
+    prepare(Coordinate::parse(raw)?, cwd)
+}
+
+fn prepare(coord: Coordinate, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
+    let root = find_workspace_root(coord.absolute_parent().as_deref(), cwd);
+    let graph = get_or_sync_graph(&root)?;
+    Ok((graph, coord.normalize_against(&root)))
 }

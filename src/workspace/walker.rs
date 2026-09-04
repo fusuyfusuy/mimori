@@ -117,6 +117,38 @@ pub fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Find the workspace root for a target.
+///
+/// 1. Walk up from the target's directory for a `.mimori`, then a VCS root.
+/// 2. Otherwise, if the cwd contains the target, use the cwd.
+/// 3. Otherwise fall back to the target's own directory.
+///
+/// The previous rule was step 3 unconditionally, so an absolute coordinate
+/// inside a repository silently indexed only that one directory -- hiding
+/// callers elsewhere and writing a stray SQLite index into a source folder.
+/// Step 3 survives only for a target that lies outside any known workspace.
+pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
+    let Some(target_dir) = target_dir else {
+        return cwd.to_path_buf();
+    };
+
+    for marker in [".mimori", ".git"] {
+        let mut dir = Some(target_dir);
+        while let Some(d) = dir {
+            if d.join(marker).exists() {
+                return d.to_path_buf();
+            }
+            dir = d.parent();
+        }
+    }
+
+    if target_dir.starts_with(cwd) {
+        return cwd.to_path_buf();
+    }
+
+    target_dir.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +174,42 @@ mod tests {
         }
         assert!(!has_supported_extension(Path::new("a.md")));
         assert!(!has_supported_extension(Path::new("noext")));
+    }
+
+    #[test]
+    fn workspace_root_walks_up_to_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let nested = root.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(root.join(".mimori")).unwrap();
+
+        // Regression M5: this used to return `nested` itself.
+        assert_eq!(find_workspace_root(Some(&nested), Path::new("/nowhere")), root);
+    }
+
+    #[test]
+    fn workspace_root_prefers_a_containing_cwd_over_the_file_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().canonicalize().unwrap();
+        let nested = cwd.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+
+        // Regression M5: this used to return `nested`, indexing one directory.
+        assert_eq!(find_workspace_root(Some(&nested), &cwd), cwd);
+    }
+
+    #[test]
+    fn a_target_outside_any_workspace_roots_at_its_own_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loose = tmp.path().canonicalize().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        // Pointing at a loose file from an unrelated cwd must still work.
+        assert_eq!(
+            find_workspace_root(Some(&loose), elsewhere.path()),
+            loose
+        );
     }
 
     #[test]
