@@ -65,7 +65,7 @@ pub struct FindArgs {
     #[arg(help = "Search pattern")]
     pub pattern: String,
 
-    #[arg(short = 's', long, help = "Symbols only")]
+    #[arg(short = 's', long, conflicts_with = "files_only", help = "Symbols only")]
     pub symbols_only: bool,
 
     #[arg(short = 'f', long, help = "Files only")]

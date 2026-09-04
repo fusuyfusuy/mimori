@@ -208,7 +208,11 @@ fn main() -> ExitCode {
         Commands::Clean(args) => {
             match clean_cache(&current_dir, args.all) {
                 Ok(_) => {
-                    println!("Cleaned .mimori cache.");
+                    if cli.json {
+                        println!("{}", json!({ "cleaned": true, "all": args.all }));
+                    } else {
+                        println!("Cleaned .mimori cache.");
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -223,7 +227,11 @@ fn main() -> ExitCode {
                 eprintln!("Error creating {}: {}", mimori_dir.display(), e);
                 return ExitCode::FAILURE;
             }
-            println!("Initialized .mimori workspace memory");
+            if cli.json {
+                println!("{}", json!({ "initialized": mimori_dir.display().to_string() }));
+            } else {
+                println!("Initialized .mimori workspace memory");
+            }
             ExitCode::SUCCESS
         }
         Commands::Log(args) => {

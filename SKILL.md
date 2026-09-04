@@ -31,7 +31,7 @@ All commands output compact Markdown optimized for LLM prompt context windows by
 
 ## GLOBAL OPTIONS
 * `--json`  
-  Emit all query results as structured JSON instead of human/LLM-readable Markdown.
+  Emit results as structured JSON instead of human/LLM-readable Markdown. Honoured by every subcommand, including the `init` and `clean` acknowledgements.
 * `-h`, `--help`  
   Print help information.
 * `-V`, `--version`  
@@ -67,7 +67,7 @@ mimori find <pattern> [-s|--symbols-only] [-f|--files-only] [--json]
 ```
 Search for symbols and files across the repository, ordered by exact match and in-degree PageRank centrality.
 * `-s`, `--symbols-only`: Restrict search hits strictly to symbol declarations.
-* `-f`, `--files-only`: Restrict search hits strictly to file paths.
+* `-f`, `--files-only`: Restrict search hits strictly to file paths. Mutually exclusive with `-s`; passing both exits `2`.
 * *Hybrid Fallback*: When zero symbols **and** files match, falls back to a case-insensitive literal scan of indexed symbol **bodies**, locating configuration tokens, string literals, and builder patterns. Text outside any symbol body -- imports, module-level statements, comments between declarations -- is not covered; use `rg` for those.
 
 ### `up`
