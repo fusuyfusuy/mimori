@@ -3,6 +3,13 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// Bumped whenever parsing or the stored symbol/reference format changes.
+///
+/// Without this, a format change decodes through `unwrap_or_default()` at load
+/// time and yields an empty reference list rather than an error -- a graph with
+/// zero edges, on a database that reports itself as fresh.
+pub const PARSER_VERSION: i64 = 2;
+
 pub struct Database {
     conn: Connection,
 }
@@ -57,7 +64,25 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges(callee_id);",
         )?;
 
-        Ok(Database { conn })
+        let db = Database { conn };
+        db.enforce_parser_version()?;
+        Ok(db)
+    }
+
+    /// Discard everything cached by an older parser. Deleting from `files`
+    /// cascades to `symbols`.
+    fn enforce_parser_version(&self) -> Result<()> {
+        let found: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        if found != PARSER_VERSION {
+            self.conn.execute("DELETE FROM files", [])?;
+            self.conn
+                .execute_batch(&format!("PRAGMA user_version = {PARSER_VERSION};"))?;
+        }
+
+        Ok(())
     }
 
     pub fn get_file_records(&self) -> Result<std::collections::HashMap<String, (i64, i64, String)>> {
@@ -174,15 +199,4 @@ impl Database {
         Ok(symbols)
     }
 
-    pub fn update_centralities(&mut self, symbols: &[Symbol]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        for s in symbols {
-            tx.execute(
-                "UPDATE symbols SET centrality = ? WHERE name = ? AND file_id = (SELECT id FROM files WHERE path = ?)",
-                params![s.centrality, s.name, s.file],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
 }

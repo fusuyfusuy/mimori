@@ -1,12 +1,63 @@
-use crate::model::Symbol;
-use crate::parser::parse_file;
-use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
-pub fn discover_and_parse_workspace(root: &Path) -> Result<(Vec<PathBuf>, Vec<Symbol>)> {
+/// One source file as found on disk: its path relative to the workspace root,
+/// its mtime, a content hash, and the content itself.
+///
+/// The hash is what decides whether a reparse is needed. mtime is carried only
+/// so it can be recorded; it is never trusted for invalidation, because any
+/// operation that preserves mtime while changing content (`cp -p`, `touch -r`,
+/// `rsync -t`) would otherwise leave the index permanently stale.
+pub struct FileScan {
+    pub rel: PathBuf,
+    pub mtime: i64,
+    pub hash: String,
+    pub content: String,
+}
+
+/// Directory names never indexed, matched as whole path components relative to
+/// the workspace root. Substring matching on the absolute path would exclude an
+/// entire repository that merely lives under e.g. `~/build/`.
+const IGNORED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "dist",
+    "build",
+    "vendor",
+    ".mimori",
+];
+
+const SUPPORTED_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "py", "go"];
+
+/// Walk the workspace, then read and hash every supported file in parallel.
+///
+/// Reading every file on every run is what makes hash-based invalidation
+/// possible: a content change cannot be detected without reading the content.
+/// Parsing, which dominates the cost, still runs only on files whose hash moved.
+pub fn scan_workspace(root: &Path) -> Vec<FileScan> {
+    let paths = discover_workspace_files(root);
+
+    paths
+        .into_par_iter()
+        .filter_map(|(rel, full, mtime)| {
+            let content = fs::read_to_string(&full).ok()?;
+            let hash = format!("{:x}", fnv1a_hash(content.as_bytes()));
+            Some(FileScan {
+                rel,
+                mtime,
+                hash,
+                content,
+            })
+        })
+        .collect()
+}
+
+fn discover_workspace_files(root: &Path) -> Vec<(PathBuf, PathBuf, i64)> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -15,81 +66,87 @@ pub fn discover_and_parse_workspace(root: &Path) -> Result<(Vec<PathBuf>, Vec<Sy
         .git_exclude(true)
         .add_custom_ignore_filename(".mimoriignore");
 
-    let mut discovered_files = Vec::new();
+    let mut list = Vec::new();
 
-    for result in builder.build() {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
+    for entry in builder.build().flatten() {
         let path = entry.path();
-        if path.is_file() {
-            let path_str = path.to_string_lossy();
-            if is_ignored_path(&path_str) {
-                continue;
-            }
-
-            if has_supported_extension(path) {
-                let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-                discovered_files.push(rel_path);
-            }
+        if !path.is_file() || !has_supported_extension(path) {
+            continue;
         }
+
+        let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        if is_ignored_rel(&rel) {
+            continue;
+        }
+
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+
+        list.push((rel, path.to_path_buf(), mtime));
     }
 
-    // Parallel parse all files
-    let symbols: Vec<Symbol> = discovered_files
-        .par_iter()
-        .flat_map(|rel_path| {
-            let full_path = root.join(rel_path);
-            let content = match fs::read_to_string(&full_path) {
-                Ok(c) => c,
-                Err(_) => return Vec::new(),
-            };
-
-            let file_str = rel_path.to_string_lossy();
-            match parse_file(&full_path, &content) {
-                Ok(mut syms) => {
-                    for s in &mut syms {
-                        s.file = file_str.to_string();
-                    }
-                    syms
-                }
-                Err(_) => Vec::new(),
-            }
-        })
-        .collect();
-
-    Ok((discovered_files, symbols))
+    list
 }
 
-fn has_supported_extension(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("rs")
-            | Some("ts")
-            | Some("tsx")
-            | Some("js")
-            | Some("jsx")
-            | Some("py")
-            | Some("go")
-    )
+pub fn has_supported_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext))
 }
 
-fn is_ignored_path(path_str: &str) -> bool {
-    let ignores = [
-        "/target/",
-        "/node_modules/",
-        "/.git/",
-        "/dist/",
-        "/build/",
-        "/vendor/",
-        "/.mimori/",
-        "target/",
-        "node_modules/",
-        ".git/",
-        ".mimori/",
-    ];
+/// True when any component of the workspace-relative path is an ignored
+/// directory name.
+pub fn is_ignored_rel(rel: &Path) -> bool {
+    rel.components().any(|c| match c {
+        Component::Normal(name) => IGNORED_DIRS.iter().any(|d| OsStr::new(d) == name),
+        _ => false,
+    })
+}
 
-    ignores.iter().any(|&ign| path_str.contains(ign))
+pub fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_match_components_not_substrings() {
+        assert!(is_ignored_rel(Path::new("target/debug/x.rs")));
+        assert!(is_ignored_rel(Path::new("a/node_modules/b/c.js")));
+        assert!(is_ignored_rel(Path::new(".mimori/index.rs")));
+
+        // Regression M14: a repo living under a path containing an ignored name
+        // must still be indexed. These are workspace-relative, so the parent
+        // directory never appears here.
+        assert!(!is_ignored_rel(Path::new("src/lib.rs")));
+        assert!(!is_ignored_rel(Path::new("src/building/mod.rs")));
+        assert!(!is_ignored_rel(Path::new("src/targeting.rs")));
+    }
+
+    #[test]
+    fn extension_filter_covers_the_supported_set() {
+        for ext in SUPPORTED_EXTENSIONS {
+            assert!(has_supported_extension(Path::new(&format!("a.{ext}"))));
+        }
+        assert!(!has_supported_extension(Path::new("a.md")));
+        assert!(!has_supported_extension(Path::new("noext")));
+    }
+
+    #[test]
+    fn hash_distinguishes_same_length_content() {
+        // Same byte length, different content: the case mtime+size cannot catch.
+        assert_ne!(fnv1a_hash(b"pub fn aaa() {}"), fnv1a_hash(b"pub fn bbb() {}"));
+    }
 }
