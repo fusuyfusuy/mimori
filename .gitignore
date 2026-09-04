@@ -1,0 +1,5 @@
+/target
+.mimori/cache*
+.mimori/index.db*
+**/*.rs.bk
+*.log
