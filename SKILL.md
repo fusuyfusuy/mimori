@@ -23,7 +23,7 @@ mimori clean  [--all]
 ```
 
 ## DESCRIPTION
-**`mimori`** provides sub-millisecond, token-dense structural code intelligence for AI agents and developers. It statically embeds Tree-sitter parsers for Rust, TypeScript/JavaScript, Python, and Go, indexing functions, methods, classes, traits, interfaces, exported constants, builder patterns, and object literal members (e.g. tRPC routers, Drizzle tables, Hono routes). It builds an in-memory cross-file dependency graph, computes architectural centrality via in-degree PageRank, and persists incremental states into an embedded SQLite database (`.mimori/index.db`).
+**`mimori`** provides token-dense structural code intelligence for AI agents and developers. It statically embeds Tree-sitter parsers for Rust, TypeScript/JavaScript, Python, and Go, indexing functions, methods, classes, traits, interfaces, exported constants, builder patterns, and object literal members (e.g. tRPC routers, Drizzle tables, Hono routes). It builds an in-memory cross-file dependency graph, computes architectural centrality via in-degree PageRank, and persists parsed symbols into an embedded SQLite database (`.mimori/index.db`). Indexing is near-linear in workspace size; a warm run on a 481,200-symbol workspace takes ~1.8s, and small repositories index in milliseconds.
 
 All commands output compact Markdown optimized for LLM prompt context windows by default, or machine-readable JSON when `--json` is specified.
 
@@ -68,7 +68,7 @@ mimori find <pattern> [-s|--symbols-only] [-f|--files-only] [--json]
 Search for symbols and files across the repository, ordered by exact match and in-degree PageRank centrality.
 * `-s`, `--symbols-only`: Restrict search hits strictly to symbol declarations.
 * `-f`, `--files-only`: Restrict search hits strictly to file paths.
-* *Hybrid Fallback*: When zero AST symbols match, automatically falls back to an in-index trigram/token literal search to locate configuration tokens, string literals, and builder patterns.
+* *Hybrid Fallback*: When zero symbols **and** files match, falls back to a case-insensitive literal scan of indexed symbol **bodies**, locating configuration tokens, string literals, and builder patterns. Text outside any symbol body -- imports, module-level statements, comments between declarations -- is not covered; use `rg` for those.
 
 ### `up`
 ```shell
@@ -86,17 +86,17 @@ Display all downstream **callees** (functions, methods, types) invoked or refere
 ```shell
 mimori blast <target> [-d|--depth <N>] [--json]
 ```
-Evaluate the transitive **blast radius** (ripple impact) when `<target>` changes. Traverses the upstream reachability closure up to depth `N` (default: 3), reporting affected callers, entry points (`main`, API handlers), and test suites.
+Evaluate the transitive **blast radius** (ripple impact) when `<target>` changes. Traverses the upstream reachability closure up to depth `N` (default: 3), reporting affected callers, entry points, and test suites. An entry point is a symbol with no callers, or one named `main`; test detection matches real conventions (`tests/`, `__tests__/`, `_test.go`, `.spec.ts`, `test_*`) rather than any path containing the substring "test".
 
 ### `dump`
 ```shell
-mimori dump [--file] [--json]
+mimori dump [--file] [--scope <dir>] [--seed <term>] [--limit <N>] [--json]
 ```
+Emit a full repository context snapshot. Combines the centrality-ranked repository map with the recent action history from `.mimori/activity.jsonl`.
+* `--file`: Write output to `.mimori/.cache/context.md` instead of stdout.
 * `--scope <dir>`: Restrict the snapshot to files within the specified directory.
 * `--seed <term>`: Bias the ranking toward symbols whose name or file matches the term.
 * `--limit <N>`: Keep only the top `N` symbols by centrality.
-Emit a full repository context snapshot. Combines the centrality-ranked repository map with the recent action history from `.mimori/activity.jsonl`.
-* `--file`: Writes output directly to `.mimori/.cache/context.md`.
 
 ### `log`
 ```shell
@@ -128,8 +128,20 @@ Commands accept coordinates in three formats:
    Targets a specific declaration within a file (e.g., `src/auth.rs:authenticate` or `src/service.ts:UserService::findUser`).
 2. **Line Coordinate**: `path/to/file:#L<start>-<end>`  
    Targets a precise line slice (e.g., `src/main.rs:#L20-45`).
-3. **Bare Symbol**: `<symbol>`  
-   Lookups by name across the workspace. If ambiguous, returns a ranked list of candidate coordinates ordered by PageRank centrality.
+3. **Bare Symbol**: `<symbol>` or `<Type>::<method>`  
+   Lookup by name across the workspace.
+
+### Resolution order
+
+A file coordinate is matched in tiers, and the first tier that produces candidates wins:
+
+1. exact workspace-relative path (absolute paths normalize into this tier),
+2. path suffix on a **component** boundary (`alpha/mod.rs` matches `src/alpha/mod.rs`, `ha/mod.rs` does not),
+3. basename alone.
+
+**If any tier matches more than one symbol, the command exits `1` and prints the candidates
+ranked by centrality.** `mimori` never silently picks between two files sharing a basename
+such as `mod.rs`, `index.ts`, or `__init__.py`.
 
 ---
 
@@ -139,7 +151,11 @@ Commands accept coordinates in three formats:
 Rather than dumping symbols alphabetically or in source order, `mimori` models caller $\to$ callee dependency topology and computes in-degree PageRank via power iteration ($d = 0.85$, 25 iterations). Foundational abstractions (traits, types, shared utilities) rank highest, ensuring token budgets are spent on architectural backbones rather than leaf helpers.
 
 ### Persistence & Incremental Synchronization
-Parsed ASTs, coordinates, and PageRank scores are persisted into `.mimori/index.db` using embedded SQLite with WAL (Write-Ahead Logging). File modifications are tracked with nanosecond timestamps and FNV-1a content hashes. Only edited files are re-parsed; point lookups execute in `< 1ms`.
+Parsed symbols, coordinates, and references are persisted into `.mimori/index.db` using embedded SQLite with WAL (Write-Ahead Logging). Centrality is recomputed on load rather than stored.
+
+Re-parsing is decided by **FNV-1a content hash**, not by timestamp: every source file is read and hashed on every run, and only files whose hash changed are re-parsed. Trusting mtime would let `cp -p`, `touch -r`, `rsync -t` or a `tar` extraction leave the index permanently stale. Reading and hashing costs roughly 0.4% of a warm run.
+
+The index is derived data, safe to delete at any time, and rebuilds automatically when the embedded parser version changes.
 
 ---
 
@@ -149,9 +165,9 @@ When exploring or modifying a codebase, AI agents should follow the **Canopy $\t
 
 1. **Canopy (Orientation)**:
    ```shell
-   mimori map --scope <dir>
+   mimori map --scope <dir> --limit 100
    ```
-   Inspect the high-centrality symbols and entry points of the target subsystem without reading raw files.
+   Inspect the high-centrality symbols and entry points of the target subsystem without reading raw files. `--limit` caps the output at the top `N` symbols by centrality, which is what keeps a large workspace inside a token budget.
 
 2. **1-Hop Slice (Inspection)**:
    ```shell
@@ -222,15 +238,21 @@ mimori clean --all
 ## FILES
 * `.mimori/index.db`: Embedded SQLite database storing file records, parsed symbols, and PageRank centrality scores.
 * `.mimori/index.db-wal`: SQLite write-ahead log.
-* `.mimori/activity.jsonl`: Append-only JSONL log of discrete agent actions recorded via `mimori log`.
+* `.mimori/activity.jsonl`: Append-only JSONL log of discrete agent actions recorded via `mimori log`. Rotates to `activity.jsonl.1` past 1 MiB.
 * `.mimori/.cache/context.md`: Persisted context dump snapshot generated by `mimori dump --file`.
 * `.mimoriignore`: Optional ignore file supplementing `.gitignore` for custom exclusion patterns.
 
 ---
 
+## ENVIRONMENT
+* `MIMORI_PROFILE`: When set to any value, prints per-phase indexing timings to stderr. Costs nothing when unset.
+
+---
+
 ## EXIT STATUS
 * `0`: Success.
-* `1`: Command failure, symbol not found, coordinate parse error, or database error.
+* `1`: Symbol not found, ambiguous coordinate, coordinate parse error, unreadable workspace, or database error.
+* `2`: Invalid command-line arguments.
 
 ---
 

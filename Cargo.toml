@@ -1,6 +1,6 @@
 [package]
 name = "mimori"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["mimori team"]
 description = "High-performance AST code-intelligence and symbol-graph CLI"

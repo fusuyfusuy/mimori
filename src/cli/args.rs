@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "mimori",
     author = "mimori team",
-    version = "2.0.0",
+    version,
     about = "High-performance AST code-intelligence and symbol-graph CLI"
 )]
 pub struct Cli {

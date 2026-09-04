@@ -9,14 +9,15 @@
 
 ## What is mimori?
 
-`mimori` gives AI coding agents and developers sub-millisecond, token-dense structural code intelligence and spatial awareness without background daemons:
+`mimori` gives AI coding agents and developers token-dense structural code intelligence and spatial awareness without background daemons:
 
 - **Polyglot Embedded Tree-sitter AST**: Statically embeds Tree-sitter parsers for Rust, TypeScript/JavaScript, Python, and Go. Indexes functions, methods, classes, traits, interfaces, exported constants, builder patterns, and object literal members (e.g. tRPC routers, Drizzle tables, Hono routes).
-- **In-Degree PageRank Centrality**: Ranks architectural entry points, hubs, and core data abstractions using power iteration ($d=0.85$, 25 iterations). Pass `--seed <token>` to prioritize symbols, or `--focus <symbol>` for Personalized PageRank (PPR) around a specific component.
+- **In-Degree PageRank Centrality**: Ranks architectural entry points, hubs, and core data abstractions using power iteration (*d*=0.85, 25 iterations). Pass `--seed <term>` to bias the ranking toward matching symbols, or `--focus <symbol>` for Personalized PageRank around a specific component.
 - **Context-Aware Slicing**: Extract isolated code slices containing exact source coordinates, 1-hop callers/callees, inlined private local callees (`-f`), and top-of-file imports (`-i`). Consumes ~120 tokens vs 3,000+ for raw whole-file reads.
-- **Transitive Blast Radius**: Evaluate ripple impact up to depth $N$ before editing (`blast`), reporting affected callers, entry points (`main`, API handlers), and test suites.
-- **Hybrid Search Fallback**: Fast symbol search across the codebase (`find`). When zero AST symbols match, automatically falls back to in-index literal token search.
-- **Zero-Daemon SQLite Cache**: Persistent incremental index in `.mimori/index.db` (WAL mode). Tracks file changes via nanosecond timestamps and FNV-1a content hashing. Point lookups execute in `< 1ms`.
+- **Unambiguous Coordinates**: A coordinate resolves to exactly one symbol, or the command fails and lists the candidates. `mimori` never silently picks between two files that share a basename.
+- **Transitive Blast Radius**: Evaluate ripple impact up to depth *N* before editing (`blast`), reporting affected callers, entry points, and test suites.
+- **Hybrid Search Fallback**: Fast symbol and file search (`find`). When zero symbols or files match, falls back to a literal scan of indexed symbol bodies.
+- **Zero-Daemon SQLite Cache**: Persistent incremental index in `.mimori/index.db` (WAL mode). Re-parsing is decided by FNV-1a **content hash**, so an edit that preserves the file's mtime cannot leave the index stale.
 - **Action Journaling**: High-signal action logging (`log`) and single-shot context snapshots (`dump`) for agent turn-to-turn memory.
 
 ---
@@ -34,8 +35,7 @@ Or clone and build:
 ```bash
 git clone https://github.com/fusuyfusuy/mimori.git
 cd mimori
-cargo build --release
-cp target/release/mimori ~/.local/bin/
+cargo install --path .
 ```
 
 ---
@@ -57,12 +57,32 @@ mimori log    -a|--action <slug> -s|--summary <text> [-f|--files <f1,f2>] [--jso
 mimori clean  [--all]
 ```
 
+### Coordinates
+
+```shell
+src/auth.rs:authenticate          # symbol in a file
+src/service.ts:UserService::findUser
+src/main.rs:#L20-45               # line range (read straight off disk, no index)
+authenticate                      # bare name, resolved across the workspace
+```
+
+A file coordinate is matched by exact path first, then by a path suffix on a component
+boundary, then by basename. **Whenever a tier matches more than one symbol, the command
+exits non-zero and prints the candidates** rather than guessing:
+
+```shell
+$ mimori slice mod.rs:handler
+Error: Ambiguous symbol 'mod.rs:handler'. Multiple matches found, please specify full coordinate:
+  - `src/alpha/mod.rs:handler` (function) [rank: 0.0142]
+  - `src/beta/mod.rs:handler` (function) [rank: 0.0138]
+```
+
 ### Examples
 
 #### 1. Warm up workspace and snapshot context
 ```shell
 mimori init
-mimori dump --file
+mimori dump --file --scope src --limit 200
 ```
 
 #### 2. Search for high-centrality symbols or literals
@@ -85,6 +105,56 @@ mimori blast src/db/connection.rs:query -d 3
 ```shell
 mimori log -a "oauth-refresh" -s "Migrated token refresh to Redis with 5m TTL" -f "src/auth.ts,src/redis.ts"
 ```
+
+---
+
+## Performance
+
+Indexing is near-linear in workspace size. Measured on a 1200-file / 38MB / 481,200-symbol
+corpus (4 cores):
+
+| Workspace | Cold (full parse) | Warm (no changes) |
+| --------- | ----------------- | ----------------- |
+| this repo (~4k lines) | 0.05s | &lt;0.01s |
+| 120,300 symbols | 2.1s | 0.45s |
+| 481,200 symbols | 7.9s | 1.75s |
+
+Every command reads and hashes every source file so the index cannot go stale; that costs
+about 0.4% of a warm run. Only files whose hash changed are re-parsed.
+
+Set `MIMORI_PROFILE=1` to print per-phase timings to stderr:
+
+```shell
+$ MIMORI_PROFILE=1 mimori map >/dev/null
+  [profile] scan+read+hash        95.2ms
+  [profile] load_all_symbols     553.4ms
+  [profile]   edge resolve       291.2ms
+  [profile]   pagerank           203.6ms
+```
+
+---
+
+## Files
+
+| Path | Purpose |
+| ---- | ------- |
+| `.mimori/index.db` | SQLite index of files, symbols, and references (WAL). |
+| `.mimori/activity.jsonl` | Append-only action journal written by `mimori log`; rotates at 1 MiB. |
+| `.mimori/.cache/context.md` | Snapshot written by `mimori dump --file`. |
+| `.mimoriignore` | Optional extra ignore patterns, supplementing `.gitignore`. |
+
+The index is derived data and is safe to delete at any time; `mimori clean` does it for you.
+It rebuilds automatically whenever the embedded parser version changes.
+
+---
+
+## Exit status
+
+| Code | Meaning |
+| ---- | ------- |
+| `0` | Success. |
+| `1` | Symbol not found, ambiguous coordinate, unreadable workspace, or database error. |
+| `2` | Invalid command-line arguments. |
 
 ---
 
