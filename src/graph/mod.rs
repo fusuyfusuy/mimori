@@ -358,7 +358,19 @@ fn slice_line_coordinate(target: &str, with_imports: bool) -> Result<SliceResult
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
 
-    let start_idx = (start - 1).min(total_lines);
+    // Normalize: accept reversed ranges, floor at line 1, fail past end of file.
+    let (start, end) = if start > end { (end, start) } else { (start, end) };
+    let start = start.max(1);
+    if start > total_lines {
+        bail!(
+            "Line {} is past the end of {} ({} lines).",
+            start,
+            file_str,
+            total_lines
+        );
+    }
+
+    let start_idx = start - 1;
     let end_idx = end.min(total_lines);
 
     let mut sliced = String::new();
@@ -389,4 +401,55 @@ fn slice_line_coordinate(target: &str, with_imports: bool) -> Result<SliceResult
         total_lines: end_idx - start_idx,
         imports,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fixture(lines: usize) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 1..=lines {
+            writeln!(f, "line {i}").unwrap();
+        }
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn line_zero_does_not_underflow() {
+        // (start - 1) on line 0 wrapped to usize::MAX. Regression: M3/graph.rs:361.
+        let f = fixture(10);
+        let target = format!("{}:#L0-5", f.path().display());
+        let res = slice_line_coordinate(&target, false).unwrap();
+        assert_eq!(res.line_range, Some((1, 5)));
+        assert!(res.content.contains("line 1"));
+    }
+
+    #[test]
+    fn reversed_ranges_are_normalized() {
+        // lines[7..2] panicked. Regression: M3/graph.rs:365.
+        let f = fixture(10);
+        let target = format!("{}:#L8-2", f.path().display());
+        let res = slice_line_coordinate(&target, false).unwrap();
+        assert_eq!(res.line_range, Some((2, 8)));
+        assert!(res.content.contains("line 2") && res.content.contains("line 8"));
+    }
+
+    #[test]
+    fn start_past_end_of_file_is_an_error() {
+        let f = fixture(10);
+        let target = format!("{}:#L400-500", f.path().display());
+        let err = slice_line_coordinate(&target, false).unwrap_err().to_string();
+        assert!(err.contains("past the end"), "got: {err}");
+    }
+
+    #[test]
+    fn end_past_end_of_file_clamps() {
+        let f = fixture(10);
+        let target = format!("{}:#L8-500", f.path().display());
+        let res = slice_line_coordinate(&target, false).unwrap();
+        assert!(res.content.contains("line 10"));
+    }
 }

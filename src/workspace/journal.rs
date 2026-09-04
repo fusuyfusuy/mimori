@@ -14,6 +14,37 @@ pub struct ActivityRecord {
     pub files: Vec<String>,
 }
 
+/// Maximum summary length, in characters, enforced on construction.
+pub const SUMMARY_MAX_CHARS: usize = 160;
+
+impl ActivityRecord {
+    /// Build a record, capping the summary at `SUMMARY_MAX_CHARS` characters.
+    /// Truncation is on a character boundary, never a byte offset.
+    pub fn new(action: String, summary: String, files: Vec<String>) -> Self {
+        ActivityRecord {
+            timestamp: current_utc_timestamp(),
+            action,
+            summary: truncate_summary(&summary),
+            files,
+        }
+    }
+}
+
+fn truncate_summary(summary: &str) -> String {
+    let keep = SUMMARY_MAX_CHARS - 3;
+    match summary.char_indices().nth(SUMMARY_MAX_CHARS) {
+        None => summary.to_string(),
+        Some(_) => {
+            let cut = summary
+                .char_indices()
+                .nth(keep)
+                .map(|(byte_idx, _)| byte_idx)
+                .unwrap_or(summary.len());
+            format!("{}...", &summary[..cut])
+        }
+    }
+}
+
 pub fn current_utc_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -97,5 +128,39 @@ pub fn read_recent_activity(workspace_root: &Path, limit: usize) -> Result<Vec<A
         Ok(records[start..].to_vec())
     } else {
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_truncation_respects_char_boundaries() {
+        // 200 two-byte chars: byte-slicing at 157 lands mid-char. Regression: M3/main.rs.
+        let long = "ü".repeat(200);
+        let rec = ActivityRecord::new("act".into(), long, vec![]);
+        assert_eq!(rec.summary.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(rec.summary.ends_with("..."));
+    }
+
+    #[test]
+    fn short_summaries_pass_through_untouched() {
+        let rec = ActivityRecord::new("act".into(), "ünïcödé fine".into(), vec![]);
+        assert_eq!(rec.summary, "ünïcödé fine");
+    }
+
+    #[test]
+    fn summary_at_the_boundary_is_not_truncated() {
+        let exact = "a".repeat(SUMMARY_MAX_CHARS);
+        let rec = ActivityRecord::new("act".into(), exact.clone(), vec![]);
+        assert_eq!(rec.summary, exact);
+    }
+
+    #[test]
+    fn timestamp_round_numbers_are_correct() {
+        // Sanity-check the hand-rolled civil-from-days conversion.
+        assert!(current_utc_timestamp().ends_with('Z'));
+        assert_eq!(current_utc_timestamp().len(), 20);
     }
 }

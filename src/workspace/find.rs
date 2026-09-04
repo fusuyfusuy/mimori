@@ -123,17 +123,8 @@ pub fn execute_find(
     if matches.is_empty() {
         for s in &graph.symbols {
             let body_lower = s.body.to_lowercase();
-            if let Some(pos) = body_lower.find(&q_lower) {
-                let prefix = &s.body[..pos];
-                let line_offset = prefix.matches('\n').count();
+            if let Some((line_offset, line_text)) = locate_literal(&s.body, &body_lower, &q_lower) {
                 let match_line = s.start_line + line_offset;
-
-                let line_text = s
-                    .body
-                    .lines()
-                    .nth(line_offset)
-                    .unwrap_or("")
-                    .trim();
 
                 matches.push(FindMatch {
                     name: format!("{} (literal match)", s.name),
@@ -162,4 +153,47 @@ pub fn execute_find(
         query: query.to_string(),
         matches,
     })
+}
+
+/// Locate `needle` (already lowercased) within `body_lower`, returning the
+/// 0-based line offset of the match and that line's text from the original
+/// `body`.
+///
+/// `body_lower` is indexed rather than `body` because lowercasing is not
+/// byte-length preserving (e.g. 'İ' grows from 2 bytes to 3). Case mapping
+/// never adds or removes newlines, so the line offset is valid in both.
+fn locate_literal<'a>(body: &'a str, body_lower: &str, needle: &str) -> Option<(usize, &'a str)> {
+    let pos = body_lower.find(needle)?;
+    let line_offset = body_lower[..pos].matches('\n').count();
+    let line_text = body.lines().nth(line_offset).unwrap_or("").trim();
+    Some((line_offset, line_text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locate_literal_handles_multibyte_case_expansion() {
+        // 'İ' is 2 bytes but lowercases to 3, so a byte offset taken from the
+        // lowered string is invalid in the original. Regression: M3/find.rs.
+        let body = "fn f() {\n    // İİİİİİİİİİ marker\n    \"İstanbul\"\n}";
+        let lower = body.to_lowercase();
+        assert!(lower.len() > body.len(), "test needs case expansion");
+
+        let (offset, text) = locate_literal(body, &lower, "marker").unwrap();
+        assert_eq!(offset, 1, "marker is on the second line");
+        assert!(text.contains("marker"), "got: {text}");
+
+        // Must not panic even when the offset lands near the end.
+        let (offset, text) = locate_literal(body, &lower, "stanbul").unwrap();
+        assert_eq!(offset, 2);
+        assert!(text.contains("stanbul"), "got: {text}");
+    }
+
+    #[test]
+    fn locate_literal_returns_none_when_absent() {
+        let body = "fn f() {}";
+        assert!(locate_literal(body, &body.to_lowercase(), "zzz").is_none());
+    }
 }

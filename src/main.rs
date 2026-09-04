@@ -212,18 +212,8 @@ fn main() -> ExitCode {
                 None => Vec::new(),
             };
 
-            let summary = if args.summary.len() > 160 {
-                format!("{}...", &args.summary[..157])
-            } else {
-                args.summary.clone()
-            };
-
-            let record = mimori::workspace::ActivityRecord {
-                timestamp: mimori::workspace::current_utc_timestamp(),
-                action: args.action.clone(),
-                summary,
-                files,
-            };
+            let record =
+                mimori::workspace::ActivityRecord::new(args.action.clone(), args.summary, files);
 
             if let Err(e) = mimori::workspace::append_activity(&current_dir, &record) {
                 eprintln!("Error logging activity: {}", e);
