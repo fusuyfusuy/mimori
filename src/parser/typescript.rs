@@ -106,6 +106,11 @@ fn walk_ts_node(
                                 extract_object_literal_members(arg, content, file, name, symbols);
                             }
                         }
+                        // Return as the class_declaration arm does. Falling
+                        // through let the generic recursion revisit the same
+                        // method_definition nodes with parent_class = None,
+                        // emitting every shorthand method a second time.
+                        return;
                     }
                 } else if is_top_level_const(node, content) {
                     let symbol = create_symbol(node, content, file, name.to_string(), SymbolKind::Constant);

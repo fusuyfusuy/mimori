@@ -8,7 +8,7 @@ use std::path::Path;
 /// Without this, a format change decodes through `unwrap_or_default()` at load
 /// time and yields an empty reference list rather than an error -- a graph with
 /// zero edges, on a database that reports itself as fresh.
-pub const PARSER_VERSION: i64 = 2;
+pub const PARSER_VERSION: i64 = 3;
 
 pub struct Database {
     conn: Connection,

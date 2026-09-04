@@ -41,26 +41,34 @@ impl SymbolGraph {
         let mut callers_map: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut callees_map: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        // Resolve reference edges
+        // Resolve reference edges.
+        //
+        // A reference is a bare name, so resolution is a guess. The rule is to
+        // guess only when there is nothing to guess between: prefer a match in
+        // the same file, else accept a name that is unique across the
+        // workspace, else record nothing. Linking to every same-named symbol
+        // (the previous behaviour) meant one call to `new` or `get` wired the
+        // caller to all of them, inflating both centrality and blast radius.
         for (u_idx, sym) in symbols.iter().enumerate() {
             for ref_name in &sym.references {
-                if let Some(candidate_indices) = name_to_indices.get(ref_name) {
-                    // Match candidates (prefer same file, otherwise all matching)
-                    let same_file_match = candidate_indices
-                        .iter()
-                        .copied()
-                        .find(|&v_idx| symbols[v_idx].file == sym.file);
+                let Some(candidates) = name_to_indices.get(ref_name) else {
+                    continue;
+                };
 
-                    if let Some(v_idx) = same_file_match {
-                        if u_idx != v_idx {
-                            add_edge(u_idx, v_idx, &mut callers_map, &mut callees_map);
-                        }
-                    } else {
-                        for &v_idx in candidate_indices {
-                            if u_idx != v_idx {
-                                add_edge(u_idx, v_idx, &mut callers_map, &mut callees_map);
-                            }
-                        }
+                let same_file = candidates
+                    .iter()
+                    .copied()
+                    .find(|&v_idx| symbols[v_idx].file == sym.file);
+
+                let resolved = match same_file {
+                    Some(v_idx) => Some(v_idx),
+                    None if candidates.len() == 1 => Some(candidates[0]),
+                    None => None,
+                };
+
+                if let Some(v_idx) = resolved {
+                    if u_idx != v_idx {
+                        add_edge(u_idx, v_idx, &mut callers_map, &mut callees_map);
                     }
                 }
             }
@@ -566,6 +574,48 @@ mod tests {
         let g = graph_of(&[("src/lib.rs", "Store::save"), ("src/lib.rs", "other")]);
         assert!(matches!(at(&g, "Store::save"), Resolution::Unique(_)));
         assert!(matches!(at(&g, "save"), Resolution::Unique(_)));
+    }
+
+    fn sym_with_refs(file: &str, name: &str, refs: &[&str]) -> Symbol {
+        let mut s = sym(file, name);
+        s.references = refs.iter().map(|r| r.to_string()).collect();
+        s
+    }
+
+    #[test]
+    fn a_reference_prefers_a_match_in_its_own_file() {
+        let g = SymbolGraph::new(vec![
+            sym_with_refs("a.rs", "caller", &["target"]),
+            sym("a.rs", "target"),
+            sym("b.rs", "target"),
+        ]);
+        let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].file, "a.rs");
+    }
+
+    #[test]
+    fn a_unique_name_links_across_files() {
+        let g = SymbolGraph::new(vec![
+            sym_with_refs("a.rs", "caller", &["only_one"]),
+            sym("b.rs", "only_one"),
+        ]);
+        let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());
+        assert_eq!(callees.len(), 1, "a unique cross-file name must still link");
+    }
+
+    #[test]
+    fn an_ambiguous_name_links_to_nothing_rather_than_everything() {
+        // Regression M7: one call to `new` used to wire the caller to every
+        // `new` in the workspace, inflating centrality and blast radius.
+        let g = SymbolGraph::new(vec![
+            sym_with_refs("a.rs", "caller", &["new"]),
+            sym("b.rs", "new"),
+            sym("c.rs", "new"),
+            sym("d.rs", "new"),
+        ]);
+        let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());
+        assert!(callees.is_empty(), "got {} spurious edges", callees.len());
     }
 
     #[test]

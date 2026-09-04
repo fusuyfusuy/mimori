@@ -149,7 +149,11 @@ fn collect_references(node: Node, content: &str, refs: &mut Vec<String>) {
         if child.kind() == "call_expression" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 let text = node_text(func_node, content);
-                let func_name = text.rsplit("::").next().unwrap_or(text).trim();
+                // `self.save(1)` has a field_expression as its function, whose
+                // text is "self.save". Splitting only on "::" recorded that
+                // literal string, which matched no symbol -- so method calls,
+                // the majority of calls in idiomatic Rust, produced no edges.
+                let func_name = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
                 if !func_name.is_empty() && !refs.contains(&func_name.to_string()) {
                     refs.push(func_name.to_string());
                 }
@@ -177,4 +181,43 @@ fn extract_signature(body: &str, _kind: &SymbolKind) -> String {
 
 fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
     &content[node.start_byte()..node.end_byte()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refs_of(src: &str, symbol: &str) -> Vec<String> {
+        parse_rust("t.rs", src)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == symbol)
+            .unwrap_or_else(|| panic!("no symbol {symbol}"))
+            .references
+    }
+
+    #[test]
+    fn method_calls_are_recorded_as_references() {
+        // Regression M4: `self.save(1)` recorded the literal "self.save",
+        // which matched no symbol, so method calls produced no edges at all.
+        let src = "struct S; impl S { fn save(&self) {} fn run(&self) { self.save(); } }";
+        assert!(
+            refs_of(src, "S::run").contains(&"save".to_string()),
+            "got {:?}",
+            refs_of(src, "S::run")
+        );
+    }
+
+    #[test]
+    fn path_calls_still_resolve_to_the_final_segment() {
+        let src = "fn f() { crate::db::query_user(); }";
+        assert!(refs_of(src, "f").contains(&"query_user".to_string()));
+    }
+
+    #[test]
+    fn chained_method_calls_record_the_called_method() {
+        let src = "fn f() { let x = builder().with_name().finish(); }";
+        let refs = refs_of(src, "f");
+        assert!(refs.contains(&"finish".to_string()), "got {refs:?}");
+    }
 }
