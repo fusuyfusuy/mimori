@@ -84,6 +84,32 @@ impl SymbolGraph {
         }
     }
 
+    /// Bias the ranking toward symbols whose name or file contains `term`.
+    ///
+    /// `--seed` parsed and was discarded before this existed, while three
+    /// documents described it as working.
+    pub fn seed_indices(&self, term: &str) -> Vec<usize> {
+        let needle = term.to_lowercase();
+        self.symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.name.to_lowercase().contains(&needle)
+                    || s.file.to_lowercase().contains(&needle)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn apply_personalization(&mut self, indices: &[usize]) {
+        pagerank::compute_in_degree_pagerank(
+            &mut self.symbols,
+            &self.callers_map,
+            &self.callees_map,
+            Some(indices),
+        );
+    }
+
     pub fn compute_personalized_pagerank(&mut self, focus: &Coordinate) {
         let focus_indices = self.resolve_all(focus);
         pagerank::compute_in_degree_pagerank(
@@ -346,7 +372,9 @@ pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
     let mut in_multiline_import = false;
     let mut multiline_buf = String::new();
 
-    for line in content.lines().take(100) {
+    // Scan the header generously: a 100-line cap silently dropped imports in
+    // files with long licence blocks or large import lists.
+    for line in content.lines().take(400) {
         let trimmed = line.trim();
 
         if in_multiline_import {
@@ -390,15 +418,8 @@ pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
             } else {
                 imports.push(trimmed.to_string());
             }
-        } else if trimmed.starts_with("import ") {
-            imports.push(trimmed.to_string());
-        } else if trimmed.starts_with("import (") || trimmed == "import (" {
-            in_multiline_import = true;
-            multiline_buf.push_str(line);
-            multiline_buf.push('\n');
-        } else if trimmed.starts_with("import \"")
-            || ((trimmed.starts_with("const ") || trimmed.starts_with("let "))
-                && trimmed.contains("= require("))
+        } else if (trimmed.starts_with("const ") || trimmed.starts_with("let "))
+            && trimmed.contains("= require(")
         {
             imports.push(trimmed.to_string());
         }
@@ -496,8 +517,7 @@ mod tests {
             end_line: 1,
             signature: String::new(),
             body: format!("fn {name}() {{ /* {file} */ }}"),
-            doc: None,
-            centrality: 0.0,
+                centrality: 0.0,
             references: vec![],
         }
     }

@@ -49,19 +49,7 @@ impl Database {
 
              CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
              CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
-             CREATE INDEX IF NOT EXISTS idx_symbols_centrality ON symbols(centrality DESC);
-
-             CREATE TABLE IF NOT EXISTS edges (
-                 caller_id INTEGER NOT NULL,
-                 callee_id INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 PRIMARY KEY (caller_id, callee_id, kind),
-                 FOREIGN KEY(caller_id) REFERENCES symbols(id) ON DELETE CASCADE,
-                 FOREIGN KEY(callee_id) REFERENCES symbols(id) ON DELETE CASCADE
-             );
-
-             CREATE INDEX IF NOT EXISTS idx_edges_caller ON edges(caller_id);
-             CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges(callee_id);",
+             CREATE INDEX IF NOT EXISTS idx_symbols_centrality ON symbols(centrality DESC);",
         )?;
 
         let db = Database { conn };
@@ -155,8 +143,7 @@ impl Database {
     pub fn load_all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.kind, f.path, s.start_line, s.end_line, s.signature, s.body, s.centrality, s.references_json
-             FROM symbols s JOIN files f ON s.file_id = f.id
-             ORDER BY s.centrality DESC",
+             FROM symbols s JOIN files f ON s.file_id = f.id",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -186,8 +173,7 @@ impl Database {
                 end_line: row.get::<_, i64>(4)? as usize,
                 signature: row.get(5)?,
                 body: row.get(6)?,
-                doc: None,
-                centrality: row.get(7)?,
+                        centrality: row.get(7)?,
                 references,
             })
         })?;

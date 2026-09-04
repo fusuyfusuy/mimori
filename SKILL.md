@@ -11,13 +11,13 @@ description: "High-performance code intelligence CLI: AST slicing, symbol search
 ## SYNOPSIS
 ```shell
 mimori init
-mimori map    [--scope <dir>] [--focus <target>] [--seed <term>] [--json]
+mimori map    [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
 mimori slice  <coordinate> [-f|--follow-local] [-i|--with-imports] [--json]
 mimori find   <pattern> [-s|--symbols-only] [-f|--files-only] [--json]
 mimori up     <target> [--json]
 mimori down   <target> [--json]
 mimori blast  <target> [-d|--depth <N>] [--json]
-mimori dump   [--file] [--json]
+mimori dump   [--file] [--scope <dir>] [--seed <term>] [--limit <N>] [--json]
 mimori log    -a|--action <slug> -s|--summary <text> [-f|--files <f1,f2>] [--json]
 mimori clean  [--all]
 ```
@@ -43,12 +43,13 @@ All commands output compact Markdown optimized for LLM prompt context windows by
 
 ### `map`
 ```shell
-mimori map [--scope <dir>] [--focus <target>] [--seed <term>] [--json]
+mimori map [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
 ```
 Generate a hierarchical, centrality-ranked structural outline of codebase symbols, modules, and entry points.
 * `--scope <dir>`: Restrict the map to files within the specified directory.
 * `--focus <target>`: Run Personalized PageRank (PPR) biased toward `<target>` to surface its relevant architectural neighborhood.
-* `--seed <term>`: Prioritize symbols matching the seed keyword.
+* `--seed <term>`: Bias the ranking toward symbols whose name or file matches the term.
+* `--limit <N>`: Keep only the top `N` symbols by centrality.
 
 ### `slice`
 ```shell
@@ -91,6 +92,9 @@ Evaluate the transitive **blast radius** (ripple impact) when `<target>` changes
 ```shell
 mimori dump [--file] [--json]
 ```
+* `--scope <dir>`: Restrict the snapshot to files within the specified directory.
+* `--seed <term>`: Bias the ranking toward symbols whose name or file matches the term.
+* `--limit <N>`: Keep only the top `N` symbols by centrality.
 Emit a full repository context snapshot. Combines the centrality-ranked repository map with the recent action history from `.mimori/activity.jsonl`.
 * `--file`: Writes output directly to `.mimori/.cache/context.md`.
 

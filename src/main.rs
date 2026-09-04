@@ -150,17 +150,17 @@ fn main() -> ExitCode {
                 }
             };
 
-            if let Some(focus_target) = &args.focus {
-                match Coordinate::parse(focus_target) {
-                    Ok(c) => graph.compute_personalized_pagerank(&c.normalize_against(&current_dir)),
-                    Err(e) => {
-                        eprintln!("Error: invalid --focus target: {}", e);
-                        return ExitCode::FAILURE;
-                    }
-                }
+            if let Err(e) = personalize(&mut graph, args.focus.as_deref(), args.seed.as_deref(), &current_dir) {
+                eprintln!("Error: {}", e);
+                return ExitCode::FAILURE;
             }
 
-            let map_result = generate_map(&graph, args.scope.as_deref(), args.focus.as_deref());
+            let map_result = generate_map(
+                &graph,
+                args.scope.as_deref(),
+                args.focus.as_deref(),
+                args.limit,
+            );
 
             if cli.json {
                 match serde_json::to_string_pretty(&map_result) {
@@ -255,14 +255,20 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Dump(args) => {
-            let graph = match get_or_sync_graph(&current_dir) {
+            let mut graph = match get_or_sync_graph(&current_dir) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("Error syncing workspace: {}", e);
                     return ExitCode::FAILURE;
                 }
             };
-            let map_result = generate_map(&graph, None, None);
+
+            if let Err(e) = personalize(&mut graph, None, args.seed.as_deref(), &current_dir) {
+                eprintln!("Error: {}", e);
+                return ExitCode::FAILURE;
+            }
+
+            let map_result = generate_map(&graph, args.scope.as_deref(), None, args.limit);
             let recent_activity =
                 mimori::workspace::read_recent_activity(&current_dir, 10).unwrap_or_default();
 
@@ -314,6 +320,33 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Apply `--focus` (personalized PageRank around a symbol) and/or `--seed`
+/// (bias toward symbols matching a term) to the ranking.
+fn personalize(
+    graph: &mut SymbolGraph,
+    focus: Option<&str>,
+    seed: Option<&str>,
+    cwd: &Path,
+) -> Result<()> {
+    let mut indices = Vec::new();
+
+    if let Some(target) = focus {
+        let coord = Coordinate::parse(target)?.normalize_against(cwd);
+        indices.extend(graph.resolve_all(&coord));
+    }
+    if let Some(term) = seed {
+        indices.extend(graph.seed_indices(term));
+    }
+
+    indices.sort_unstable();
+    indices.dedup();
+
+    if !indices.is_empty() {
+        graph.apply_personalization(&indices);
+    }
+    Ok(())
 }
 
 /// Parse a raw target, locate the workspace root from it, load the index, and

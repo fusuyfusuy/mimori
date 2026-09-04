@@ -121,7 +121,6 @@ fn create_symbol(
         end_line: end_pos.row + 1,
         signature,
         body,
-        doc: None,
         centrality: 0.0,
         references,
     }
