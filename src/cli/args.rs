@@ -97,6 +97,9 @@ pub struct MapArgs {
 
     #[arg(long, help = "Seed term for personalized ranking")]
     pub seed: Option<String>,
+
+    #[arg(long, help = "Keep only the top N symbols by centrality")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -109,6 +112,15 @@ pub struct CleanArgs {
 pub struct DumpArgs {
     #[arg(long, help = "Write context snapshot to .mimori/.cache/context.md")]
     pub file: bool,
+
+    #[arg(long, help = "Scope directory or module")]
+    pub scope: Option<String>,
+
+    #[arg(long, help = "Seed term for personalized ranking")]
+    pub seed: Option<String>,
+
+    #[arg(long, help = "Keep only the top N symbols by centrality")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Args, Debug)]

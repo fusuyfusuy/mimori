@@ -2,7 +2,7 @@ pub mod blast;
 pub mod map;
 pub mod pagerank;
 
-use crate::model::{SliceResult, Symbol};
+use crate::model::{Coordinate, SliceResult, Symbol};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -41,26 +41,34 @@ impl SymbolGraph {
         let mut callers_map: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut callees_map: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        // Resolve reference edges
+        // Resolve reference edges.
+        //
+        // A reference is a bare name, so resolution is a guess. The rule is to
+        // guess only when there is nothing to guess between: prefer a match in
+        // the same file, else accept a name that is unique across the
+        // workspace, else record nothing. Linking to every same-named symbol
+        // (the previous behaviour) meant one call to `new` or `get` wired the
+        // caller to all of them, inflating both centrality and blast radius.
         for (u_idx, sym) in symbols.iter().enumerate() {
             for ref_name in &sym.references {
-                if let Some(candidate_indices) = name_to_indices.get(ref_name) {
-                    // Match candidates (prefer same file, otherwise all matching)
-                    let same_file_match = candidate_indices
-                        .iter()
-                        .copied()
-                        .find(|&v_idx| symbols[v_idx].file == sym.file);
+                let Some(candidates) = name_to_indices.get(ref_name) else {
+                    continue;
+                };
 
-                    if let Some(v_idx) = same_file_match {
-                        if u_idx != v_idx {
-                            add_edge(u_idx, v_idx, &mut callers_map, &mut callees_map);
-                        }
-                    } else {
-                        for &v_idx in candidate_indices {
-                            if u_idx != v_idx {
-                                add_edge(u_idx, v_idx, &mut callers_map, &mut callees_map);
-                            }
-                        }
+                let same_file = candidates
+                    .iter()
+                    .copied()
+                    .find(|&v_idx| symbols[v_idx].file == sym.file);
+
+                let resolved = match same_file {
+                    Some(v_idx) => Some(v_idx),
+                    None if candidates.len() == 1 => Some(candidates[0]),
+                    None => None,
+                };
+
+                if let Some(v_idx) = resolved {
+                    if u_idx != v_idx {
+                        add_edge(u_idx, v_idx, &mut callers_map, &mut callees_map);
                     }
                 }
             }
@@ -76,8 +84,34 @@ impl SymbolGraph {
         }
     }
 
-    pub fn compute_personalized_pagerank(&mut self, focus_target: &str) {
-        let focus_indices = self.find_symbol_indices(focus_target);
+    /// Bias the ranking toward symbols whose name or file contains `term`.
+    ///
+    /// `--seed` parsed and was discarded before this existed, while three
+    /// documents described it as working.
+    pub fn seed_indices(&self, term: &str) -> Vec<usize> {
+        let needle = term.to_lowercase();
+        self.symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.name.to_lowercase().contains(&needle)
+                    || s.file.to_lowercase().contains(&needle)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn apply_personalization(&mut self, indices: &[usize]) {
+        pagerank::compute_in_degree_pagerank(
+            &mut self.symbols,
+            &self.callers_map,
+            &self.callees_map,
+            Some(indices),
+        );
+    }
+
+    pub fn compute_personalized_pagerank(&mut self, focus: &Coordinate) {
+        let focus_indices = self.resolve_all(focus);
         pagerank::compute_in_degree_pagerank(
             &mut self.symbols,
             &self.callers_map,
@@ -86,45 +120,69 @@ impl SymbolGraph {
         );
     }
 
-    pub fn find_symbol_indices(&self, target: &str) -> Vec<usize> {
-        let mut results = Vec::new();
-
-        // 1. Exact coordinate match: "path/file.rs:symbol"
-        if let Some((target_file, target_name)) = target.split_once(':') {
-            let tf_name = Path::new(target_file).file_name().and_then(|n| n.to_str()).unwrap_or(target_file);
-
-            for (idx, s) in self.symbols.iter().enumerate() {
-                if s.name == target_name || s.name.ends_with(&format!("::{}", target_name)) {
-                    let sf_name = Path::new(&s.file).file_name().and_then(|n| n.to_str()).unwrap_or(&s.file);
-                    if target_file == s.file
-                        || target_file.ends_with(&s.file)
-                        || s.file.ends_with(target_file)
-                        || tf_name == sf_name
-                    {
-                        results.push(idx);
-                    }
-                }
-            }
-            if !results.is_empty() {
-                return results;
-            }
+    /// Resolve a coordinate to every symbol in the winning match tier.
+    ///
+    /// Used by up/down/blast/focus, which legitimately want all matches for a
+    /// bare name.
+    pub fn resolve_all(&self, coord: &Coordinate) -> Vec<usize> {
+        match self.resolve(coord) {
+            Resolution::Unique(idx) => vec![idx],
+            Resolution::Ambiguous(indices) => indices,
+            Resolution::NotFound => Vec::new(),
         }
-
-        // 2. Name match (exact or qualified suffix)
-        for (idx, s) in self.symbols.iter().enumerate() {
-            if s.name == target
-                || s.name.ends_with(&format!("::{}", target))
-                || s.name.ends_with(&format!(".{}", target))
-            {
-                results.push(idx);
-            }
-        }
-
-        results
     }
 
-    pub fn callers(&self, target: &str) -> Vec<&Symbol> {
-        let indices = self.find_symbol_indices(target);
+    /// Resolve a coordinate, distinguishing "one match" from "several".
+    ///
+    /// Matching is tiered and the first tier that produces candidates is the
+    /// answer -- but more than one candidate in a tier is Ambiguous, never a
+    /// silent pick. Previously an exact coordinate could match another file by
+    /// basename and `build_slice` would take `indices[0]`, returning a
+    /// different file's source under the requested path.
+    pub fn resolve(&self, coord: &Coordinate) -> Resolution {
+        let Some(name) = coord.name() else {
+            return Resolution::NotFound;
+        };
+
+        let by_name: Vec<usize> = self
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| name_matches(&s.name, name))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if by_name.is_empty() {
+            return Resolution::NotFound;
+        }
+
+        let Some(target_file) = coord.file() else {
+            return Resolution::from(by_name);
+        };
+
+        // Tier 1: the exact workspace-relative path.
+        // Tier 2: a path suffix on a component boundary.
+        // Tier 3: the basename alone.
+        for tier in [
+            |a: &Path, b: &Path| a == b,
+            component_suffix_match,
+            basename_match,
+        ] {
+            let hits: Vec<usize> = by_name
+                .iter()
+                .copied()
+                .filter(|&idx| tier(Path::new(&self.symbols[idx].file), target_file))
+                .collect();
+            if !hits.is_empty() {
+                return Resolution::from(hits);
+            }
+        }
+
+        Resolution::NotFound
+    }
+
+    pub fn callers(&self, coord: &Coordinate) -> Vec<&Symbol> {
+        let indices = self.resolve_all(coord);
         let mut caller_symbols = Vec::new();
 
         for target_idx in indices {
@@ -141,8 +199,8 @@ impl SymbolGraph {
         caller_symbols
     }
 
-    pub fn callees(&self, target: &str) -> Vec<&Symbol> {
-        let indices = self.find_symbol_indices(target);
+    pub fn callees(&self, coord: &Coordinate) -> Vec<&Symbol> {
+        let indices = self.resolve_all(coord);
         let mut callee_symbols = Vec::new();
 
         for target_idx in indices {
@@ -161,73 +219,74 @@ impl SymbolGraph {
 
     pub fn build_slice(
         &self,
-        target: &str,
+        coord: &Coordinate,
         follow_local: bool,
         with_imports: bool,
     ) -> Result<SliceResult> {
-        // Line range check
-        if target.contains(":#L") {
-            return slice_line_coordinate(target, with_imports);
+        if let Coordinate::Lines { file, start, end } = coord {
+            return slice_line_coordinate(file, *start, *end, with_imports);
         }
 
-        let indices = self.find_symbol_indices(target);
-        if indices.is_empty() {
-            bail!("Symbol '{}' not found in workspace.", target);
-        }
+        let target_idx = match self.resolve(coord) {
+            Resolution::Unique(idx) => idx,
+            Resolution::NotFound => bail!("Symbol '{}' not found in workspace.", coord),
+            Resolution::Ambiguous(indices) => {
+                let mut matches: Vec<&Symbol> = indices.iter().map(|&i| &self.symbols[i]).collect();
+                matches.sort_by(|a, b| {
+                    b.centrality
+                        .partial_cmp(&a.centrality)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let coords: Vec<String> = matches
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "  - `{}` ({}) [rank: {:.4}]",
+                            s.coordinate(),
+                            s.kind.as_str(),
+                            s.centrality
+                        )
+                    })
+                    .collect();
+                bail!(
+                    "Ambiguous symbol '{}'. Multiple matches found, please specify full coordinate:\n{}",
+                    coord,
+                    coords.join("\n")
+                );
+            }
+        };
 
-        if !target.contains(':') && indices.len() > 1 {
-            let mut matches: Vec<&Symbol> = indices.iter().map(|&i| &self.symbols[i]).collect();
-            matches.sort_by(|a, b| b.centrality.partial_cmp(&a.centrality).unwrap_or(std::cmp::Ordering::Equal));
-            let coords: Vec<String> = matches.iter().map(|s| format!("  - `{}` ({}) [rank: {:.4}]", s.coordinate(), s.kind.as_str(), s.centrality)).collect();
-            bail!("Ambiguous symbol '{}'. Multiple matches found, please specify full coordinate:\n{}", target, coords.join("\n"));
-        }
-
-        let target_idx = indices[0];
         let sym = &self.symbols[target_idx];
 
         let callers: Vec<String> = self
-            .callers(target)
+            .callers(coord)
             .into_iter()
             .map(|s| s.coordinate())
             .collect();
 
-        let callee_syms = self.callees(target);
-        let callees: Vec<String> = callee_syms
-            .iter()
-            .map(|s| s.coordinate())
-            .collect();
+        let callee_syms = self.callees(coord);
+        let callees: Vec<String> = callee_syms.iter().map(|s| s.coordinate()).collect();
 
-        let mut body = if sym.end_line - sym.start_line > 250 {
-            let lines: Vec<&str> = sym.body.lines().collect();
-            let head = lines[..200].join("\n");
-            let tail = lines[lines.len() - 30..].join("\n");
-            format!("{}\n\n// ... [{} lines truncated for token efficiency] ...\n\n{}", head, lines.len() - 230, tail)
-        } else {
-            sym.body.clone()
-        };
+        let mut body = truncate_body(&sym.body, sym.end_line - sym.start_line);
 
         if follow_local {
-            let local_callees: Vec<&&Symbol> = callee_syms
-                .iter()
-                .filter(|c| c.file == sym.file)
-                .collect();
+            let local_callees: Vec<&&Symbol> =
+                callee_syms.iter().filter(|c| c.file == sym.file).collect();
 
             if !local_callees.is_empty() {
                 body.push_str("\n\n// --- Inlined Local Callees (--follow-local) ---\n");
                 for lc in local_callees {
-                    body.push_str(&format!("\n// Symbol: `{}` (L{}-L{})\n{}\n", lc.name, lc.start_line, lc.end_line, lc.body));
+                    body.push_str(&format!(
+                        "\n// Symbol: `{}` (L{}-L{})\n{}\n",
+                        lc.name, lc.start_line, lc.end_line, lc.body
+                    ));
                 }
             }
         }
 
         let imports = if with_imports {
-            let p = Path::new(&sym.file);
-            let imps = extract_file_imports(p);
-            if imps.is_empty() {
-                None
-            } else {
-                Some(imps)
-            }
+            let imps = extract_file_imports(Path::new(&sym.file));
+            (!imps.is_empty()).then_some(imps)
         } else {
             None
         };
@@ -246,6 +305,64 @@ impl SymbolGraph {
     }
 }
 
+/// How a coordinate resolved against the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Unique(usize),
+    Ambiguous(Vec<usize>),
+    NotFound,
+}
+
+impl From<Vec<usize>> for Resolution {
+    fn from(mut hits: Vec<usize>) -> Self {
+        match hits.len() {
+            0 => Resolution::NotFound,
+            1 => Resolution::Unique(hits.remove(0)),
+            _ => Resolution::Ambiguous(hits),
+        }
+    }
+}
+
+fn name_matches(symbol_name: &str, target: &str) -> bool {
+    symbol_name == target
+        || symbol_name.ends_with(&format!("::{}", target))
+        || symbol_name.ends_with(&format!(".{}", target))
+}
+
+/// True when one path is a suffix of the other on a component boundary.
+fn component_suffix_match(a: &Path, b: &Path) -> bool {
+    let av: Vec<_> = a.components().collect();
+    let bv: Vec<_> = b.components().collect();
+    let n = av.len().min(bv.len());
+    n > 0 && av[av.len() - n..] == bv[bv.len() - n..]
+}
+
+fn basename_match(a: &Path, b: &Path) -> bool {
+    match (a.file_name(), b.file_name()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Cap very large bodies, keeping the head and tail.
+fn truncate_body(body: &str, span: usize) -> String {
+    const LIMIT: usize = 250;
+    const HEAD: usize = 200;
+    const TAIL: usize = 30;
+
+    let lines: Vec<&str> = body.lines().collect();
+    if span <= LIMIT || lines.len() <= HEAD + TAIL {
+        return body.to_string();
+    }
+
+    format!(
+        "{}\n\n// ... [{} lines truncated for token efficiency] ...\n\n{}",
+        lines[..HEAD].join("\n"),
+        lines.len() - HEAD - TAIL,
+        lines[lines.len() - TAIL..].join("\n")
+    )
+}
+
 pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(file_path) else {
         return Vec::new();
@@ -255,7 +372,9 @@ pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
     let mut in_multiline_import = false;
     let mut multiline_buf = String::new();
 
-    for line in content.lines().take(100) {
+    // Scan the header generously: a 100-line cap silently dropped imports in
+    // files with long licence blocks or large import lists.
+    for line in content.lines().take(400) {
         let trimmed = line.trim();
 
         if in_multiline_import {
@@ -299,15 +418,8 @@ pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
             } else {
                 imports.push(trimmed.to_string());
             }
-        } else if trimmed.starts_with("import ") {
-            imports.push(trimmed.to_string());
-        } else if trimmed.starts_with("import (") || trimmed == "import (" {
-            in_multiline_import = true;
-            multiline_buf.push_str(line);
-            multiline_buf.push('\n');
-        } else if trimmed.starts_with("import \"")
-            || ((trimmed.starts_with("const ") || trimmed.starts_with("let "))
-                && trimmed.contains("= require("))
+        } else if (trimmed.starts_with("const ") || trimmed.starts_with("let "))
+            && trimmed.contains("= require(")
         {
             imports.push(trimmed.to_string());
         }
@@ -333,54 +445,53 @@ fn add_edge(
     }
 }
 
-fn slice_line_coordinate(target: &str, with_imports: bool) -> Result<SliceResult> {
-    let idx = target.find(":#L").unwrap();
-    let file_str = &target[..idx];
-    let range_str = &target[idx + 3..];
-
-    let path = Path::new(file_str);
-    if !path.exists() {
-        bail!("File not found: {}", file_str);
+/// Slice a line range straight off disk. Needs no index.
+pub fn slice_line_coordinate(
+    file: &Path,
+    start: usize,
+    end: usize,
+    with_imports: bool,
+) -> Result<SliceResult> {
+    if !file.exists() {
+        bail!("File not found: {}", file.display());
     }
 
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {}", file_str))?;
-
-    let (start, end) = if let Some(dash) = range_str.find('-') {
-        let s: usize = range_str[..dash].parse().context("Invalid start line")?;
-        let e: usize = range_str[dash + 1..].parse().context("Invalid end line")?;
-        (s, e)
-    } else {
-        let s: usize = range_str.parse().context("Invalid line number")?;
-        (s, s)
-    };
+    let content = fs::read_to_string(file)
+        .with_context(|| format!("Failed to read file: {}", file.display()))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
 
-    let start_idx = (start - 1).min(total_lines);
+    // Normalize: accept reversed ranges, floor at line 1, fail past end of file.
+    let (start, end) = if start > end { (end, start) } else { (start, end) };
+    let start = start.max(1);
+    if start > total_lines {
+        bail!(
+            "Line {} is past the end of {} ({} lines).",
+            start,
+            file.display(),
+            total_lines
+        );
+    }
+
+    let start_idx = start - 1;
     let end_idx = end.min(total_lines);
 
     let mut sliced = String::new();
     for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
-        let line_num = start + i;
-        sliced.push_str(&format!("{:4} | {}\n", line_num, line));
+        sliced.push_str(&format!("{:4} | {}\n", start + i, line));
     }
 
     let imports = if with_imports {
-        let imps = extract_file_imports(path);
-        if imps.is_empty() {
-            None
-        } else {
-            Some(imps)
-        }
+        let imps = extract_file_imports(file);
+        (!imps.is_empty()).then_some(imps)
     } else {
         None
     };
 
     Ok(SliceResult {
-        coordinate: target.to_string(),
-        file: file_str.to_string(),
+        coordinate: format!("{}:#L{}-{}", file.display(), start, end),
+        file: file.display().to_string(),
         symbol: None,
         line_range: Some((start, end)),
         content: sliced,
@@ -389,4 +500,202 @@ fn slice_line_coordinate(target: &str, with_imports: bool) -> Result<SliceResult
         total_lines: end_idx - start_idx,
         imports,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SymbolKind;
+    use std::io::Write;
+
+    fn sym(file: &str, name: &str) -> Symbol {
+        Symbol {
+            name: name.into(),
+            kind: SymbolKind::Function,
+            file: file.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            body: format!("fn {name}() {{ /* {file} */ }}"),
+                centrality: 0.0,
+            references: vec![],
+        }
+    }
+
+    fn graph_of(files: &[(&str, &str)]) -> SymbolGraph {
+        SymbolGraph::new(files.iter().map(|(f, n)| sym(f, n)).collect())
+    }
+
+    fn at(g: &SymbolGraph, raw: &str) -> Resolution {
+        g.resolve(&Coordinate::parse(raw).unwrap())
+    }
+
+    #[test]
+    fn exact_path_beats_a_basename_collision() {
+        // Regression M1: `alpha/mod.rs:handler` returned beta's body, because
+        // basename equality was one of four equal-weight OR'd conditions and
+        // build_slice then took indices[0].
+        let g = graph_of(&[("src/alpha/mod.rs", "handler"), ("src/beta/mod.rs", "handler")]);
+
+        let Resolution::Unique(i) = at(&g, "src/alpha/mod.rs:handler") else {
+            panic!("exact path must resolve uniquely");
+        };
+        assert_eq!(g.symbols[i].file, "src/alpha/mod.rs");
+
+        let Resolution::Unique(j) = at(&g, "src/beta/mod.rs:handler") else {
+            panic!("exact path must resolve uniquely");
+        };
+        assert_eq!(g.symbols[j].file, "src/beta/mod.rs");
+    }
+
+    #[test]
+    fn a_basename_collision_is_ambiguous_not_a_guess() {
+        let g = graph_of(&[("src/alpha/mod.rs", "handler"), ("src/beta/mod.rs", "handler")]);
+        assert!(matches!(at(&g, "mod.rs:handler"), Resolution::Ambiguous(v) if v.len() == 2));
+    }
+
+    #[test]
+    fn a_unique_basename_still_resolves() {
+        let g = graph_of(&[("src/auth_service.rs", "login"), ("src/other.rs", "logout")]);
+        assert!(matches!(at(&g, "auth_service.rs:login"), Resolution::Unique(_)));
+    }
+
+    #[test]
+    fn a_path_suffix_resolves_on_component_boundaries() {
+        let g = graph_of(&[("src/alpha/mod.rs", "handler"), ("src/beta/mod.rs", "handler")]);
+        assert!(matches!(at(&g, "alpha/mod.rs:handler"), Resolution::Unique(_)));
+
+        // "ha/mod.rs" is a string suffix of "alpha/mod.rs" but not a component
+        // suffix, so the suffix tier must not resolve it. It falls through to
+        // the basename tier, which sees both files and reports ambiguity rather
+        // than guessing.
+        assert!(matches!(at(&g, "ha/mod.rs:handler"), Resolution::Ambiguous(_)));
+    }
+
+    #[test]
+    fn component_suffix_ignores_mid_component_string_suffixes() {
+        assert!(component_suffix_match(
+            Path::new("src/alpha/mod.rs"),
+            Path::new("alpha/mod.rs")
+        ));
+        assert!(!component_suffix_match(
+            Path::new("src/alpha/mod.rs"),
+            Path::new("ha/mod.rs")
+        ));
+        assert!(component_suffix_match(
+            Path::new("mod.rs"),
+            Path::new("src/alpha/mod.rs")
+        ));
+    }
+
+    #[test]
+    fn qualified_bare_names_resolve_through_the_name_tier() {
+        // Regression P17: "Store::save" parsed as file "Store", name ":save".
+        let g = graph_of(&[("src/lib.rs", "Store::save"), ("src/lib.rs", "other")]);
+        assert!(matches!(at(&g, "Store::save"), Resolution::Unique(_)));
+        assert!(matches!(at(&g, "save"), Resolution::Unique(_)));
+    }
+
+    fn sym_with_refs(file: &str, name: &str, refs: &[&str]) -> Symbol {
+        let mut s = sym(file, name);
+        s.references = refs.iter().map(|r| r.to_string()).collect();
+        s
+    }
+
+    #[test]
+    fn a_reference_prefers_a_match_in_its_own_file() {
+        let g = SymbolGraph::new(vec![
+            sym_with_refs("a.rs", "caller", &["target"]),
+            sym("a.rs", "target"),
+            sym("b.rs", "target"),
+        ]);
+        let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].file, "a.rs");
+    }
+
+    #[test]
+    fn a_unique_name_links_across_files() {
+        let g = SymbolGraph::new(vec![
+            sym_with_refs("a.rs", "caller", &["only_one"]),
+            sym("b.rs", "only_one"),
+        ]);
+        let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());
+        assert_eq!(callees.len(), 1, "a unique cross-file name must still link");
+    }
+
+    #[test]
+    fn an_ambiguous_name_links_to_nothing_rather_than_everything() {
+        // Regression M7: one call to `new` used to wire the caller to every
+        // `new` in the workspace, inflating centrality and blast radius.
+        let g = SymbolGraph::new(vec![
+            sym_with_refs("a.rs", "caller", &["new"]),
+            sym("b.rs", "new"),
+            sym("c.rs", "new"),
+            sym("d.rs", "new"),
+        ]);
+        let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());
+        assert!(callees.is_empty(), "got {} spurious edges", callees.len());
+    }
+
+    #[test]
+    fn an_unknown_symbol_is_not_found() {
+        let g = graph_of(&[("src/lib.rs", "handler")]);
+        assert!(matches!(at(&g, "nope"), Resolution::NotFound));
+        assert!(matches!(at(&g, "src/lib.rs:nope"), Resolution::NotFound));
+    }
+
+    #[test]
+    fn build_slice_refuses_to_guess_between_ambiguous_matches() {
+        let g = graph_of(&[("src/alpha/mod.rs", "handler"), ("src/beta/mod.rs", "handler")]);
+        let err = g
+            .build_slice(&Coordinate::parse("mod.rs:handler").unwrap(), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Ambiguous"), "got: {err}");
+        assert!(err.contains("alpha") && err.contains("beta"), "got: {err}");
+    }
+
+    fn fixture(lines: usize) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 1..=lines {
+            writeln!(f, "line {i}").unwrap();
+        }
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn line_zero_does_not_underflow() {
+        // (start - 1) on line 0 wrapped to usize::MAX. Regression: M3/graph.rs:361.
+        let f = fixture(10);
+        let res = slice_line_coordinate(f.path(), 0, 5, false).unwrap();
+        assert_eq!(res.line_range, Some((1, 5)));
+        assert!(res.content.contains("line 1"));
+    }
+
+    #[test]
+    fn reversed_ranges_are_normalized() {
+        // lines[7..2] panicked. Regression: M3/graph.rs:365.
+        let f = fixture(10);
+        let res = slice_line_coordinate(f.path(), 8, 2, false).unwrap();
+        assert_eq!(res.line_range, Some((2, 8)));
+        assert!(res.content.contains("line 2") && res.content.contains("line 8"));
+    }
+
+    #[test]
+    fn start_past_end_of_file_is_an_error() {
+        let f = fixture(10);
+        let err = slice_line_coordinate(f.path(), 400, 500, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("past the end"), "got: {err}");
+    }
+
+    #[test]
+    fn end_past_end_of_file_clamps() {
+        let f = fixture(10);
+        let res = slice_line_coordinate(f.path(), 8, 500, false).unwrap();
+        assert!(res.content.contains("line 10"));
+    }
 }

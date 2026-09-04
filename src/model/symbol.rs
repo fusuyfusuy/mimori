@@ -42,7 +42,6 @@ pub struct Symbol {
     pub end_line: usize,
     pub signature: String,
     pub body: String,
-    pub doc: Option<String>,
     #[serde(default)]
     pub centrality: f64,
     #[serde(default)]

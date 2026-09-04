@@ -1,5 +1,8 @@
 use crate::graph::SymbolGraph;
+use crate::model::Coordinate;
 use crate::model::Symbol;
+use std::ffi::OsStr;
+use std::path::{Component, Path};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
@@ -77,12 +80,12 @@ impl BlastResult {
 
 pub fn calculate_blast_radius(
     graph: &SymbolGraph,
-    target: &str,
+    coord: &Coordinate,
     depth_limit: usize,
 ) -> Result<BlastResult> {
-    let indices = graph.find_symbol_indices(target);
+    let indices = graph.resolve_all(coord);
     if indices.is_empty() {
-        bail!("Target symbol '{}' not found in workspace.", target);
+        bail!("Target symbol '{}' not found in workspace.", coord);
     }
 
     let mut queue = VecDeque::new();
@@ -109,8 +112,8 @@ pub fn calculate_blast_radius(
                     let sym = &graph.symbols[caller_idx];
                     let next_depth = curr_depth + 1;
 
-                    let is_entry = check_is_entry_point(sym);
-                    let is_test = check_is_test(sym);
+                    let is_entry = is_entry_point(graph, caller_idx, sym);
+                    let is_test = is_test_symbol(sym);
 
                     if is_entry && !entry_points.contains(&sym.coordinate()) {
                         entry_points.push(sym.coordinate());
@@ -136,7 +139,7 @@ pub fn calculate_blast_radius(
     }
 
     Ok(BlastResult {
-        target: target.to_string(),
+        target: coord.to_string(),
         depth_limit,
         affected,
         entry_points,
@@ -144,20 +147,90 @@ pub fn calculate_blast_radius(
     })
 }
 
-fn check_is_entry_point(sym: &Symbol) -> bool {
-    sym.name == "main"
-        || sym.name.ends_with("::main")
-        || sym.name.starts_with("post_")
-        || sym.name.starts_with("get_")
-        || sym.name.starts_with("handle_")
-        || sym.file.contains("main.")
-        || sym.file.contains("index.")
-        || sym.file.contains("app.")
+/// An entry point is a symbol nothing else calls -- which is what the graph
+/// already knows -- or a program entry by name.
+///
+/// The previous rule matched any name starting with `get_`, `post_` or
+/// `handle_`, and any file whose path contained `main.`, `index.` or `app.`,
+/// so every getter in the codebase was reported as an affected entry point.
+fn is_entry_point(graph: &SymbolGraph, idx: usize, sym: &Symbol) -> bool {
+    if sym.name == "main" || sym.name.ends_with("::main") {
+        return true;
+    }
+    graph
+        .callers_map
+        .get(&idx)
+        .is_none_or(|callers| callers.is_empty())
 }
 
-fn check_is_test(sym: &Symbol) -> bool {
-    sym.name.starts_with("test_")
-        || sym.name.contains("test")
-        || sym.file.contains("test")
-        || sym.file.contains("spec")
+/// Test detection on real conventions, matched against path components and
+/// filename suffixes.
+///
+/// The previous rule was `name.contains("test") || file.contains("test")`,
+/// which classified `latest`, `contest` and `attestation` as tests.
+fn is_test_symbol(sym: &Symbol) -> bool {
+    const TEST_DIRS: &[&str] = &["tests", "test", "__tests__", "spec", "__mocks__"];
+    const TEST_SUFFIXES: &[&str] = &[
+        "_test.go", "_test.py", ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+        ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+    ];
+
+    let path = Path::new(&sym.file);
+
+    if path
+        .components()
+        .any(|c| matches!(c, Component::Normal(n) if TEST_DIRS.iter().any(|d| OsStr::new(d) == n)))
+    {
+        return true;
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
+    if TEST_SUFFIXES.iter().any(|sfx| name.ends_with(sfx))
+        || name.starts_with("test_")
+        || name.starts_with("Test")
+    {
+        return true;
+    }
+
+    let sym_leaf = sym.name.rsplit("::").next().unwrap_or(&sym.name);
+    sym_leaf.starts_with("test_") || sym_leaf.starts_with("Test")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SymbolKind;
+
+    fn s(file: &str, name: &str) -> Symbol {
+        Symbol {
+            name: name.into(),
+            kind: SymbolKind::Function,
+            file: file.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            body: String::new(),
+            centrality: 0.0,
+            references: vec![],
+        }
+    }
+
+    #[test]
+    fn test_detection_uses_conventions_not_substrings() {
+        assert!(is_test_symbol(&s("tests/cli_map.rs", "anything")));
+        assert!(is_test_symbol(&s("src/__tests__/a.ts", "anything")));
+        assert!(is_test_symbol(&s("pkg/server_test.go", "TestServe")));
+        assert!(is_test_symbol(&s("src/a.spec.ts", "anything")));
+        assert!(is_test_symbol(&s("src/lib.rs", "test_parses_input")));
+
+        // Regression M13: these are not tests.
+        assert!(!is_test_symbol(&s("src/latest.rs", "latest_version")));
+        assert!(!is_test_symbol(&s("src/contest.rs", "run_contest")));
+        assert!(!is_test_symbol(&s("src/auth.rs", "attestation")));
+        assert!(!is_test_symbol(&s("src/protest/mod.rs", "handler")));
+    }
 }

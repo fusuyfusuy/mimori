@@ -46,13 +46,13 @@ cp target/release/mimori ~/.local/bin/
 
 ```shell
 mimori init
-mimori map    [--scope <dir>] [--focus <target>] [--seed <term>] [--json]
+mimori map    [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
 mimori slice  <coordinate> [-f|--follow-local] [-i|--with-imports] [--json]
 mimori find   <pattern> [-s|--symbols-only] [-f|--files-only] [--json]
 mimori up     <target> [--json]
 mimori down   <target> [--json]
 mimori blast  <target> [-d|--depth <N>] [--json]
-mimori dump   [--file] [--json]
+mimori dump   [--file] [--scope <dir>] [--seed <term>] [--limit <N>] [--json]
 mimori log    -a|--action <slug> -s|--summary <text> [-f|--files <f1,f2>] [--json]
 mimori clean  [--all]
 ```

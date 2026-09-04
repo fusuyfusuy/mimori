@@ -3,6 +3,13 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// Bumped whenever parsing or the stored symbol/reference format changes.
+///
+/// Without this, a format change decodes through `unwrap_or_default()` at load
+/// time and yields an empty reference list rather than an error -- a graph with
+/// zero edges, on a database that reports itself as fresh.
+pub const PARSER_VERSION: i64 = 3;
+
 pub struct Database {
     conn: Connection,
 }
@@ -42,22 +49,28 @@ impl Database {
 
              CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
              CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
-             CREATE INDEX IF NOT EXISTS idx_symbols_centrality ON symbols(centrality DESC);
-
-             CREATE TABLE IF NOT EXISTS edges (
-                 caller_id INTEGER NOT NULL,
-                 callee_id INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 PRIMARY KEY (caller_id, callee_id, kind),
-                 FOREIGN KEY(caller_id) REFERENCES symbols(id) ON DELETE CASCADE,
-                 FOREIGN KEY(callee_id) REFERENCES symbols(id) ON DELETE CASCADE
-             );
-
-             CREATE INDEX IF NOT EXISTS idx_edges_caller ON edges(caller_id);
-             CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges(callee_id);",
+             CREATE INDEX IF NOT EXISTS idx_symbols_centrality ON symbols(centrality DESC);",
         )?;
 
-        Ok(Database { conn })
+        let db = Database { conn };
+        db.enforce_parser_version()?;
+        Ok(db)
+    }
+
+    /// Discard everything cached by an older parser. Deleting from `files`
+    /// cascades to `symbols`.
+    fn enforce_parser_version(&self) -> Result<()> {
+        let found: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        if found != PARSER_VERSION {
+            self.conn.execute("DELETE FROM files", [])?;
+            self.conn
+                .execute_batch(&format!("PRAGMA user_version = {PARSER_VERSION};"))?;
+        }
+
+        Ok(())
     }
 
     pub fn get_file_records(&self) -> Result<std::collections::HashMap<String, (i64, i64, String)>> {
@@ -130,8 +143,7 @@ impl Database {
     pub fn load_all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.kind, f.path, s.start_line, s.end_line, s.signature, s.body, s.centrality, s.references_json
-             FROM symbols s JOIN files f ON s.file_id = f.id
-             ORDER BY s.centrality DESC",
+             FROM symbols s JOIN files f ON s.file_id = f.id",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -161,8 +173,7 @@ impl Database {
                 end_line: row.get::<_, i64>(4)? as usize,
                 signature: row.get(5)?,
                 body: row.get(6)?,
-                doc: None,
-                centrality: row.get(7)?,
+                        centrality: row.get(7)?,
                 references,
             })
         })?;
@@ -174,15 +185,4 @@ impl Database {
         Ok(symbols)
     }
 
-    pub fn update_centralities(&mut self, symbols: &[Symbol]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        for s in symbols {
-            tx.execute(
-                "UPDATE symbols SET centrality = ? WHERE name = ? AND file_id = (SELECT id FROM files WHERE path = ?)",
-                params![s.centrality, s.name, s.file],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
 }
