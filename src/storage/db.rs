@@ -112,12 +112,19 @@ impl Database {
         )?;
         let file_id = tx.last_insert_rowid();
 
-        for s in symbols {
-            let refs_json = serde_json::to_string(&s.references).unwrap_or_else(|_| "[]".to_string());
-            tx.execute(
+        {
+            // Prepare once and reuse. rusqlite's Connection::execute re-prepares
+            // the statement on every call, which on a large workspace means
+            // hundreds of thousands of parse+plan cycles for one INSERT shape.
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO symbols (file_id, name, kind, start_line, end_line, signature, body, centrality, references_json)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
+            )?;
+
+            for s in symbols {
+                let refs_json =
+                    serde_json::to_string(&s.references).unwrap_or_else(|_| "[]".to_string());
+                stmt.execute(params![
                     file_id,
                     s.name,
                     s.kind.as_str(),
@@ -127,8 +134,8 @@ impl Database {
                     s.body,
                     s.centrality,
                     refs_json
-                ],
-            )?;
+                ])?;
+            }
         }
 
         tx.commit()?;

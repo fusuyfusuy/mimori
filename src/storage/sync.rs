@@ -17,7 +17,9 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     let db_path = mimori_dir.join("index.db");
     let mut db = Database::open_or_create(&db_path)?;
 
+    let _p = crate::Phase::start("scan+read+hash");
     let scans = scan_workspace(root);
+    drop(_p);
     let db_files = db.get_file_records()?;
 
     let mut disk_paths = HashSet::new();
@@ -37,6 +39,7 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     }
 
     // Parse in parallel; write serially, since the connection is not Sync.
+    let _p = crate::Phase::start("parse (parallel)");
     let parsed: Vec<(String, i64, String, Option<Vec<_>>)> = stale
         .par_iter()
         .map(|(rel, scan)| {
@@ -51,6 +54,8 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
         })
         .collect();
 
+    drop(_p);
+    let _p = crate::Phase::start("db write");
     let mut unparsed = Vec::new();
 
     for (rel, mtime, hash, symbols) in parsed {
@@ -70,6 +75,7 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
         }
     }
 
+    drop(_p);
     if !unparsed.is_empty() {
         eprintln!(
             "mimori: {} file(s) could not be parsed and are indexed as empty: {}",
@@ -78,8 +84,13 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
         );
     }
 
+    let _p = crate::Phase::start("load_all_symbols");
     let symbols = db.load_all_symbols()?;
-    Ok(SymbolGraph::new(symbols))
+    drop(_p);
+    let _p = crate::Phase::start("SymbolGraph::new");
+    let g = SymbolGraph::new(symbols);
+    drop(_p);
+    Ok(g)
 }
 
 fn preview(paths: &[String]) -> String {

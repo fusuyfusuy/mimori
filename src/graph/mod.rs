@@ -17,6 +17,7 @@ pub struct SymbolGraph {
 
 impl SymbolGraph {
     pub fn new(mut symbols: Vec<Symbol>) -> Self {
+        let _p = crate::Phase::start("  name index");
         let mut name_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
         let mut coord_to_index: HashMap<String, usize> = HashMap::new();
 
@@ -38,31 +39,50 @@ impl SymbolGraph {
             }
         }
 
+        drop(_p);
+        let _p = crate::Phase::start("  edge resolve");
         let mut callers_map: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut callees_map: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        // Resolve reference edges.
-        //
-        // A reference is a bare name, so resolution is a guess. The rule is to
-        // guess only when there is nothing to guess between: prefer a match in
-        // the same file, else accept a name that is unique across the
-        // workspace, else record nothing. Linking to every same-named symbol
-        // (the previous behaviour) meant one call to `new` or `get` wired the
-        // caller to all of them, inflating both centrality and blast radius.
+        // Intern file paths so the same-file test is a u32 compare.
+        let mut file_ids: HashMap<&str, u32> = HashMap::new();
+        let sym_file_id: Vec<u32> = symbols
+            .iter()
+            .map(|s| {
+                let next = file_ids.len() as u32;
+                *file_ids.entry(s.file.as_str()).or_insert(next)
+            })
+            .collect();
+
+        // Order each candidate list by file so the same-file probe is a binary
+        // search rather than a scan. Without this, a name defined once per file
+        // costs O(files) per reference, which is quadratic in workspace size --
+        // and names like `new`, `build` or `Config` are defined in most files.
+        let mut by_name: HashMap<&str, Vec<(u32, usize)>> =
+            HashMap::with_capacity(name_to_indices.len());
+        for (name, indices) in &name_to_indices {
+            let mut v: Vec<(u32, usize)> =
+                indices.iter().map(|&i| (sym_file_id[i], i)).collect();
+            v.sort_unstable();
+            by_name.insert(name.as_str(), v);
+        }
+
         for (u_idx, sym) in symbols.iter().enumerate() {
+            let u_file = sym_file_id[u_idx];
             for ref_name in &sym.references {
-                let Some(candidates) = name_to_indices.get(ref_name) else {
+                let Some(candidates) = by_name.get(ref_name.as_str()) else {
                     continue;
                 };
 
-                let same_file = candidates
-                    .iter()
-                    .copied()
-                    .find(|&v_idx| symbols[v_idx].file == sym.file);
+                // partition_point, not binary_search: entries are sorted by
+                // (file, index), so this finds the *first* symbol in the file,
+                // matching the original scan's "first candidate in index order".
+                let pos = candidates.partition_point(|&(f, _)| f < u_file);
+                let same_file = candidates.get(pos).filter(|&&(f, _)| f == u_file);
 
                 let resolved = match same_file {
-                    Some(v_idx) => Some(v_idx),
-                    None if candidates.len() == 1 => Some(candidates[0]),
+                    Some(&(_, v_idx)) => Some(v_idx),
+                    None if candidates.len() == 1 => Some(candidates[0].1),
                     None => None,
                 };
 
@@ -74,9 +94,11 @@ impl SymbolGraph {
             }
         }
 
-        // Compute in-degree PageRank centrality
+        drop(_p);
+        let _p = crate::Phase::start("  pagerank");
         pagerank::compute_in_degree_pagerank(&mut symbols, &callers_map, &callees_map, None);
 
+        drop(_p);
         SymbolGraph {
             symbols,
             callers_map,
