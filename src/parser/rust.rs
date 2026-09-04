@@ -167,8 +167,17 @@ fn collect_references(node: Node, content: &str, refs: &mut Vec<String>) {
     }
 }
 
-fn extract_signature(body: &str, _kind: &SymbolKind) -> String {
+fn extract_signature(body: &str, kind: &SymbolKind) -> String {
     let first_line = body.lines().next().unwrap_or("").trim();
+
+    // A const or static has no body to split off, and its initializer may well
+    // contain a brace inside a string literal. The other three parsers already
+    // special-case these; rust.rs ignored `kind` entirely and truncated
+    // `const B: &str = "{ .. }"` to `const B: &str = "`.
+    if matches!(kind, SymbolKind::Constant | SymbolKind::Variable) {
+        return first_line.to_string();
+    }
+
     if let Some(idx) = body.find('{') {
         let sig = body[..idx].trim().replace('\n', " ");
         if !sig.is_empty() {
@@ -205,6 +214,30 @@ mod tests {
             "got {:?}",
             refs_of(src, "S::run")
         );
+    }
+
+    #[test]
+    fn const_signatures_are_not_cut_at_a_brace_in_a_string() {
+        // Regression S4: extract_signature ignored `kind` in this parser only,
+        // truncating at the first '{' wherever it appeared.
+        let src = r#"pub const BRACE: &str = "{ not a body }";"#;
+        let sym = parse_rust("t.rs", src)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "BRACE")
+            .unwrap();
+        assert!(sym.signature.contains("not a body"), "got: {}", sym.signature);
+    }
+
+    #[test]
+    fn function_signatures_still_stop_at_the_body() {
+        let src = "pub fn real(x: u64) -> u64 { x }";
+        let sym = parse_rust("t.rs", src)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "real")
+            .unwrap();
+        assert_eq!(sym.signature, "pub fn real(x: u64) -> u64");
     }
 
     #[test]
