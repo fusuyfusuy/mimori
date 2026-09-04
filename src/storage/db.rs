@@ -163,7 +163,12 @@ impl Database {
             };
 
             let refs_str: String = row.get(8)?;
-            let references: Vec<String> = serde_json::from_str(&refs_str).unwrap_or_default();
+            // PARSER_VERSION guards format changes; this guards corruption.
+            // Silently defaulting here yields an edgeless graph on a database
+            // that reports itself as fresh.
+            let references: Vec<String> = serde_json::from_str(&refs_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+            })?;
 
             Ok(Symbol {
                 name: row.get(0)?,

@@ -92,3 +92,17 @@ fn test_cli_clean_command_purges_cache() {
 
     assert!(!db_path.exists(), ".mimori/index.db should be purged after clean");
 }
+
+#[test]
+fn test_cli_init_reports_failure_when_it_creates_nothing() {
+    // Regression S1: init printed success and exited 0 even when
+    // create_dir_all failed, and it is the first step of the documented
+    // warmup, so the failure cascaded silently.
+    let dir = tempdir().unwrap();
+    // A regular file at .mimori makes create_dir_all fail.
+    fs::write(dir.path().join(".mimori"), b"").unwrap();
+
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path()).arg("init");
+    cmd.assert().failure();
+}

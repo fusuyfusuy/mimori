@@ -219,7 +219,10 @@ fn main() -> ExitCode {
         }
         Commands::Init => {
             let mimori_dir = current_dir.join(".mimori");
-            let _ = fs::create_dir_all(&mimori_dir);
+            if let Err(e) = fs::create_dir_all(&mimori_dir) {
+                eprintln!("Error creating {}: {}", mimori_dir.display(), e);
+                return ExitCode::FAILURE;
+            }
             println!("Initialized .mimori workspace memory");
             ExitCode::SUCCESS
         }
@@ -269,8 +272,13 @@ fn main() -> ExitCode {
             }
 
             let map_result = generate_map(&graph, args.scope.as_deref(), None, args.limit);
-            let recent_activity =
-                mimori::workspace::read_recent_activity(&current_dir, 10).unwrap_or_default();
+            let recent_activity = match mimori::workspace::read_recent_activity(&current_dir, 10) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Warning: could not read activity journal: {}", e);
+                    Vec::new()
+                }
+            };
 
             if cli.json {
                 let dump_json = json!({
@@ -307,7 +315,10 @@ fn main() -> ExitCode {
 
             if args.file {
                 let cache_dir = current_dir.join(".mimori").join(".cache");
-                let _ = fs::create_dir_all(&cache_dir);
+                if let Err(e) = fs::create_dir_all(&cache_dir) {
+                    eprintln!("Error creating {}: {}", cache_dir.display(), e);
+                    return ExitCode::FAILURE;
+                }
                 let out_file = cache_dir.join("context.md");
                 if let Err(e) = fs::write(&out_file, &md) {
                     eprintln!("Error writing context dump: {}", e);
