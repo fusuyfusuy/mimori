@@ -209,7 +209,14 @@ impl SymbolGraph {
                 }
                 same_file.retain(|&v| v != u_idx);
                 if same_file.len() == 1 {
-                    add_weighted_edge(u_idx, same_file[0], w, &mut callers_map, &mut callees_map, &mut edge_weights);
+                    add_weighted_edge(
+                        u_idx,
+                        same_file[0],
+                        w,
+                        &mut callers_map,
+                        &mut callees_map,
+                        &mut edge_weights,
+                    );
                     stats.resolved += 1;
                     continue;
                 } else if same_file.len() > 1 {
@@ -245,7 +252,14 @@ impl SymbolGraph {
                 same_dir.sort_unstable();
                 same_dir.dedup();
                 if same_dir.len() == 1 {
-                    add_weighted_edge(u_idx, same_dir[0], w, &mut callers_map, &mut callees_map, &mut edge_weights);
+                    add_weighted_edge(
+                        u_idx,
+                        same_dir[0],
+                        w,
+                        &mut callers_map,
+                        &mut callees_map,
+                        &mut edge_weights,
+                    );
                     stats.resolved += 1;
                     continue;
                 } else if same_dir.len() > 1 {
@@ -263,7 +277,14 @@ impl SymbolGraph {
                 if callable.len() == 1 {
                     let v_idx = callable[0].1;
                     if u_idx != v_idx {
-                        add_weighted_edge(u_idx, v_idx, w, &mut callers_map, &mut callees_map, &mut edge_weights);
+                        add_weighted_edge(
+                            u_idx,
+                            v_idx,
+                            w,
+                            &mut callers_map,
+                            &mut callees_map,
+                            &mut edge_weights,
+                        );
                         stats.resolved += 1;
                     }
                 } else {
@@ -274,7 +295,14 @@ impl SymbolGraph {
                         .map(|&(_, v)| v)
                         .collect();
                     if non_self.len() == 1 {
-                        add_weighted_edge(u_idx, non_self[0], w, &mut callers_map, &mut callees_map, &mut edge_weights);
+                        add_weighted_edge(
+                            u_idx,
+                            non_self[0],
+                            w,
+                            &mut callers_map,
+                            &mut callees_map,
+                            &mut edge_weights,
+                        );
                         stats.resolved += 1;
                     } else {
                         stats.ambiguous_dropped += 1;
@@ -383,7 +411,9 @@ impl SymbolGraph {
             let mut out = Vec::new();
             for sym in &self.symbols {
                 if sym.mentions.iter().any(|m| m == name || m == short)
-                    && !out.iter().any(|s: &&Symbol| s.coordinate() == sym.coordinate())
+                    && !out
+                        .iter()
+                        .any(|s: &&Symbol| s.coordinate() == sym.coordinate())
                 {
                     out.push(sym);
                 }
@@ -407,9 +437,7 @@ impl SymbolGraph {
         self.symbols
             .iter()
             .enumerate()
-            .filter(|(i, s)| {
-                *i != target_idx && s.mentions.iter().any(|m| m == name || m == short)
-            })
+            .filter(|(i, s)| *i != target_idx && s.mentions.iter().any(|m| m == name || m == short))
             .map(|(i, _)| i)
             .collect()
     }
@@ -422,11 +450,7 @@ impl SymbolGraph {
         let weak: Vec<&Symbol> = self
             .mentioners(coord)
             .into_iter()
-            .filter(|m| {
-                !callers
-                    .iter()
-                    .any(|c| c.coordinate() == m.coordinate())
-            })
+            .filter(|m| !callers.iter().any(|c| c.coordinate() == m.coordinate()))
             .collect();
         (callers, weak)
     }
@@ -1194,7 +1218,7 @@ mod tests {
 
     #[test]
     fn mentions_never_become_call_edges() {
-         // P0-1 gate: property/type/arg mentions must not fan out to Field
+        // P0-1 gate: property/type/arg mentions must not fan out to Field
         // candidates. 12 readers mention `serverId`, defined as a field in
         // 3 files — fan-in on every candidate must stay 0, not 12.
         fn reader(file: &str, name: &str) -> Symbol {
@@ -1303,7 +1327,11 @@ mod tests {
         assert_eq!(top[0].name, "realHub");
         let field_coord = Coordinate::parse("s.rs:Store::input").unwrap();
         assert!(g.callers(&field_coord).is_empty());
-        let hub_c = ranked.iter().find(|s| s.name == "realHub").unwrap().centrality;
+        let hub_c = ranked
+            .iter()
+            .find(|s| s.name == "realHub")
+            .unwrap()
+            .centrality;
         let field_c = ranked
             .iter()
             .find(|s| s.name == "Store::input")
@@ -1328,7 +1356,7 @@ mod tests {
 
     #[test]
     fn same_file_ambiguity_drops_instead_of_picking_index_order() {
-         // Two same-file `target` candidates: no edge, counted ambiguous.
+        // Two same-file `target` candidates: no edge, counted ambiguous.
         let g = SymbolGraph::new(vec![
             sym_with_refs("a.rs", "caller", &["target"]),
             sym("a.rs", "target"),
@@ -1501,7 +1529,10 @@ mod tests {
         assert_eq!(local.len(), 1);
         assert_eq!(local[0].file, "a.ts");
         let remote = g.callees(&Coordinate::parse("c.ts:remoteUser").unwrap());
-        assert!(remote.is_empty(), "member call escaped its file: {remote:?}");
+        assert!(
+            remote.is_empty(),
+            "member call escaped its file: {remote:?}"
+        );
         assert_eq!(
             g.callers(&Coordinate::parse("b.ts:input").unwrap()).len(),
             0,
@@ -1544,13 +1575,7 @@ mod tests {
             assert!(is_callable_kind(&kind), "{kind:?} must be callable");
         }
         for kind in [
-            Variable,
-            Constant,
-            Field,
-            Interface,
-            Trait,
-            TypeAlias,
-            Module,
+            Variable, Constant, Field, Interface, Trait, TypeAlias, Module,
         ] {
             assert!(!is_callable_kind(&kind), "{kind:?} must not be callable");
         }
@@ -1586,8 +1611,16 @@ mod tests {
                 .unwrap()
         };
         let hub = idx("src/hub.rs", "hub");
-        let wt = g.edge_weights.get(&(idx("tests/t.rs", "t"), hub)).copied().unwrap();
-        let wp = g.edge_weights.get(&(idx("src/p.rs", "p"), hub)).copied().unwrap();
+        let wt = g
+            .edge_weights
+            .get(&(idx("tests/t.rs", "t"), hub))
+            .copied()
+            .unwrap();
+        let wp = g
+            .edge_weights
+            .get(&(idx("src/p.rs", "p"), hub))
+            .copied()
+            .unwrap();
         assert!((wp - 1.0).abs() < 1e-9, "product weight {wp}");
         assert!((wt - TEST_EDGE_WEIGHT).abs() < 1e-9, "test weight {wt}");
     }

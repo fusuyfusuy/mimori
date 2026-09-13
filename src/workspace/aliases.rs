@@ -95,28 +95,59 @@ impl AliasSet {
     /// Walk the workspace for `tsconfig*.json` / `jsconfig.json` /
     /// `package.json`, then collect: workspace package names, and every
     /// `compilerOptions.paths` key reachable through the `extends` chains.
+    /// Walk the workspace for `tsconfig*.json` / `jsconfig.json` /
+    /// `package.json`, and `pnpm-workspace.yaml`, then collect: workspace package names,
+    /// and every `compilerOptions.paths` key reachable through `extends` and `references`.
     pub fn collect(root: &Path) -> AliasSet {
-        let manifests = super::walker::discover_package_manifests(root);
+        let mut manifests = super::walker::discover_package_manifests(root);
+        let mut configs = super::walker::discover_tsconfigs(root);
+
+        // Discover workspaces from package.json and pnpm-workspace.yaml
+        let mut workspace_globs = read_package_json_workspaces(root);
+        workspace_globs.extend(read_pnpm_workspaces(root));
+        let workspace_dirs = expand_workspace_globs(root, &workspace_globs);
+
+        for dir in &workspace_dirs {
+            let pkg_json = dir.join("package.json");
+            if pkg_json.is_file() && !manifests.contains(&pkg_json) {
+                manifests.push(pkg_json);
+            }
+            let tsconfig = dir.join("tsconfig.json");
+            if tsconfig.is_file() && !configs.contains(&tsconfig) {
+                configs.push(tsconfig);
+            }
+        }
+
         let packages = read_package_names(&manifests);
-        let configs = super::walker::discover_tsconfigs(root);
 
         let mut set = AliasSet {
             packages: packages.iter().map(|(name, _)| name.clone()).collect(),
             ..Default::default()
         };
+
+        // Also add relative package directory names (e.g. "packages/core")
+        for dir in &workspace_dirs {
+            if let Ok(rel) = dir.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().to_string();
+                if !set.packages.contains(&rel_str) {
+                    set.packages.push(rel_str);
+                }
+            }
+        }
+
         let mut hash: u64 = 0xcbf29ce484222325;
-        // Content-hashed, not field-extracted: which field of a config matters
-        // is exactly the kind of reasoning that lets a stale index through.
-        for path in manifests.iter().chain(configs.iter()) {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            hash = crate::workspace::walker::fnv1a_hash(rel.to_string_lossy().as_bytes())
-                ^ hash.wrapping_mul(0x100000001b3);
-            let content = std::fs::read_to_string(path).unwrap_or_default();
+        let pnpm_yaml = root.join("pnpm-workspace.yaml");
+        if pnpm_yaml.is_file() {
+            let content = std::fs::read_to_string(&pnpm_yaml).unwrap_or_default();
             hash = crate::workspace::walker::fnv1a_hash(content.as_bytes())
                 ^ hash.wrapping_mul(0x100000001b3);
         }
+
+        let mut visited_configs = HashSet::new();
         for config in &configs {
-            for (key, replacements) in read_paths(config, &packages) {
+            let mut paths = Vec::new();
+            collect_paths(config, &packages, &mut visited_configs, &mut paths);
+            for (key, replacements) in paths {
                 if let Some(pattern) = pattern_for(&key, &replacements) {
                     if !set.patterns.contains(&pattern) {
                         set.patterns.push(pattern);
@@ -124,9 +155,119 @@ impl AliasSet {
                 }
             }
         }
+
+        // Fingerprint all manifests and all visited configs
+        for path in manifests.iter().chain(visited_configs.iter()) {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            hash = crate::workspace::walker::fnv1a_hash(rel.to_string_lossy().as_bytes())
+                ^ hash.wrapping_mul(0x100000001b3);
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            hash = crate::workspace::walker::fnv1a_hash(content.as_bytes())
+                ^ hash.wrapping_mul(0x100000001b3);
+        }
+
         set.fingerprint = format!("{hash:016x}");
         set
     }
+}
+
+fn read_package_json_workspaces(root: &Path) -> Vec<String> {
+    let pkg_path = root.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&pkg_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(workspaces) = json.get("workspaces") {
+        if let Some(arr) = workspaces.as_array() {
+            for item in arr.iter().filter_map(Value::as_str) {
+                out.push(item.to_string());
+            }
+        } else if let Some(obj) = workspaces.as_object() {
+            if let Some(arr) = obj.get("packages").and_then(Value::as_array) {
+                for item in arr.iter().filter_map(Value::as_str) {
+                    out.push(item.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_pnpm_workspaces(root: &Path) -> Vec<String> {
+    let yaml_path = root.join("pnpm-workspace.yaml");
+    let Ok(raw) = std::fs::read_to_string(&yaml_path) else {
+        return Vec::new();
+    };
+    parse_yaml_packages_list(&raw)
+}
+
+fn parse_yaml_packages_list(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_packages = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("packages:") {
+            in_packages = true;
+            continue;
+        }
+        if in_packages {
+            if trimmed.starts_with('-') {
+                let item = trimmed.trim_start_matches('-').trim();
+                let clean = item.trim_matches(|c| c == '\'' || c == '"').trim();
+                if !clean.starts_with('!') && !clean.is_empty() {
+                    out.push(clean.to_string());
+                }
+            } else if !line.starts_with(' ') && !line.starts_with('\t') {
+                in_packages = false;
+            }
+        }
+    }
+    out
+}
+
+fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut package_dirs = Vec::new();
+    for pat in patterns {
+        let clean = pat.trim_end_matches('/');
+        if let Some(parent) = clean.strip_suffix("/*") {
+            let parent_dir = root.join(parent);
+            if let Ok(entries) = std::fs::read_dir(&parent_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_dir() {
+                            package_dirs.push(entry.path());
+                        }
+                    }
+                }
+            }
+        } else if clean.ends_with("/**") {
+            let parent = clean.trim_end_matches("/**");
+            let parent_dir = root.join(parent);
+            if let Ok(entries) = std::fs::read_dir(&parent_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_dir() {
+                            package_dirs.push(entry.path());
+                        }
+                    }
+                }
+            }
+        } else {
+            let dir = root.join(clean);
+            if dir.is_dir() {
+                package_dirs.push(dir);
+            }
+        }
+    }
+    package_dirs.sort();
+    package_dirs.dedup();
+    package_dirs
 }
 
 /// `package.json` `name` -> the directory that declares it.
@@ -189,19 +330,6 @@ fn pattern_for(key: &str, replacements: &[String]) -> Option<AliasPattern> {
     }
 }
 
-/// `compilerOptions.paths` of one config, following `extends` (string or the
-/// TS 5.0 array form) with `extends`-targets inheriting before overrides.
-///
-/// `packages` resolves the `extends` form that a pnpm workspace actually uses:
-/// `"@acme/tsconfig/base.json"` is a workspace member, not an npm dependency,
-/// so a shared base that declares `paths` must not be invisible here.
-fn read_paths(config: &Path, packages: &[(String, PathBuf)]) -> Vec<(String, Vec<String>)> {
-    let mut out = Vec::new();
-    let mut visited = HashSet::new();
-    collect_paths(config, packages, &mut visited, &mut out);
-    out
-}
-
 fn collect_paths(
     config: &Path,
     packages: &[(String, PathBuf)],
@@ -231,6 +359,23 @@ fn collect_paths(
             }
         }
         _ => {}
+    }
+
+    if let Some(refs) = json.get("references").and_then(Value::as_array) {
+        for r in refs {
+            let ref_path = r.as_str().or_else(|| r.get("path").and_then(Value::as_str));
+            if let Some(target_spec) = ref_path {
+                follow_reference(config, target_spec, packages, visited, out);
+            }
+        }
+    }
+
+    if let Some(base_url) = json
+        .get("compilerOptions")
+        .and_then(|c| c.get("baseUrl"))
+        .and_then(Value::as_str)
+    {
+        collect_base_url_aliases(config, base_url, out);
     }
 
     let Some(paths) = json
@@ -283,6 +428,86 @@ fn follow_extends(
         target
     };
     collect_paths(&target, packages, visited, out);
+}
+
+fn follow_reference(
+    config: &Path,
+    target_spec: &str,
+    packages: &[(String, PathBuf)],
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Vec<(String, Vec<String>)>,
+) {
+    let config_dir = config.parent().unwrap_or(Path::new(""));
+    let candidate = if target_spec.starts_with('.') || target_spec.starts_with('/') {
+        config_dir.join(target_spec)
+    } else if let Some((name, rest)) = split_package_spec(target_spec) {
+        if let Some((_, dir)) = packages.iter().find(|(n, _)| *n == name) {
+            dir.join(rest)
+        } else {
+            config_dir.join(target_spec)
+        }
+    } else if let Some((_, dir)) = packages.iter().find(|(n, _)| *n == target_spec) {
+        dir.clone()
+    } else {
+        config_dir.join(target_spec)
+    };
+
+    let target = if candidate.is_dir() {
+        candidate.join("tsconfig.json")
+    } else if candidate.is_file() {
+        candidate
+    } else if candidate.with_extension("json").is_file() {
+        candidate.with_extension("json")
+    } else {
+        candidate.join("tsconfig.json")
+    };
+
+    collect_paths(&target, packages, visited, out);
+}
+
+fn collect_base_url_aliases(config: &Path, base_url: &str, out: &mut Vec<(String, Vec<String>)>) {
+    let config_dir = config.parent().unwrap_or(Path::new(""));
+    let base_dir = config_dir.join(base_url);
+    let Ok(entries) = std::fs::read_dir(&base_dir) else {
+        return;
+    };
+    let is_root_like = base_url == "." || base_url == "./";
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.')
+            || [
+                "node_modules",
+                "target",
+                "dist",
+                "build",
+                "vendor",
+                ".git",
+                ".mimori",
+            ]
+            .contains(&name)
+        {
+            continue;
+        }
+        if is_root_like && !["src", "lib", "app", "source"].contains(&name) {
+            continue;
+        }
+        if path.is_dir() {
+            let pattern_key = format!("{name}/*");
+            let replacement = format!("./{name}/*");
+            out.push((pattern_key, vec![replacement]));
+            out.push((name.to_string(), vec![format!("./{name}")]));
+        } else if path.is_file() {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ["ts", "tsx", "js", "jsx"].contains(&ext) {
+                    out.push((stem.to_string(), vec![format!("./{stem}")]));
+                }
+            }
+        }
+    }
 }
 
 /// `@scope/name/sub/path` -> `("@scope/name", "sub/path")`;
@@ -616,5 +841,77 @@ mod tests {
             second.fingerprint(),
             "an edited tsconfig must change the fingerprint"
         );
+    }
+
+    #[test]
+    fn tsconfig_project_references_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "references": [{ "path": "./packages/core" }] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+        std::fs::write(
+            root.join("packages/core/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@core/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+
+        let set = AliasSet::collect(root);
+        assert!(
+            set.matches("@core/service"),
+            "reference path alias should match"
+        );
+        assert!(!set.matches("react"));
+    }
+
+    #[test]
+    fn base_url_discovers_internal_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/utils")).unwrap();
+        std::fs::create_dir_all(root.join("src/components")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": "./src" } }"#,
+        )
+        .unwrap();
+
+        let set = AliasSet::collect(root);
+        assert!(set.matches("utils/math"), "baseUrl subdir should match");
+        assert!(set.matches("components/button"));
+        assert!(!set.matches("react"));
+    }
+
+    #[test]
+    fn pnpm_workspace_yaml_discovers_packages_and_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("packages/auth")).unwrap();
+        std::fs::write(
+            root.join("packages/auth/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@auth/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+
+        let first = AliasSet::collect(root);
+        assert!(first.matches("@auth/jwt"));
+        assert!(first.matches("packages/auth"));
+
+        // Edit pnpm-workspace.yaml to invalidate fingerprint
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - 'apps/*'\n",
+        )
+        .unwrap();
+        let second = AliasSet::collect(root);
+        assert_ne!(first.fingerprint(), second.fingerprint());
     }
 }

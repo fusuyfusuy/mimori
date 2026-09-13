@@ -249,3 +249,112 @@ export function run(): string {
     .success()
     .stdout(predicate::str::contains("run").not());
 }
+
+#[test]
+fn monorepo_project_references_resolve_cross_package_callers() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    write(
+        root,
+        "tsconfig.json",
+        r#"{
+  "files": [],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/app" }
+  ]
+}"#,
+    );
+    write(
+        root,
+        "packages/core/tsconfig.json",
+        r#"{
+  "compilerOptions": {
+    "composite": true,
+    "paths": {
+      "@core/*": ["./src/*"]
+    }
+  }
+}"#,
+    );
+    write(
+        root,
+        "packages/core/src/auth.ts",
+        r#"export function verifySession(): boolean {
+    return true;
+}
+"#,
+    );
+    write(
+        root,
+        "packages/app/tsconfig.json",
+        r#"{
+  "compilerOptions": {
+    "composite": true,
+    "paths": {
+      "@core/*": ["../core/src/*"]
+    }
+  }
+}"#,
+    );
+    write(
+        root,
+        "packages/app/src/router.ts",
+        r#"import { verifySession } from "@core/auth";
+
+export function routeLogin(): boolean {
+    return verifySession();
+}
+"#,
+    );
+
+    let coordinate = "packages/core/src/auth.ts:verifySession";
+
+    mimori(root, &["up", coordinate])
+        .success()
+        .stdout(predicate::str::contains("routeLogin"));
+}
+
+#[test]
+fn monorepo_pnpm_workspaces_and_nested_tsconfig_resolution() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    write(root, "pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+    write(
+        root,
+        "packages/shared/tsconfig.json",
+        r#"{
+  "compilerOptions": {
+    "paths": {
+      "@shared/*": ["./src/*"]
+    }
+  }
+}"#,
+    );
+    write(
+        root,
+        "packages/shared/src/format.ts",
+        r#"export function formatDate(d: string): string {
+    return d;
+}
+"#,
+    );
+    write(
+        root,
+        "packages/ui/src/Card.tsx",
+        r#"import { formatDate } from "@shared/format";
+
+export function Card(): string {
+    return formatDate("today");
+}
+"#,
+    );
+
+    let coordinate = "packages/shared/src/format.ts:formatDate";
+
+    mimori(root, &["up", coordinate])
+        .success()
+        .stdout(predicate::str::contains("Card"));
+}

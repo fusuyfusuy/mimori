@@ -1,8 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use mimori::cli::{Cli, Commands};
+use mimori::cli::{Cli, Commands, DebtCommand, MemoryCommand};
 use mimori::graph::map::generate_map;
 use mimori::graph::{slice_line_coordinate, SymbolGraph, COUNT_LEGEND};
+use mimori::memory::{check_debt, generate_dump, list_debt, sync_debt, MemoryLedger};
 use mimori::model::Coordinate;
 use mimori::storage::{clean_cache, get_or_sync_graph};
 use mimori::workspace::walker::find_workspace_root;
@@ -55,9 +56,9 @@ fn main() -> ExitCode {
                             }
                         }
                     } else if let Some(budget) = args.budget {
-                        print!("{}", slice.to_markdown_budgeted(budget));
+                        print!("{}", slice.render_markdown_budgeted(budget, args.numbered));
                     } else {
-                        print!("{}", slice.to_markdown());
+                        print!("{}", slice.render_markdown(args.numbered));
                     }
                     ExitCode::SUCCESS
                 }
@@ -137,9 +138,7 @@ fn main() -> ExitCode {
                         );
                     }
                     if !value_uses.is_empty() {
-                        println!(
-                            "\n### 📎 Value Uses (mentions — weakest tier, not call edges)\n"
-                        );
+                        println!("\n### 📎 Value Uses (mentions — weakest tier, not call edges)\n");
                         for m in value_uses {
                             println!(
                                 "- 📎 **`{}`** ({}) → `{}` [Value Use]",
@@ -204,8 +203,7 @@ fn main() -> ExitCode {
             let mentioners = graph.mentioners(&coord);
 
             if cli.json {
-                let json_mentioners: Vec<_> =
-                    mentioners.iter().map(|s| s.coordinate()).collect();
+                let json_mentioners: Vec<_> = mentioners.iter().map(|s| s.coordinate()).collect();
                 println!(
                     "{}",
                     json!({ "target": coord.to_string(), "mentioners": json_mentioners })
@@ -275,7 +273,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-         Commands::Map(args) => {
+        Commands::Map(args) => {
             let mut graph = match get_or_sync_graph(&current_dir) {
                 Ok(g) => g,
                 Err(e) => {
@@ -336,10 +334,8 @@ fn main() -> ExitCode {
                     let sink_hits: Vec<String> = if sinks.is_empty() {
                         Vec::new()
                     } else {
-                        let root = find_workspace_root(
-                            coord.absolute_parent().as_deref(),
-                            &current_dir,
-                        );
+                        let root =
+                            find_workspace_root(coord.absolute_parent().as_deref(), &current_dir);
                         sweep_literal_sinks(&root, &graph, &sinks)
                     };
                     if cli.json {
@@ -364,7 +360,10 @@ fn main() -> ExitCode {
                         }
                     } else {
                         print!("{}", blast_res.to_markdown());
-                        if blast_res.affected.is_empty() && blast_res.value_uses.is_empty() && !args.down {
+                        if blast_res.affected.is_empty()
+                            && blast_res.value_uses.is_empty()
+                            && !args.down
+                        {
                             // P2: same zero-caller detour as `up`.
                             if let Some(hint) = zero_caller_hint(&graph, &coord) {
                                 println!("{}", hint);
@@ -422,21 +421,291 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Commands::Init => {
+        Commands::Init(args) => {
             let mimori_dir = current_dir.join(".mimori");
             if let Err(e) = fs::create_dir_all(&mimori_dir) {
-                eprintln!("Error creating {}: {}", mimori_dir.display(), e);
+                eprintln!(
+                    "INIT_FAIL: create dir {}: {}; exit 1.",
+                    mimori_dir.display(),
+                    e
+                );
                 return ExitCode::FAILURE;
             }
+
+            let gitignore_path = current_dir.join(".gitignore");
+            let gitignore_status = if gitignore_path.exists() {
+                let content = fs::read_to_string(&gitignore_path).unwrap_or_default();
+                if content
+                    .lines()
+                    .any(|l| l.trim() == ".mimori" || l.trim() == ".mimori/")
+                {
+                    "already configured"
+                } else {
+                    let mut updated = content;
+                    if !updated.ends_with('\n') && !updated.is_empty() {
+                        updated.push('\n');
+                    }
+                    updated.push_str(".mimori/\n");
+                    let _ = fs::write(&gitignore_path, updated);
+                    "updated"
+                }
+            } else {
+                let _ = fs::write(&gitignore_path, ".mimori/\n");
+                "created"
+            };
+
+            let (mem_created, dec_created) = match MemoryLedger::scaffold(&current_dir, args.force)
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("INIT_FAIL: scaffold .agents: {}; exit 1.", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let agents_status = if mem_created || dec_created {
+                "initialized"
+            } else {
+                "verified"
+            };
+
             if cli.json {
                 println!(
                     "{}",
-                    json!({ "initialized": mimori_dir.display().to_string() })
+                    json!({
+                        "initialized": true,
+                        "mimori_cache": mimori_dir.display().to_string(),
+                        "gitignore": gitignore_status,
+                        "agents": agents_status,
+                    })
                 );
             } else {
-                println!("Initialized .mimori cache");
+                println!(
+                    "INIT: .mimori cache ready; .gitignore {}; .agents/ {} (memory.md, decisions.md); exit 0.",
+                    gitignore_status, agents_status
+                );
             }
             ExitCode::SUCCESS
+        }
+        Commands::Memory(args) => match args.command {
+            Some(MemoryCommand::Lint) | Some(MemoryCommand::Check) => {
+                let ledger = match MemoryLedger::load(&current_dir) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("MEM_LINT_FAIL: load .agents/memory.md: {}; exit 1.", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let report = ledger.lint();
+                if cli.json {
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(j) => println!("{}", j),
+                        Err(e) => {
+                            eprintln!("MEM_ERR: serialize JSON: {}; exit 1.", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    println!("{}", report.to_m2m_output());
+                }
+                if report.passed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Some(MemoryCommand::Resolve(res_args)) => {
+                let mut ledger = match MemoryLedger::load(&current_dir) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("MEM_RESOLVE_FAIL: load .agents/memory.md: {}; exit 1.", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                match ledger.resolve(&res_args.pattern) {
+                    Ok(deleted) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                json!({
+                                    "deleted": deleted,
+                                    "pattern": res_args.pattern,
+                                    "remaining_debt": ledger.raw_debt_lines.len(),
+                                    "ceiling": 30
+                                })
+                            );
+                        } else {
+                            println!(
+                                    "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/30 lines; exit 0.",
+                                    deleted, res_args.pattern, ledger.raw_debt_lines.len()
+                                );
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("MEM_RESOLVE_FAIL: {}; exit 1.", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Some(MemoryCommand::Show(show_args)) => {
+                let ledger = match MemoryLedger::load(&current_dir) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("MEM_SHOW_FAIL: load .agents/memory.md: {}; exit 1.", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let sec = show_args.section.as_deref().or(args.section.as_deref());
+                let budget = show_args.budget.or(args.budget);
+                if let Some(s) = sec {
+                    match ledger.get_section(s) {
+                        Some(content) => {
+                            print_budgeted(&content, budget);
+                            ExitCode::SUCCESS
+                        }
+                        None => {
+                            println!("MEM_EMPTY: section '{}' not found; exit 0.", s);
+                            ExitCode::SUCCESS
+                        }
+                    }
+                } else if cli.json {
+                    let val = json!({
+                        "epics": ledger.epics,
+                        "debt_count": ledger.raw_debt_lines.len(),
+                        "debt_items": ledger.debt_items,
+                        "vocab_gotchas": ledger.vocab_gotchas,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                    ExitCode::SUCCESS
+                } else {
+                    print_budgeted(&ledger.raw_content, budget);
+                    ExitCode::SUCCESS
+                }
+            }
+            None => {
+                let ledger = match MemoryLedger::load(&current_dir) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("MEM_SHOW_FAIL: load .agents/memory.md: {}; exit 1.", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Some(s) = args.section.as_deref() {
+                    match ledger.get_section(s) {
+                        Some(content) => {
+                            print_budgeted(&content, args.budget);
+                            ExitCode::SUCCESS
+                        }
+                        None => {
+                            println!("MEM_EMPTY: section '{}' not found; exit 0.", s);
+                            ExitCode::SUCCESS
+                        }
+                    }
+                } else if cli.json {
+                    let val = json!({
+                        "epics": ledger.epics,
+                        "debt_count": ledger.raw_debt_lines.len(),
+                        "debt_items": ledger.debt_items,
+                        "vocab_gotchas": ledger.vocab_gotchas,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                    ExitCode::SUCCESS
+                } else {
+                    print_budgeted(&ledger.raw_content, args.budget);
+                    ExitCode::SUCCESS
+                }
+            }
+        },
+        Commands::Debt(args) => match args.command {
+            Some(DebtCommand::Check) => {
+                let (passed, output) = check_debt(&current_dir);
+                if cli.json {
+                    println!("{}", json!({ "passed": passed, "output": output }));
+                } else {
+                    println!("{}", output);
+                }
+                if passed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Some(DebtCommand::Sync) => match sync_debt(&current_dir) {
+                Ok((in_code, manual, synced, output)) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            json!({
+                                "in_code": in_code,
+                                "manual": manual,
+                                "synced": synced,
+                                "ceiling": 30
+                            })
+                        );
+                    } else {
+                        println!("{}", output);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("DEBT_SYNC_FAIL: {}; exit 1.", e);
+                    ExitCode::FAILURE
+                }
+            },
+            Some(DebtCommand::List(list_args)) => {
+                let scope = list_args.scope.as_deref().or(args.scope.as_deref());
+                let (markers, output) = list_debt(&current_dir, scope);
+                if cli.json {
+                    match serde_json::to_string_pretty(&markers) {
+                        Ok(j) => println!("{}", j),
+                        Err(e) => {
+                            eprintln!("DEBT_ERR: serialize JSON: {}; exit 1.", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    println!("{}", output);
+                }
+                ExitCode::SUCCESS
+            }
+            None => {
+                let (markers, output) = list_debt(&current_dir, args.scope.as_deref());
+                if cli.json {
+                    match serde_json::to_string_pretty(&markers) {
+                        Ok(j) => println!("{}", j),
+                        Err(e) => {
+                            eprintln!("DEBT_ERR: serialize JSON: {}; exit 1.", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    println!("{}", output);
+                }
+                ExitCode::SUCCESS
+            }
+        },
+        Commands::Dump(args) => {
+            match generate_dump(&current_dir, args.budget, args.focus.as_deref()) {
+                Ok(dump) => {
+                    if cli.json {
+                        match serde_json::to_string_pretty(&dump) {
+                            Ok(j) => println!("{}", j),
+                            Err(e) => {
+                                eprintln!("DUMP_ERR: serialize JSON: {}; exit 1.", e);
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else {
+                        print!("{}", dump.markdown);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("DUMP_FAIL: {}; exit 1.", e);
+                    ExitCode::FAILURE
+                }
+            }
         }
         Commands::Mcp(args) => match mimori::mcp::run_mcp_server(args.workspace) {
             Ok(_) => ExitCode::SUCCESS,
@@ -530,17 +799,9 @@ fn parse_sink_list(raw: Option<&str>) -> Vec<String> {
 
 /// P3: case-sensitive substring sweep over indexed files, one hit per matching
 /// line, capped so a noisy sink (e.g. `console.`) can't flood the context.
-fn sweep_literal_sinks(
-    root: &Path,
-    graph: &SymbolGraph,
-    sinks: &[String],
-) -> Vec<String> {
+fn sweep_literal_sinks(root: &Path, graph: &SymbolGraph, sinks: &[String]) -> Vec<String> {
     const CAP: usize = 100;
-    let mut files: Vec<&str> = graph
-        .symbols
-        .iter()
-        .map(|s| s.file.as_str())
-        .collect();
+    let mut files: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
     files.sort_unstable();
     files.dedup();
     let mut hits = Vec::new();
@@ -552,7 +813,10 @@ fn sweep_literal_sinks(
             if sinks.iter().any(|s| line.contains(s)) {
                 hits.push(format!("{}:#L{}: {}", rel, idx + 1, line.trim()));
                 if hits.len() >= CAP {
-                    hits.push(format!("… capped at {} hits; refine --with-sinks or use rg.", CAP));
+                    hits.push(format!(
+                        "… capped at {} hits; refine --with-sinks or use rg.",
+                        CAP
+                    ));
                     break 'files;
                 }
             }
@@ -562,12 +826,37 @@ fn sweep_literal_sinks(
 }
 
 fn print_sink_hits(sinks: &[String], hits: &[String]) {
-    println!("\n### 🔍 Literal sink hits (`--with-sinks {}`)\n", sinks.join(","));
+    println!(
+        "\n### 🔍 Literal sink hits (`--with-sinks {}`)\n",
+        sinks.join(",")
+    );
     if hits.is_empty() {
         println!("No literal sink hits.");
     } else {
         for h in hits {
             println!("- `{}`", h);
         }
+    }
+}
+
+fn print_budgeted(text: &str, budget: Option<usize>) {
+    if let Some(b) = budget {
+        let max_chars = b * 4;
+        if text.len() > max_chars {
+            let mut acc = 0;
+            for line in text.lines() {
+                if acc + line.len() + 1 > max_chars {
+                    println!("… [truncated to fit token budget]");
+                    break;
+                }
+                println!("{}", line);
+                acc += line.len() + 1;
+            }
+            return;
+        }
+    }
+    print!("{}", text);
+    if !text.ends_with('\n') {
+        println!();
     }
 }

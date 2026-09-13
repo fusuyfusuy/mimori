@@ -37,13 +37,25 @@ impl SliceResult {
     }
 
     pub fn to_markdown(&self) -> String {
+        self.render_markdown(false)
+    }
+
+    pub fn to_markdown_numbered(&self) -> String {
+        self.render_markdown(true)
+    }
+
+    pub fn render_markdown(&self, numbered: bool) -> String {
         format!(
             "{}{}{}{}{}",
             self.header_markdown(),
             self.imports_markdown(),
             self.callers_markdown(),
             self.callees_markdown(),
-            self.body_markdown(true)
+            if numbered {
+                self.body_markdown_numbered(true)
+            } else {
+                self.body_markdown(true)
+            }
         )
     }
 
@@ -52,8 +64,21 @@ impl SliceResult {
     /// lowest-priority first: inlined locals, callees, callers, imports.
     /// A notice names what was dropped so agents can re-request it explicitly.
     pub fn to_markdown_budgeted(&self, budget_tokens: usize) -> String {
+        self.render_markdown_budgeted(budget_tokens, false)
+    }
+
+    pub fn to_markdown_budgeted_numbered(&self, budget_tokens: usize) -> String {
+        self.render_markdown_budgeted(budget_tokens, true)
+    }
+
+    pub fn render_markdown_budgeted(&self, budget_tokens: usize, numbered: bool) -> String {
         let header = self.header_markdown();
-        let core_tokens = self.estimate_tokens(&header) + self.estimate_tokens(&self.body_markdown(false));
+        let core_body = if numbered {
+            self.body_markdown_numbered(false)
+        } else {
+            self.body_markdown(false)
+        };
+        let core_tokens = self.estimate_tokens(&header) + self.estimate_tokens(&core_body);
 
         // Optional context, lowest priority first.
         let optional: Vec<(&str, String)> = vec![
@@ -110,7 +135,11 @@ impl SliceResult {
         if kept("callees") {
             out.push_str(text_of("callees"));
         }
-        out.push_str(&self.body_markdown(kept("inlined local callees")));
+        if numbered {
+            out.push_str(&self.body_markdown_numbered(kept("inlined local callees")));
+        } else {
+            out.push_str(&self.body_markdown(kept("inlined local callees")));
+        }
 
         if total > budget_tokens {
             // Core alone exceeds the budget; everything droppable is gone.
@@ -174,8 +203,15 @@ impl SliceResult {
         let mut out = String::new();
         if !self.callers.is_empty() {
             out.push_str("- **1-Hop Callers**:\n");
-            for c in &self.callers {
+            let limit = 5;
+            for c in self.callers.iter().take(limit) {
                 out.push_str(&format!("  - `{}`\n", c));
+            }
+            if self.callers.len() > limit {
+                out.push_str(&format!(
+                    "  - _5 of {} callers shown (use mimori up for full list)_\n",
+                    self.callers.len()
+                ));
             }
         }
         out
@@ -206,17 +242,81 @@ impl SliceResult {
     }
 
     fn body_markdown(&self, include_locals: bool) -> String {
+        self.format_body(include_locals, false)
+    }
+
+    fn body_markdown_numbered(&self, include_locals: bool) -> String {
+        self.format_body(include_locals, true)
+    }
+
+    fn format_body(&self, include_locals: bool, numbered: bool) -> String {
         let (main, locals) = self.split_locals();
-        let shown = if include_locals {
-            self.content.as_str()
-        } else {
-            main
-        };
-        let _ = locals;
         let mut out = String::from("\n```\n");
-        out.push_str(shown);
-        if !shown.ends_with('\n') {
-            out.push('\n');
+        if !numbered {
+            let shown = if include_locals {
+                self.content.as_str()
+            } else {
+                main
+            };
+            out.push_str(shown);
+            if !shown.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            let start_line = self
+                .symbol
+                .as_ref()
+                .map(|s| s.start_line)
+                .or_else(|| self.line_range.map(|r| r.0))
+                .unwrap_or(1)
+                .max(1);
+
+            for (i, line) in main.lines().enumerate() {
+                let (lineno, content) = if let Some((num_part, code_part)) = line.split_once(" | ")
+                {
+                    if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
+                        (parsed_num, code_part)
+                    } else {
+                        (start_line + i, line)
+                    }
+                } else {
+                    (start_line + i, line)
+                };
+                out.push_str(&format!("L{}: {}\n", lineno, content));
+            }
+            if include_locals && !locals.is_empty() {
+                let mut callee_line: Option<usize> = None;
+                for line in locals.lines() {
+                    if line.starts_with("// --- Inlined Local Callees") {
+                        callee_line = None;
+                        out.push_str(line);
+                        out.push('\n');
+                    } else if line.starts_with("// Symbol: `") {
+                        if let Some(pos) = line.find("(L") {
+                            let rest = &line[pos + 2..];
+                            if let Some(dash) = rest.find('-') {
+                                callee_line = rest[..dash].parse::<usize>().ok();
+                            } else {
+                                callee_line = None;
+                            }
+                        } else {
+                            callee_line = None;
+                        }
+                        out.push_str(line);
+                        out.push('\n');
+                    } else if let Some(ref mut lno) = callee_line {
+                        if line.is_empty() {
+                            out.push_str(&format!("L{}:\n", lno));
+                        } else {
+                            out.push_str(&format!("L{}: {}\n", lno, line));
+                        }
+                        *lno += 1;
+                    } else {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            }
         }
         out.push_str("```\n");
         out
@@ -307,5 +407,54 @@ mod tests {
         assert!(md.contains("### Slice: `src/a.rs:foo`"), "core lost: {md}");
         assert!(md.contains("exceeds --budget 0"), "notice missing: {md}");
         assert!(!md.contains("1-Hop Callers"), "context kept: {md}");
+    }
+
+    #[test]
+    fn caller_truncation_limits_to_five_and_shows_summary() {
+        let mut s = fixture();
+        s.callers = vec![
+            "src/a.rs:c1".into(),
+            "src/a.rs:c2".into(),
+            "src/a.rs:c3".into(),
+            "src/a.rs:c4".into(),
+            "src/a.rs:c5".into(),
+            "src/a.rs:c6".into(),
+            "src/a.rs:c7".into(),
+        ];
+        let md = s.to_markdown();
+        assert!(md.contains("  - `src/a.rs:c1`"));
+        assert!(md.contains("  - `src/a.rs:c5`"));
+        assert!(!md.contains("  - `src/a.rs:c6`"));
+        assert!(!md.contains("  - `src/a.rs:c7`"));
+        assert!(md.contains("  - _5 of 7 callers shown (use mimori up for full list)_"));
+
+        // Exactly 5 callers -> no truncation notice
+        s.callers.truncate(5);
+        let md5 = s.to_markdown();
+        assert!(md5.contains("  - `src/a.rs:c5`"));
+        assert!(!md5.contains("callers shown"));
+    }
+
+    #[test]
+    fn numbered_render_prefixes_lines_with_linenos() {
+        let s = fixture();
+        let md = s.to_markdown_numbered();
+        assert!(md.contains("L1: pub fn foo() {"));
+        assert!(md.contains("L2:   bar();"));
+        assert!(md.contains("L3: }"));
+        // Follow-local inlined callee should also be numbered from L10
+        assert!(md.contains("L10: fn bar() {}"));
+    }
+
+    #[test]
+    fn numbered_render_with_line_range_respects_start_offset() {
+        let mut s = fixture();
+        s.symbol = None;
+        s.line_range = Some((42, 44));
+        s.content = "line a\nline b\nline c\n".into();
+        let md = s.to_markdown_numbered();
+        assert!(md.contains("L42: line a"));
+        assert!(md.contains("L43: line b"));
+        assert!(md.contains("L44: line c"));
     }
 }

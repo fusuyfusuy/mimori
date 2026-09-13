@@ -11,7 +11,8 @@ Instructions for autonomous AI agents working in the `mimori` repository.
 - **`src/model/`**: Core types: `Symbol`, `Coordinate`, `Slice`, and language descriptors.
 - **`src/storage/`**: Incremental SQLite cache (`.mimori/index.db`) keyed on file content hashes.
 - **`src/workspace/`**: File traversal, `.gitignore` / `.mimoriignore` resolution, and monorepo path alias tracking.
-- **`src/mcp/`**: Native JSON-RPC stdio Model Context Protocol server exposing `mimori_slice`, `mimori_map`, `mimori_find`, `mimori_blast`, and `mimori_graph`.
+- **`src/memory/`**: Project memory ledger (`.agents/memory.md`), ponytail technical debt engine (`# ponytail:` scanner & sync), and Turn-0 context snapshot packing.
+- **`src/mcp/`**: Native JSON-RPC stdio Model Context Protocol server exposing `mimori_slice`, `mimori_map`, `mimori_find`, `mimori_blast`, `mimori_graph`, `mimori_memory`, and `mimori_debt`.
 - **`src/cli/`**: Clap command-line parser and command dispatch.
 
 ## Build and Test

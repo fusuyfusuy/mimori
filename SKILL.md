@@ -10,18 +10,21 @@ description: "High-performance code intelligence CLI: AST slicing, symbol search
 
 ## SYNOPSIS
 ```shell
-mimori init
-mimori map    [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
-mimori slice  <coordinate> [-f|--follow-local] [-i|--with-imports] [--budget <N>] [--json]
-mimori find   <pattern> [-s|--symbols-only] [-f|--files-only] [--limit <N>] [--json]
-mimori up     <target> [--json]
-mimori down   <target> [--json]
-mimori uses   <target> [--json]
+mimori init    [--force]
+mimori map     [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
+mimori slice   <coordinate> [-f|--follow-local] [-i|--with-imports] [-n|--numbered] [--budget <N>] [--json]
+mimori find    <pattern> [-s|--symbols-only] [-f|--files-only] [--limit <N>] [--json]
+mimori up      <target> [--json]
+mimori down    <target> [--json]
+mimori uses    <target> [--json]
 mimori missing <pattern> [--scope <dir>] [--defines <lit>] [--json]
-mimori blast  <target> [-d|--depth <N>] [--down] [--with-sinks <a,b,c>] [--json]
-mimori doctor [--limit <N>] [--json]
-mimori clean  [--all]
-mimori mcp    [--workspace <dir>]
+mimori blast   <target> [-d|--depth <N>] [--down] [--with-sinks <a,b,c>] [--json]
+mimori doctor  [--limit <N>] [--json]
+mimori memory  [show|lint|resolve] [--section <sec>] [--budget <N>] [--json]
+mimori debt    [list|check|sync] [--scope <dir>] [--json]
+mimori dump    [--budget <N>] [--focus <target>] [--json]
+mimori clean   [--all]
+mimori mcp     [--workspace <dir>]
 ```
 
 ## DESCRIPTION
@@ -111,21 +114,55 @@ Show repository health: file/symbol/edge counts, edge-resolution accounting (res
 
 ### `init`
 ```shell
-mimori init
+mimori init [--force]
 ```
-Initialize the `.mimori` workspace directory and cache storage.
+Initialize the `.mimori/` ephemeral cache directory and `.agents/` project memory substrate (`memory.md` and `decisions.md`). Guarantees `.mimori/` is present in `.gitignore`. Idempotent: preserves existing files unless `--force` is specified.
+
+### `memory`
+```shell
+mimori memory [show|lint|resolve] [--section <sec>] [--budget <N>] [--json]
+```
+Read, lint, or surgically resolve items in the project memory substrate (`.agents/memory.md`).
+* `show`: Output memory content or specific section (`--section <epics|debt|vocab|gotchas>`) bounded by `--budget <N>`.
+* `lint` (alias `check`): Automated validation gate enforcing:
+  - Strict 3-tuple debt schema: `- <what> <- <why> -> <trigger>`
+  - Hard 30-line debt ceiling
+  - Zero tolerance for strikethrough (`~~`) or completed checkboxes (`- [x]`, `* [x]`) — debt must be deleted, never hoarded.
+* `resolve <pattern>`: Surgically deletes debt ledger lines matching pattern, preserving adjacent formatting and comments.
+
+### `debt`
+```shell
+mimori debt [list|check|sync] [--scope <dir>] [--json]
+```
+Scan, validate, and reconcile in-code ponytail technical debt markers (`# ponytail: <what> <- <ceiling> -> <trigger>`).
+* `list`: Multi-threaded Rayon scanner uncovering in-code markers across all source languages (respects `.gitignore`).
+* `check`: CI proof gate verifying valid triggers and non-empty ceilings across markers + manual accepted debt.
+* `sync`: Reconciles in-code markers into `.agents/memory.md` under `## KNOWN DEBT`, automatically preserving operator waivers (`- accepted ...`) while purging stale markers.
+
+### `dump`
+```shell
+mimori dump [--budget <N>] [--focus <target>] [--json]
+```
+Generate a token-dense Turn-0 context snapshot packing PageRank architectural entry points, active technical debt, domain vocabulary, and empirical gotchas within a specified token budget (default: 1500 tokens).
 
 ### `clean`
 ```shell
 mimori clean [--all]
 ```
-Purge the embedded SQLite cache (`.mimori/index.db`, WAL, SHM) to force a fresh re-index on the next command. If `--all` is passed, also removes `.mimori/.cache/`.
+Purge the embedded SQLite cache (`.mimori/index.db`, WAL, SHM) to force a fresh re-index on the next command. If `--all` is passed, also removes `.mimori/.cache/`. Safe to run anytime; `.agents/` memory is never touched.
 
 ### `mcp`
 ```shell
 mimori mcp [--workspace <dir>]
 ```
-Run `mimori` as a Model Context Protocol (MCP) server over `stdio` using standard JSON-RPC 2.0 (protocol version `2024-11-05`). Exposes 5 high-leverage tools (`mimori_slice`, `mimori_map`, `mimori_find`, `mimori_blast`, `mimori_graph`) directly to AI coding agents with warm in-memory symbol graph caching.
+Run `mimori` as a Model Context Protocol (MCP) server over `stdio` using standard JSON-RPC 2.0 (protocol version `2024-11-05`). Exposes 7 high-leverage tools directly to AI coding agents with warm in-memory symbol graph caching:
+- `mimori_slice`: AST slice with signature, body, line numbers (`numbered: true`), and 1-hop callers/callees.
+- `mimori_map`: Centrality-ranked PageRank codebase outline.
+- `mimori_find`: Fast PageRank-ordered symbol and file search (`limit` defaults to 50).
+- `mimori_blast`: Upstream/downstream impact analysis with literal sink detection.
+- `mimori_graph`: Unified caller (`up`), callee (`down`), and mentioner (`uses`) traversal.
+- `mimori_memory`: Read (`show`), validate (`lint`), and surgically resolve (`resolve`) project memory (`.agents/memory.md`).
+- `mimori_debt`: Scan in-code markers (`list`), enforce CI gate (`check`), and reconcile (`sync`) ponytail technical debt.
 * `--workspace <dir>`: Root directory of the codebase to index and serve (defaults to current working directory).
 * All tools strictly enforce workspace confinement: `workspace_dir` arguments are resolved relative to the session root, and absolute paths escaping the workspace are rejected. `mimori_find` limits responses to 50 matches by default.
 

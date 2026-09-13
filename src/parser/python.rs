@@ -109,7 +109,13 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
     let mentions = Vec::new();
     let mut call_counts = std::collections::HashMap::new();
     let mut member_calls = Vec::new();
-    collect_references(node, content, &mut calls, &mut call_counts, &mut member_calls);
+    collect_references(
+        node,
+        content,
+        &mut calls,
+        &mut call_counts,
+        &mut member_calls,
+    );
 
     Symbol {
         name,
@@ -183,10 +189,7 @@ fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>) {
     if kind == "import_statement" {
         // `import a.b as c` binds `c`, else the top segment `a`.
         let text = node_text(node, content);
-        let clause = text
-            .strip_prefix("import")
-            .unwrap_or(text)
-            .trim();
+        let clause = text.strip_prefix("import").unwrap_or(text).trim();
         for part in clause.split(',') {
             let part = part.trim();
             if let Some((_, alias)) = part.split_once(" as ") {

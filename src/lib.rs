@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod graph;
 pub mod mcp;
+pub mod memory;
 pub mod model;
 pub mod parser;
 pub mod storage;
@@ -9,6 +10,7 @@ pub mod workspace;
 pub use cli::*;
 pub use graph::*;
 pub use mcp::*;
+pub use memory::*;
 pub use model::*;
 pub use parser::*;
 pub use storage::*;

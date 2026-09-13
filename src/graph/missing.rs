@@ -6,7 +6,10 @@ use std::path::Path;
 /// matches files containing either substring. Literals, not regex — no new
 /// syntax to learn, no new dependency, and the gate pattern works as-is.
 pub fn split_alternatives(raw: &str) -> Vec<&str> {
-    raw.split('|').map(str::trim).filter(|s| !s.is_empty()).collect()
+    raw.split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// True when `content` contains any alternative (or the defines marker).
@@ -62,9 +65,7 @@ pub fn find_missing(
         if !path.is_file() {
             continue;
         }
-        if crate::workspace::walker::is_ignored_rel(
-            path.strip_prefix(root).unwrap_or(path),
-        ) {
+        if crate::workspace::walker::is_ignored_rel(path.strip_prefix(root).unwrap_or(path)) {
             continue;
         }
         if !crate::workspace::walker::has_supported_extension(path) {

@@ -196,11 +196,9 @@ pub fn handle_request(
                         "isError": false
                     }),
                 )),
-                Err(ToolError::InvalidParams(err_msg)) => Some(JsonRpcResponse::error(
-                    req_id,
-                    -32602,
-                    err_msg,
-                )),
+                Err(ToolError::InvalidParams(err_msg)) => {
+                    Some(JsonRpcResponse::error(req_id, -32602, err_msg))
+                }
                 Err(ToolError::NotFound(name)) => Some(JsonRpcResponse::success(
                     req_id,
                     json!({

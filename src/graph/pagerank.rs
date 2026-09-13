@@ -18,7 +18,13 @@ pub fn compute_in_degree_pagerank(
     callees_map: &HashMap<usize, Vec<usize>>,
     focus_indices: Option<&[usize]>,
 ) -> PagerankStats {
-    compute_weighted_pagerank(symbols, callers_map, callees_map, &HashMap::new(), focus_indices)
+    compute_weighted_pagerank(
+        symbols,
+        callers_map,
+        callees_map,
+        &HashMap::new(),
+        focus_indices,
+    )
 }
 
 /// Weighted variant: `edge_weights[(u, v)]` is the sublinear multiplicity
@@ -58,9 +64,7 @@ pub fn compute_weighted_pagerank(
         _ => vec![1.0 / n as f64; n],
     };
 
-    let edge_w = |u: usize, v: usize| -> f64 {
-        edge_weights.get(&(u, v)).copied().unwrap_or(1.0)
-    };
+    let edge_w = |u: usize, v: usize| -> f64 { edge_weights.get(&(u, v)).copied().unwrap_or(1.0) };
 
     // Weighted out-mass per node; unweighted out-degree when no weights.
     let out_weight: Vec<f64> = (0..n)

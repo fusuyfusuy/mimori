@@ -135,11 +135,7 @@ pub fn execute_find(
     // Hybrid fallback: when zero symbols and files match, scan workspace files
     // line by line, emitting one hit per matching line (P0b: `rg -c` parity).
     if matches.is_empty() {
-        let mut files: Vec<&str> = graph
-            .symbols
-            .iter()
-            .map(|s| s.file.as_str())
-            .collect();
+        let mut files: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
         files.sort_unstable();
         files.dedup();
         for rel in files {

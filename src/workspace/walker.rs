@@ -43,18 +43,18 @@ pub struct ScanStats {
     pub unindexed_exts: Vec<String>,
 }
 
- /// Walk the workspace, then read and hash every supported file in parallel.
- ///
- /// Reading every file on every run is what makes hash-based invalidation
- /// possible: a content change cannot be detected without reading the content.
- /// Parsing, which dominates the cost, still runs only on files whose hash moved.
- pub fn scan_workspace(root: &Path) -> Vec<FileScan> {
+/// Walk the workspace, then read and hash every supported file in parallel.
+///
+/// Reading every file on every run is what makes hash-based invalidation
+/// possible: a content change cannot be detected without reading the content.
+/// Parsing, which dominates the cost, still runs only on files whose hash moved.
+pub fn scan_workspace(root: &Path) -> Vec<FileScan> {
     scan_workspace_with_stats(root).0
 }
 
 pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
-     let paths = discover_workspace_files(root);
- 
+    let paths = discover_workspace_files(root);
+
     let stats = ScanStats {
         indexed_files: paths.supported.len(),
         crawled_files: paths.crawled,
@@ -63,8 +63,8 @@ pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
 
     let scans = paths
         .supported
-         .into_par_iter()
-         .filter_map(|(rel, full, mtime)| {
+        .into_par_iter()
+        .filter_map(|(rel, full, mtime)| {
             let content = fs::read_to_string(&full).ok()?;
             let hash = format!("{:x}", fnv1a_hash(content.as_bytes()));
             Some(FileScan {
@@ -73,10 +73,10 @@ pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
                 hash,
                 content,
             })
-         })
+        })
         .collect();
     (scans, stats)
- }
+}
 
 struct DiscoveredFiles {
     supported: Vec<(PathBuf, PathBuf, i64)>,

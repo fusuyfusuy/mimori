@@ -223,3 +223,80 @@ fn test_cli_slice_ambiguous_error_suggests_retry_commands() {
         .stderr(predicate::str::contains("Ambiguous"))
         .stderr(predicate::str::contains("mimori slice '"));
 }
+
+#[test]
+fn test_cli_slice_caller_ceiling() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("hub.rs");
+    let code = r#"
+pub fn target_fn() {}
+pub fn caller_1() { target_fn(); }
+pub fn caller_2() { target_fn(); }
+pub fn caller_3() { target_fn(); }
+pub fn caller_4() { target_fn(); }
+pub fn caller_5() { target_fn(); }
+pub fn caller_6() { target_fn(); }
+pub fn caller_7() { target_fn(); }
+"#;
+    fs::write(&file_path, code).unwrap();
+
+    let target = format!("{}:target_fn", file_path.to_str().unwrap());
+
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("- **1-Hop Callers**:"))
+        .stdout(predicate::str::contains(
+            "_5 of 7 callers shown (use mimori up for full list)_",
+        ));
+}
+
+#[test]
+fn test_slice_result_numbered_code_slices() {
+    use mimori::model::SliceResult;
+
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("logic.rs");
+    let code = "pub fn calculate() {\n    let a = 10;\n    let b = 20;\n    let _ = a + b;\n}\n";
+    fs::write(&file_path, code).unwrap();
+
+    let (graph, coord) = mimori::graph::prepare_coordinate(
+        mimori::model::Coordinate::parse(&format!("{}:calculate", file_path.display())).unwrap(),
+        dir.path(),
+    )
+    .unwrap();
+
+    let slice: SliceResult = graph.build_slice(&coord, false, false).unwrap();
+    let numbered_md = slice.to_markdown_numbered();
+
+    assert!(numbered_md.contains("L1: pub fn calculate() {"));
+    assert!(numbered_md.contains("L2:     let a = 10;"));
+    assert!(numbered_md.contains("L3:     let b = 20;"));
+    assert!(numbered_md.contains("L4:     let _ = a + b;"));
+    assert!(numbered_md.contains("L5: }"));
+}
+
+#[test]
+fn test_slice_result_numbered_line_range() {
+    use mimori::model::SliceResult;
+
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("lines.rs");
+    let code = "first\nsecond\nthird\nfourth\nfifth\n";
+    fs::write(&file_path, code).unwrap();
+
+    let (graph, coord) = mimori::graph::prepare_coordinate(
+        mimori::model::Coordinate::parse(&format!("{}:#L2-4", file_path.display())).unwrap(),
+        dir.path(),
+    )
+    .unwrap();
+
+    let slice: SliceResult = graph.build_slice(&coord, false, false).unwrap();
+    let numbered_md = slice.to_markdown_numbered();
+
+    assert!(numbered_md.contains("L2: second"));
+    assert!(numbered_md.contains("L3: third"));
+    assert!(numbered_md.contains("L4: fourth"));
+}

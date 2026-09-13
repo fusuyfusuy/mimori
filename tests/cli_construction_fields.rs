@@ -183,7 +183,7 @@ fn blast_on_template_var_lists_value_uses() {
 /// `commandWithLog` intermediate, which `uses` reaches instead.
 #[test]
 fn down_surfaces_true_callee_not_template_var() {
-     let dir = tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_exec_repo(dir.path());
 
     Command::cargo_bin("mimori")

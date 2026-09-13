@@ -90,7 +90,9 @@ impl MapResult {
         ));
         if let (Some(idx), Some(crawled)) = (self.indexed_files, self.crawled_files) {
             let pct = idx * 100 / crawled.max(1);
-            out.push_str(&format!("\n*Coverage*: {idx}/{crawled} files indexed ({pct}%)"));
+            out.push_str(&format!(
+                "\n*Coverage*: {idx}/{crawled} files indexed ({pct}%)"
+            ));
             if let Some(exts) = &self.unindexed_exts {
                 if !exts.is_empty() {
                     out.push_str(&format!(" | skipped exts: {}", exts.join(", ")));

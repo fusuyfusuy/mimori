@@ -134,7 +134,7 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         if !has_callers && !has_callees {
             isolated += 1;
         }
-         // Dead-weight = isolated, not a `main` program entry, not a test,
+        // Dead-weight = isolated, not a `main` program entry, not a test,
         // and not a framework-dispatched entry (P1-3): tRPC router
         // procedures, Next.js page/route/layout/middleware/server
         // conventions, and index-barrel re-exports are reachable without a
@@ -164,42 +164,42 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         }
     }
 
-/// Framework-dispatched entries: reachable without a tracked call edge.
-/// tRPC procedures (`appRouter::*` / `router(...)` objects), Next.js
-/// `page|route|layout|middleware|server` files, and symbols re-exported
-/// through an index barrel.
-pub(crate) fn is_framework_entry(sym: &crate::model::Symbol) -> bool {
-    let file = sym.file.replace('\\', "/");
-    let stem = file
-        .rsplit('/')
-        .next()
-        .unwrap_or(&file)
-        .rsplit('.')
-        .nth(1)
-        .unwrap_or("");
-    if matches!(
-        stem,
-        "page" | "route" | "layout" | "loading" | "error" | "middleware" | "server"
-    ) {
-        return true;
+    /// Framework-dispatched entries: reachable without a tracked call edge.
+    /// tRPC procedures (`appRouter::*` / `router(...)` objects), Next.js
+    /// `page|route|layout|middleware|server` files, and symbols re-exported
+    /// through an index barrel.
+    pub(crate) fn is_framework_entry(sym: &crate::model::Symbol) -> bool {
+        let file = sym.file.replace('\\', "/");
+        let stem = file
+            .rsplit('/')
+            .next()
+            .unwrap_or(&file)
+            .rsplit('.')
+            .nth(1)
+            .unwrap_or("");
+        if matches!(
+            stem,
+            "page" | "route" | "layout" | "loading" | "error" | "middleware" | "server"
+        ) {
+            return true;
+        }
+        // tRPC-style router objects: `appRouter`, `*Router`, or `router`.
+        let leaf = sym.name.rsplit("::").next().unwrap_or(&sym.name);
+        let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+        if leaf == "appRouter" || leaf == "router" || leaf.ends_with("Router") {
+            return true;
+        }
+        // Procedures registered on a router object read as `appRouter::name`.
+        if sym.name.starts_with("appRouter::") || sym.name.starts_with("appRouter.") {
+            return true;
+        }
+        // Index-barrel re-exports: anything defined in an index file is public
+        // surface by construction.
+        if stem == "index" || stem == "mod" {
+            return true;
+        }
+        false
     }
-    // tRPC-style router objects: `appRouter`, `*Router`, or `router`.
-    let leaf = sym.name.rsplit("::").next().unwrap_or(&sym.name);
-    let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
-    if leaf == "appRouter" || leaf == "router" || leaf.ends_with("Router") {
-        return true;
-    }
-    // Procedures registered on a router object read as `appRouter::name`.
-    if sym.name.starts_with("appRouter::") || sym.name.starts_with("appRouter.") {
-        return true;
-    }
-    // Index-barrel re-exports: anything defined in an index file is public
-    // surface by construction.
-    if stem == "index" || stem == "mod" {
-        return true;
-    }
-    false
-}
 
     let mut by_centrality = |a: &DeadSymbol, b: &DeadSymbol| {
         a.centrality

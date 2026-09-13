@@ -49,12 +49,14 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
         .par_iter()
         .map(|(rel, scan)| {
             let full = root.join(&scan.rel);
-            let symbols = parse_file(&full, &scan.content, &aliases).ok().map(|mut syms| {
-                for s in &mut syms {
-                    s.file = rel.clone();
-                }
-                syms
-            });
+            let symbols = parse_file(&full, &scan.content, &aliases)
+                .ok()
+                .map(|mut syms| {
+                    for s in &mut syms {
+                        s.file = rel.clone();
+                    }
+                    syms
+                });
             (rel.clone(), scan.mtime, scan.hash.clone(), symbols)
         })
         .collect();
@@ -102,9 +104,7 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     });
     // P1-4: a zero that means "none indexed" must never present as
     // "none exists". One line on stderr when coverage drops below half.
-    if scan_stats.crawled_files > 0
-        && scan_stats.indexed_files * 2 < scan_stats.crawled_files
-    {
+    if scan_stats.crawled_files > 0 && scan_stats.indexed_files * 2 < scan_stats.crawled_files {
         eprintln!(
             "Note: indexed {}/{} files ({}%); unindexed exts: {}. Coverage below 50% — map/doctor reflect indexed files only.",
             scan_stats.indexed_files,

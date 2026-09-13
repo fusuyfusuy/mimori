@@ -119,7 +119,13 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
     let mentions = Vec::new();
     let mut call_counts = std::collections::HashMap::new();
     let mut member_calls = Vec::new();
-    collect_references(node, content, &mut calls, &mut call_counts, &mut member_calls);
+    collect_references(
+        node,
+        content,
+        &mut calls,
+        &mut call_counts,
+        &mut member_calls,
+    );
 
     Symbol {
         name,
@@ -167,7 +173,6 @@ fn collect_references(
         collect_references(child, content, calls, counts, member_calls);
     }
 }
-
 
 fn extract_signature(body: &str) -> String {
     let first_line = body.lines().next().unwrap_or("").trim();

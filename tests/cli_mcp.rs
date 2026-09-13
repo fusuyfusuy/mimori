@@ -102,7 +102,7 @@ fn test_mcp_tools_list() {
     let resp = client.recv();
     assert_eq!(resp["id"], 1);
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 7);
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -112,7 +112,9 @@ fn test_mcp_tools_list() {
             "mimori_map",
             "mimori_find",
             "mimori_blast",
-            "mimori_graph"
+            "mimori_graph",
+            "mimori_memory",
+            "mimori_debt",
         ]
     );
 
@@ -322,7 +324,11 @@ fn test_mcp_error_handling() {
     assert_eq!(resp["id"], 20);
     assert_eq!(resp["result"]["isError"], true);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("Unknown tool: 'non_existent_tool'"), "got: {}", text);
+    assert!(
+        text.contains("Unknown tool: 'non_existent_tool'"),
+        "got: {}",
+        text
+    );
 
     // 2. Invalid direction for mimori_graph -> -32602 InvalidParams
     client.send(&json!({
@@ -341,7 +347,10 @@ fn test_mcp_error_handling() {
     assert_eq!(resp["id"], 21);
     assert!(resp["error"].is_object());
     assert_eq!(resp["error"]["code"], -32602);
-    assert!(resp["error"]["message"].as_str().unwrap().contains("Invalid direction"));
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid direction"));
 
     // 3. Absent name -> -32602
     client.send(&json!({
@@ -451,7 +460,11 @@ fn test_mcp_path_confinement_line_coordinates() {
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
     let in_workspace_file = src.join("inside.rs");
-    fs::write(&in_workspace_file, "pub fn inside() { println!(\"secret\"); }").unwrap();
+    fs::write(
+        &in_workspace_file,
+        "pub fn inside() { println!(\"secret\"); }",
+    )
+    .unwrap();
 
     let mut client = McpClient::spawn(dir.path());
 
@@ -533,7 +546,10 @@ fn test_mcp_workspace_dir_confinement() {
     let resp = client.recv();
     assert_eq!(resp["id"], 50);
     assert_eq!(resp["error"]["code"], -32602);
-    assert!(!hostile_probe.join(".mimori").exists(), "hostile .mimori must not be created");
+    assert!(
+        !hostile_probe.join(".mimori").exists(),
+        "hostile .mimori must not be created"
+    );
 
     // 2. Relative escaping workspace_dir -> -32602
     client.send(&json!({
@@ -712,7 +728,11 @@ fn test_mcp_request_cancellation() {
 
     // The next response must be for ping 101, id 100 was suppressed
     let resp = client.recv();
-    assert_eq!(resp["id"], 101, "Expected response for id 101, but got: {:?}", resp);
+    assert_eq!(
+        resp["id"], 101,
+        "Expected response for id 101, but got: {:?}",
+        resp
+    );
 }
 
 #[test]
@@ -833,4 +853,132 @@ fn test_mcp_whole_session_stdout_purity() {
     stdin.flush().unwrap();
     let r7 = client.recv();
     assert_eq!(r7["error"]["code"], -32700);
+}
+
+#[test]
+fn test_mcp_memory_and_debt_tools() {
+    let dir = tempdir().unwrap();
+    let agents_dir = dir.path().join(".agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+
+    let memory_md = "\
+# Project Memory
+
+## Active Epics & Scale
+- Scale: 100 active nodes.
+
+## KNOWN DEBT (open only — one line per item, delete when done)
+# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>
+
+- accepted test gaps <- daemon loops untested -> deliberate gaps preserved
+
+## Domain Vocabulary & Gotchas
+- Gotchas: Keep memory compact.
+";
+    fs::write(agents_dir.join("memory.md"), memory_md).unwrap();
+
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    let code_file = src_dir.join("cache.rs");
+    fs::write(
+        &code_file,
+        "// ponytail: bypass cache <- max 100 req/s -> implement redis pool\npub fn get_cache() {}\n",
+    )
+    .unwrap();
+
+    let mut client = McpClient::spawn(dir.path());
+
+    // 1. Debt list
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "debt_list_1",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_debt",
+            "arguments": { "action": "list" }
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], "debt_list_1");
+    let content = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(content.contains("bypass cache"));
+    assert!(content.contains("implement redis pool"));
+
+    // 2. Debt sync
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "debt_sync_2",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_debt",
+            "arguments": { "action": "sync" }
+        }
+    }));
+    let resp2 = client.recv();
+    assert_eq!(resp2["id"], "debt_sync_2");
+    let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text2.contains("DEBT_SYNC:"));
+
+    // 3. Memory lint
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "mem_lint_3",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_memory",
+            "arguments": { "action": "lint" }
+        }
+    }));
+    let resp3 = client.recv();
+    assert_eq!(resp3["id"], "mem_lint_3");
+    let text3 = resp3["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text3.contains("MEM_LINT:"));
+    assert!(text3.contains("exit 0."));
+
+    // 4. Memory show section debt
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "mem_show_4",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_memory",
+            "arguments": { "action": "show", "section": "debt" }
+        }
+    }));
+    let resp4 = client.recv();
+    assert_eq!(resp4["id"], "mem_show_4");
+    let text4 = resp4["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text4.contains("bypass cache"));
+    assert!(text4.contains("accepted test gaps"));
+
+    // 5. Memory resolve
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "mem_resolve_5",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_memory",
+            "arguments": { "action": "resolve", "target": "bypass cache" }
+        }
+    }));
+    let resp5 = client.recv();
+    assert_eq!(resp5["id"], "mem_resolve_5");
+    let text5 = resp5["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text5.contains("MEM_RESOLVE: deleted 1 lines matching 'bypass cache'"));
+
+    // 6. Debt check
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "debt_check_6",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_debt",
+            "arguments": { "action": "check" }
+        }
+    }));
+    let resp6 = client.recv();
+    assert_eq!(resp6["id"], "debt_check_6");
+    let text6 = resp6["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text6.contains("DEBT_CHECK:"));
+    assert!(text6.contains("exit 0."));
 }

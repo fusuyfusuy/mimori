@@ -274,10 +274,7 @@ fn collect_uses(node: Node, content: &str, out: &mut Vec<String>) {
             .trim()
             .trim_end_matches(';')
             .trim();
-        if !(tree.starts_with("crate")
-            || tree.starts_with("self")
-            || tree.starts_with("super"))
-        {
+        if !(tree.starts_with("crate") || tree.starts_with("self") || tree.starts_with("super")) {
             collect_use_tree_names(tree, out);
         }
         return;
@@ -422,13 +419,30 @@ mod tests {
 
     #[test]
     fn nested_use_trees_extract_clean_identifiers() {
-        let src = "use std::{collections::{HashMap, HashSet}, io};\nfn f() { let _ = HashMap::new(); }";
+        let src =
+            "use std::{collections::{HashMap, HashSet}, io};\nfn f() { let _ = HashMap::new(); }";
         let syms = parse_rust("t.rs", src).unwrap();
         let f = syms.iter().find(|s| s.name == "f").unwrap();
-        assert!(f.external_imports.contains(&"HashMap".to_string()), "got {:?}", f.external_imports);
-        assert!(f.external_imports.contains(&"HashSet".to_string()), "got {:?}", f.external_imports);
-        assert!(f.external_imports.contains(&"io".to_string()), "got {:?}", f.external_imports);
-        assert!(!f.external_imports.iter().any(|s| s.contains('}')), "trailing brace found: {:?}", f.external_imports);
+        assert!(
+            f.external_imports.contains(&"HashMap".to_string()),
+            "got {:?}",
+            f.external_imports
+        );
+        assert!(
+            f.external_imports.contains(&"HashSet".to_string()),
+            "got {:?}",
+            f.external_imports
+        );
+        assert!(
+            f.external_imports.contains(&"io".to_string()),
+            "got {:?}",
+            f.external_imports
+        );
+        assert!(
+            !f.external_imports.iter().any(|s| s.contains('}')),
+            "trailing brace found: {:?}",
+            f.external_imports
+        );
     }
 
     #[test]
@@ -436,9 +450,20 @@ mod tests {
         let src = "pub use crate::db::query_user;\npub(crate) use crate::model::User;\nuse anyhow::Result;\nfn f() {}";
         let syms = parse_rust("t.rs", src).unwrap();
         let f = syms.iter().find(|s| s.name == "f").unwrap();
-        assert!(!f.external_imports.contains(&"query_user".to_string()), "crate export misflagged as external: {:?}", f.external_imports);
-        assert!(!f.external_imports.contains(&"User".to_string()), "crate export misflagged as external: {:?}", f.external_imports);
-        assert!(f.external_imports.contains(&"Result".to_string()), "external anyhow::Result missing: {:?}", f.external_imports);
+        assert!(
+            !f.external_imports.contains(&"query_user".to_string()),
+            "crate export misflagged as external: {:?}",
+            f.external_imports
+        );
+        assert!(
+            !f.external_imports.contains(&"User".to_string()),
+            "crate export misflagged as external: {:?}",
+            f.external_imports
+        );
+        assert!(
+            f.external_imports.contains(&"Result".to_string()),
+            "external anyhow::Result missing: {:?}",
+            f.external_imports
+        );
     }
 }
-

@@ -258,6 +258,60 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                 "required": ["target", "direction"]
             }
         }),
+        json!({
+            "name": "mimori_memory",
+            "description": "Read, lint, or resolve project memory (.agents/memory.md).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["show", "lint", "resolve"],
+                        "description": "Action: 'show' (read memory sections), 'lint' (validate 30-line ceiling and schema), 'resolve' (surgically delete debt item)"
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Optional section filter for 'show': 'epics', 'debt', 'vocab', 'gotchas'"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Pattern matching debt line to delete (for 'resolve')"
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "description": "Token budget for output"
+                    },
+                    "workspace_dir": {
+                        "type": "string",
+                        "description": "Optional workspace directory relative to session root"
+                    }
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "mimori_debt",
+            "description": "Scan, check, or sync in-code ponytail technical debt markers (# ponytail: <what> <- <ceiling> -> <trigger>).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "check", "sync"],
+                        "description": "Action: 'list' (scan in-code markers), 'check' (validate in CI), 'sync' (merge into .agents/memory.md)"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional subdirectory filter"
+                    },
+                    "workspace_dir": {
+                        "type": "string",
+                        "description": "Optional workspace directory relative to session root"
+                    }
+                },
+                "required": ["action"]
+            }
+        }),
     ]
 }
 
@@ -322,6 +376,28 @@ struct GraphToolArgs {
     workspace_dir: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MemoryToolArgs {
+    action: String,
+    #[serde(default)]
+    section: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    budget: Option<usize>,
+    #[serde(default)]
+    workspace_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DebtToolArgs {
+    action: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    workspace_dir: Option<String>,
+}
+
 fn resolve_workspace_scope(
     workspace_dir: Option<&str>,
     session_root: &Path,
@@ -350,11 +426,13 @@ pub fn call_tool(
 ) -> Result<String, ToolError> {
     match name {
         "mimori_slice" => {
-            let args: SliceToolArgs = serde_json::from_value(arguments.clone())
-                .map_err(|e| ToolError::InvalidParams(format!("Invalid arguments for 'mimori_slice': {}", e)))?;
+            let args: SliceToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_slice': {}", e))
+            })?;
             let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-            let coord = Coordinate::parse(&args.coordinate)
-                .map_err(|e| ToolError::InvalidParams(format!("Invalid coordinate '{}': {}", args.coordinate, e)))?;
+            let coord = Coordinate::parse(&args.coordinate).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid coordinate '{}': {}", args.coordinate, e))
+            })?;
 
             let with_imports = args.with_imports.unwrap_or(false);
             let follow_local = args.follow_local.unwrap_or(false);
@@ -374,7 +452,9 @@ pub fn call_tool(
                     Ok(slice.to_markdown())
                 }
             } else {
-                let graph = cache.get_graph(&session.root).map_err(|e| ToolError::Execution(e.to_string()))?;
+                let graph = cache
+                    .get_graph(&session.root)
+                    .map_err(|e| ToolError::Execution(e.to_string()))?;
                 let norm_coord = coord.normalize_against(&session.root);
                 let slice = graph
                     .build_slice(&norm_coord, follow_local, with_imports)
@@ -387,10 +467,13 @@ pub fn call_tool(
             }
         }
         "mimori_map" => {
-            let args: MapToolArgs = serde_json::from_value(arguments.clone())
-                .map_err(|e| ToolError::InvalidParams(format!("Invalid arguments for 'mimori_map': {}", e)))?;
+            let args: MapToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_map': {}", e))
+            })?;
             let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-            let base_graph = cache.get_graph(&session.root).map_err(|e| ToolError::Execution(e.to_string()))?;
+            let base_graph = cache
+                .get_graph(&session.root)
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
             let mut graph = (*base_graph).clone();
 
             personalize_map(
@@ -402,17 +485,13 @@ pub fn call_tool(
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
             let scope = args.scope.as_deref().or(args.workspace_dir.as_deref());
-            let map_result = generate_map(
-                &graph,
-                scope,
-                args.focus.as_deref(),
-                args.limit,
-            );
+            let map_result = generate_map(&graph, scope, args.focus.as_deref(), args.limit);
             Ok(map_result.to_markdown())
         }
         "mimori_find" => {
-            let args: FindToolArgs = serde_json::from_value(arguments.clone())
-                .map_err(|e| ToolError::InvalidParams(format!("Invalid arguments for 'mimori_find': {}", e)))?;
+            let args: FindToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_find': {}", e))
+            })?;
             let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let limit = args.limit.or(Some(50));
             let res = crate::workspace::execute_find(
@@ -426,10 +505,13 @@ pub fn call_tool(
             Ok(res.to_markdown())
         }
         "mimori_blast" => {
-            let args: BlastToolArgs = serde_json::from_value(arguments.clone())
-                .map_err(|e| ToolError::InvalidParams(format!("Invalid arguments for 'mimori_blast': {}", e)))?;
+            let args: BlastToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_blast': {}", e))
+            })?;
             let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-            let graph = cache.get_graph(&session.root).map_err(|e| ToolError::Execution(e.to_string()))?;
+            let graph = cache
+                .get_graph(&session.root)
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
             let coord = Coordinate::parse(&args.target)
                 .map_err(|e| ToolError::InvalidParams(e.to_string()))?
                 .normalize_against(&session.root);
@@ -438,9 +520,11 @@ pub fn call_tool(
             let down = args.down.unwrap_or(false);
 
             let blast_res = if down {
-                calculate_downstream_blast(&graph, &coord, depth).map_err(|e| ToolError::Execution(e.to_string()))?
+                calculate_downstream_blast(&graph, &coord, depth)
+                    .map_err(|e| ToolError::Execution(e.to_string()))?
             } else {
-                calculate_blast_radius(&graph, &coord, depth).map_err(|e| ToolError::Execution(e.to_string()))?
+                calculate_blast_radius(&graph, &coord, depth)
+                    .map_err(|e| ToolError::Execution(e.to_string()))?
             };
 
             let sinks = parse_sink_list(args.with_sinks.as_deref());
@@ -468,10 +552,13 @@ pub fn call_tool(
             Ok(md)
         }
         "mimori_graph" => {
-            let args: GraphToolArgs = serde_json::from_value(arguments.clone())
-                .map_err(|e| ToolError::InvalidParams(format!("Invalid arguments for 'mimori_graph': {}", e)))?;
+            let args: GraphToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_graph': {}", e))
+            })?;
             let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-            let graph = cache.get_graph(&session.root).map_err(|e| ToolError::Execution(e.to_string()))?;
+            let graph = cache
+                .get_graph(&session.root)
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
             let coord = Coordinate::parse(&args.target)
                 .map_err(|e| ToolError::InvalidParams(e.to_string()))?
                 .normalize_against(&session.root);
@@ -491,6 +578,94 @@ pub fn call_tool(
                 }
                 other => Err(ToolError::InvalidParams(format!(
                     "Invalid direction '{}': expected 'up', 'down', or 'uses'",
+                    other
+                ))),
+            }
+        }
+        "mimori_memory" => {
+            let args: MemoryToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_memory': {}", e))
+            })?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let mut ledger = crate::memory::MemoryLedger::load(&scope_dir)
+                .map_err(|e| ToolError::Execution(format!("Load memory: {}", e)))?;
+
+            match args.action.as_str() {
+                "show" => {
+                    let text = if let Some(sec) = args.section.as_deref() {
+                        match ledger.get_section(sec) {
+                            Some(content) => content,
+                            None => format!("MEM_EMPTY: section '{}' not found; exit 0.", sec),
+                        }
+                    } else {
+                        ledger.raw_content
+                    };
+                    if let Some(b) = args.budget {
+                        let max_chars = b * 4;
+                        if text.len() > max_chars {
+                            let mut truncated = String::new();
+                            for line in text.lines() {
+                                if truncated.len() + line.len() + 1 > max_chars {
+                                    truncated.push_str("… [truncated to fit token budget]\n");
+                                    break;
+                                }
+                                truncated.push_str(line);
+                                truncated.push('\n');
+                            }
+                            return Ok(truncated);
+                        }
+                    }
+                    Ok(text)
+                }
+                "lint" => {
+                    let report = ledger.lint();
+                    Ok(report.to_m2m_output())
+                }
+                "resolve" => {
+                    let target = args.target.ok_or_else(|| {
+                        ToolError::InvalidParams(
+                            "Missing required 'target' parameter for action 'resolve'".to_string(),
+                        )
+                    })?;
+                    let deleted = ledger
+                        .resolve(&target)
+                        .map_err(|e| ToolError::Execution(format!("Resolve: {}", e)))?;
+                    Ok(format!(
+                        "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/30 lines; exit 0.",
+                        deleted,
+                        target,
+                        ledger.raw_debt_lines.len()
+                    ))
+                }
+                other => Err(ToolError::InvalidParams(format!(
+                    "Invalid action '{}': expected 'show', 'lint', or 'resolve'",
+                    other
+                ))),
+            }
+        }
+        "mimori_debt" => {
+            let args: DebtToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_debt': {}", e))
+            })?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+
+            match args.action.as_str() {
+                "list" => {
+                    let (_markers, output) =
+                        crate::memory::list_debt(&scope_dir, args.scope.as_deref());
+                    Ok(output)
+                }
+                "check" => {
+                    let (_passed, output) = crate::memory::check_debt(&scope_dir);
+                    Ok(output)
+                }
+                "sync" => {
+                    let (_in_code, _manual, _synced, output) = crate::memory::sync_debt(&scope_dir)
+                        .map_err(|e| ToolError::Execution(format!("Debt sync: {}", e)))?;
+                    Ok(output)
+                }
+                other => Err(ToolError::InvalidParams(format!(
+                    "Invalid action '{}': expected 'list', 'check', or 'sync'",
                     other
                 ))),
             }
