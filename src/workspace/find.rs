@@ -135,14 +135,10 @@ pub fn execute_find(
     // Hybrid fallback: when zero symbols and files match, scan workspace files
     // line by line, emitting one hit per matching line (P0b: `rg -c` parity).
     if matches.is_empty() {
-        let mut files: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
-        files.sort_unstable();
-        files.dedup();
-        for rel in files {
-            let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
-                continue;
-            };
-            for (idx, line) in content.lines().enumerate() {
+        let scans = crate::workspace::walker::scan_workspace(root);
+        for scan in scans {
+            let rel = scan.rel.to_string_lossy();
+            for (idx, line) in scan.content.lines().enumerate() {
                 if line.to_lowercase().contains(&q_lower) {
                     let line_no = idx + 1;
                     matches.push(FindMatch {

@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// File extensions that make a `:`-prefix recognizable as a path rather than
 /// the first segment of a qualified symbol name.
-const SOURCE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "py", "go"];
+const SOURCE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go"];
 
 /// A parsed target coordinate.
 ///

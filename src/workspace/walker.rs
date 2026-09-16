@@ -32,7 +32,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".mimori",
 ];
 
-const SUPPORTED_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "py", "go"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go"];
 
 /// Coverage accounting (P1-4): what the walker crawled vs indexed, so a zero
 /// that means "none indexed" never presents as "none exists".
