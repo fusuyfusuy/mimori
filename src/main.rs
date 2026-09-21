@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use mimori::cli::{Cli, Commands, DebtCommand, MemoryCommand};
 use mimori::graph::map::generate_map;
@@ -29,7 +29,28 @@ fn main() -> ExitCode {
 
             // A line range is read straight off disk; it needs no index.
             let built = if let Coordinate::Lines { file, start, end } = &coord {
-                slice_line_coordinate(file, *start, *end, args.with_imports)
+                let root = find_workspace_root(coord.absolute_parent().as_deref(), &current_dir);
+                if mimori::workspace::walker::is_system_directory(&root) {
+                    eprintln!(
+                        "Error: Cannot access system directory '{}' as workspace",
+                        root.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let full = if file.is_absolute() {
+                    file.to_path_buf()
+                } else {
+                    current_dir.join(file)
+                };
+                let target_path =
+                    match mimori::workspace::walker::confine_to_workspace(&root, &full) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                slice_line_coordinate(&target_path, *start, *end, args.with_imports)
             } else {
                 match prepare(coord, &current_dir) {
                     Ok((graph, coord)) => {
@@ -558,7 +579,25 @@ fn main() -> ExitCode {
                 };
                 let sec = show_args.section.as_deref().or(args.section.as_deref());
                 let budget = show_args.budget.or(args.budget);
-                if let Some(s) = sec {
+                if cli.json {
+                    let val = if let Some(s) = sec {
+                        let content = ledger.get_section(s);
+                        json!({
+                            "section": s,
+                            "found": content.is_some(),
+                            "content": content.unwrap_or_default(),
+                        })
+                    } else {
+                        json!({
+                            "epics": ledger.epics,
+                            "debt_count": ledger.raw_debt_lines.len(),
+                            "debt_items": ledger.debt_items,
+                            "vocab_gotchas": ledger.vocab_gotchas,
+                        })
+                    };
+                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                    ExitCode::SUCCESS
+                } else if let Some(s) = sec {
                     match ledger.get_section(s) {
                         Some(content) => {
                             print_budgeted(&content, budget);
@@ -569,15 +608,6 @@ fn main() -> ExitCode {
                             ExitCode::SUCCESS
                         }
                     }
-                } else if cli.json {
-                    let val = json!({
-                        "epics": ledger.epics,
-                        "debt_count": ledger.raw_debt_lines.len(),
-                        "debt_items": ledger.debt_items,
-                        "vocab_gotchas": ledger.vocab_gotchas,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
-                    ExitCode::SUCCESS
                 } else {
                     print_budgeted(&ledger.raw_content, budget);
                     ExitCode::SUCCESS
@@ -591,7 +621,25 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                if let Some(s) = args.section.as_deref() {
+                if cli.json {
+                    let val = if let Some(s) = args.section.as_deref() {
+                        let content = ledger.get_section(s);
+                        json!({
+                            "section": s,
+                            "found": content.is_some(),
+                            "content": content.unwrap_or_default(),
+                        })
+                    } else {
+                        json!({
+                            "epics": ledger.epics,
+                            "debt_count": ledger.raw_debt_lines.len(),
+                            "debt_items": ledger.debt_items,
+                            "vocab_gotchas": ledger.vocab_gotchas,
+                        })
+                    };
+                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                    ExitCode::SUCCESS
+                } else if let Some(s) = args.section.as_deref() {
                     match ledger.get_section(s) {
                         Some(content) => {
                             print_budgeted(&content, args.budget);
@@ -602,15 +650,6 @@ fn main() -> ExitCode {
                             ExitCode::SUCCESS
                         }
                     }
-                } else if cli.json {
-                    let val = json!({
-                        "epics": ledger.epics,
-                        "debt_count": ledger.raw_debt_lines.len(),
-                        "debt_items": ledger.debt_items,
-                        "vocab_gotchas": ledger.vocab_gotchas,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
-                    ExitCode::SUCCESS
                 } else {
                     print_budgeted(&ledger.raw_content, args.budget);
                     ExitCode::SUCCESS
@@ -752,6 +791,23 @@ fn parse_and_prepare(raw: &str, cwd: &Path) -> Result<(SymbolGraph, Coordinate)>
 
 fn prepare(coord: Coordinate, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
     let root = find_workspace_root(coord.absolute_parent().as_deref(), cwd);
+    if mimori::workspace::walker::is_system_directory(&root) {
+        bail!(
+            "Cannot access system directory '{}' as workspace",
+            root.display()
+        );
+    }
+    if let Some(file) = coord.file() {
+        if file.is_absolute() {
+            mimori::workspace::walker::confine_to_workspace(&root, file)?;
+        } else if file
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            let full = root.join(file);
+            mimori::workspace::walker::confine_to_workspace(&root, &full)?;
+        }
+    }
     let graph = get_or_sync_graph(&root)?;
     Ok((graph, coord.normalize_against(&root)))
 }

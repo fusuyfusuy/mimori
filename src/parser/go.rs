@@ -13,7 +13,7 @@ pub fn parse_go(file: &str, content: &str) -> Result<Vec<Symbol>> {
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
-    walk_go_node(root, content, file, &mut symbols);
+    walk_go_node(root, content, file, &mut symbols, 0);
     let external_imports = collect_file_external_imports(root, content);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
@@ -22,7 +22,12 @@ pub fn parse_go(file: &str, content: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
-fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>) {
+const MAX_AST_DEPTH: usize = 256;
+
+fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     match kind {
         "function_declaration" => {
@@ -48,20 +53,26 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
         }
         "type_declaration" => {
             let mut cursor = node.walk();
+            let mut specs = Vec::new();
             for child in node.children(&mut cursor) {
                 if child.kind() == "type_spec" {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = node_text(name_node, content);
-                        let type_node = child.child_by_field_name("type");
-                        let sym_kind = match type_node.map(|t| t.kind()) {
-                            Some("struct_type") => SymbolKind::Struct,
-                            Some("interface_type") => SymbolKind::Interface,
-                            _ => SymbolKind::TypeAlias,
-                        };
+                    specs.push(child);
+                }
+            }
+            let is_grouped = specs.len() > 1;
+            for child in specs {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(name_node, content);
+                    let type_node = child.child_by_field_name("type");
+                    let sym_kind = match type_node.map(|t| t.kind()) {
+                        Some("struct_type") => SymbolKind::Struct,
+                        Some("interface_type") => SymbolKind::Interface,
+                        _ => SymbolKind::TypeAlias,
+                    };
 
-                        let symbol = create_symbol(node, content, file, name.to_string(), sym_kind);
-                        symbols.push(symbol);
-                    }
+                    let sym_node = if is_grouped { child } else { node };
+                    let symbol = create_symbol(sym_node, content, file, name.to_string(), sym_kind);
+                    symbols.push(symbol);
                 }
             }
         }
@@ -88,7 +99,7 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_go_node(child, content, file, symbols);
+        walk_go_node(child, content, file, symbols, depth + 1);
     }
 }
 
@@ -125,6 +136,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         &mut calls,
         &mut call_counts,
         &mut member_calls,
+        0,
     );
 
     Symbol {
@@ -150,7 +162,11 @@ fn collect_references(
     calls: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
@@ -161,16 +177,16 @@ fn collect_references(
                 let func_name = text.rsplit('.').next().unwrap_or(text).trim();
                 if !func_name.is_empty() {
                     *counts.entry(func_name.to_string()).or_insert(0) += 1;
-                    if !calls.contains(&func_name.to_string()) {
+                    if !calls.iter().any(|c| c == func_name) {
                         calls.push(func_name.to_string());
                     }
-                    if is_member && !member_calls.contains(&func_name.to_string()) {
+                    if is_member && !member_calls.iter().any(|c| c == func_name) {
                         member_calls.push(func_name.to_string());
                     }
                 }
             }
         }
-        collect_references(child, content, calls, counts, member_calls);
+        collect_references(child, content, calls, counts, member_calls, depth + 1);
     }
 }
 

@@ -216,8 +216,18 @@ impl MemoryLedger {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::memory_path(&self.workspace_root);
-        fs::write(&path, &self.raw_content)
-            .with_context(|| format!("write memory file {}", path.display()))?;
+        Self::atomic_write(&path, &self.raw_content)
+    }
+
+    pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        fs::write(&tmp_path, content)
+            .with_context(|| format!("write temporary memory file {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("atomic rename memory file {}", path.display()))?;
         Ok(())
     }
 

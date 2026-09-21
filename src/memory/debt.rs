@@ -350,7 +350,7 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
 
     let raw = fs::read_to_string(MemoryLedger::memory_path(root))?;
     let updated_raw = replace_debt_section(&raw, &combined_lines);
-    fs::write(MemoryLedger::memory_path(root), updated_raw)?;
+    MemoryLedger::atomic_write(&MemoryLedger::memory_path(root), &updated_raw)?;
 
     let in_code_count = valid_markers.len();
     let manual_count = manual_items.len();

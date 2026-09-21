@@ -13,7 +13,7 @@ pub fn parse_python(file: &str, content: &str) -> Result<Vec<Symbol>> {
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
-    walk_python_node(root, content, file, None, &mut symbols);
+    walk_python_node(root, content, file, None, &mut symbols, None, 0);
     let external_imports = collect_file_external_imports(root, content);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
@@ -22,13 +22,20 @@ pub fn parse_python(file: &str, content: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
+const MAX_AST_DEPTH: usize = 256;
+
 fn walk_python_node(
     node: Node,
     content: &str,
     file: &str,
     parent_class: Option<&str>,
     symbols: &mut Vec<Symbol>,
+    outer_node: Option<Node>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     match kind {
         "function_definition" | "async_function_definition" => {
@@ -45,21 +52,36 @@ fn walk_python_node(
                     SymbolKind::Function
                 };
 
-                let symbol = create_symbol(node, content, file, full_name, sym_kind);
+                let symbol_node = outer_node.unwrap_or(node);
+                let symbol = create_symbol(symbol_node, content, file, full_name, sym_kind);
                 symbols.push(symbol);
             }
         }
         "class_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                let symbol =
-                    create_symbol(node, content, file, name.to_string(), SymbolKind::Class);
+                let symbol_node = outer_node.unwrap_or(node);
+                let symbol = create_symbol(
+                    symbol_node,
+                    content,
+                    file,
+                    name.to_string(),
+                    SymbolKind::Class,
+                );
                 symbols.push(symbol);
 
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut cursor = body.walk();
                     for child in body.children(&mut cursor) {
-                        walk_python_node(child, content, file, Some(name), symbols);
+                        walk_python_node(
+                            child,
+                            content,
+                            file,
+                            Some(name),
+                            symbols,
+                            None,
+                            depth + 1,
+                        );
                     }
                 }
                 return;
@@ -67,7 +89,15 @@ fn walk_python_node(
         }
         "decorated_definition" => {
             if let Some(def_node) = node.child_by_field_name("definition") {
-                walk_python_node(def_node, content, file, parent_class, symbols);
+                walk_python_node(
+                    def_node,
+                    content,
+                    file,
+                    parent_class,
+                    symbols,
+                    Some(node),
+                    depth + 1,
+                );
                 return;
             }
         }
@@ -95,7 +125,7 @@ fn walk_python_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_python_node(child, content, file, parent_class, symbols);
+        walk_python_node(child, content, file, parent_class, symbols, None, depth + 1);
     }
 }
 
@@ -115,6 +145,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         &mut calls,
         &mut call_counts,
         &mut member_calls,
+        0,
     );
 
     Symbol {
@@ -140,7 +171,11 @@ fn collect_references(
     calls: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call" {
@@ -152,26 +187,52 @@ fn collect_references(
                 let func_name = text.rsplit('.').next().unwrap_or(text).trim();
                 if !func_name.is_empty() {
                     *counts.entry(func_name.to_string()).or_insert(0) += 1;
-                    if !calls.contains(&func_name.to_string()) {
+                    if !calls.iter().any(|c| c == func_name) {
                         calls.push(func_name.to_string());
                     }
-                    if is_member && !member_calls.contains(&func_name.to_string()) {
+                    if is_member && !member_calls.iter().any(|c| c == func_name) {
                         member_calls.push(func_name.to_string());
                     }
                 }
             }
         }
-        collect_references(child, content, calls, counts, member_calls);
+        collect_references(child, content, calls, counts, member_calls, depth + 1);
     }
 }
 
 fn extract_signature(body: &str) -> String {
     let first_line = body.lines().next().unwrap_or("").trim();
-    if let Some(idx) = body.find(':') {
-        let sig = body[..idx].trim().replace('\n', " ");
-        if !sig.is_empty() {
-            return sig;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut in_quote: Option<char> = None;
+    let mut prev_char = ' ';
+
+    for (idx, ch) in body.char_indices() {
+        if let Some(q) = in_quote {
+            if ch == q && prev_char != '\\' {
+                in_quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => in_quote = Some(ch),
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                '{' => brace_depth += 1,
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                ':' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    let sig = body[..idx].trim().replace('\n', " ");
+                    if !sig.is_empty() {
+                        return sig;
+                    }
+                    break;
+                }
+                _ => {}
+            }
         }
+        prev_char = ch;
     }
     first_line.to_string()
 }

@@ -77,8 +77,23 @@ pub fn compute_weighted_pagerank(
         })
         .collect();
 
-    let callers_of: Vec<&[usize]> = (0..n)
-        .map(|v| callers_map.get(&v).map_or(&[][..], |c| c.as_slice()))
+    // Precompute normalized transition probabilities P(u -> v) = edge_w(u, v) / out_weight[u]
+    // for each caller u of v. Avoids repeated HashMap lookups and divisions in the power iteration loop.
+    let normalized_callers: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|v| {
+            let callers = callers_map.get(&v).map_or(&[][..], |c| c.as_slice());
+            callers
+                .iter()
+                .filter_map(|&u| {
+                    let total = out_weight[u];
+                    if total > 0.0 {
+                        Some((u, edge_w(u, v) / total))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
         .collect();
 
     // Which nodes are dangling never changes; only their scores do.
@@ -93,11 +108,8 @@ pub fn compute_weighted_pagerank(
 
         for v in 0..n {
             let mut in_sum = 0.0;
-            for &u in callers_of[v] {
-                let total = out_weight[u];
-                if total > 0.0 {
-                    in_sum += scores[u] * edge_w(u, v) / total;
-                }
+            for &(u, trans_prob) in &normalized_callers[v] {
+                in_sum += scores[u] * trans_prob;
             }
 
             next_scores[v] = (1.0 - damping) * personalization[v]

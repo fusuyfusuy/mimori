@@ -13,7 +13,7 @@ pub fn parse_rust(file: &str, content: &str) -> Result<Vec<Symbol>> {
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
-    walk_rust_node(root, content, file, None, &mut symbols);
+    walk_rust_node(root, content, file, None, &mut symbols, 0);
     let external_imports = collect_file_external_imports(root, content);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
@@ -22,13 +22,19 @@ pub fn parse_rust(file: &str, content: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
+const MAX_AST_DEPTH: usize = 256;
+
 fn walk_rust_node(
     node: Node,
     content: &str,
     file: &str,
     parent_type: Option<&str>,
     symbols: &mut Vec<Symbol>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     match kind {
         "function_item" => {
@@ -71,11 +77,10 @@ fn walk_rust_node(
                     create_symbol(node, content, file, name.to_string(), SymbolKind::Trait);
                 symbols.push(symbol);
 
-                if let Some(body) = node.child_by_field_name("body") {
-                    let mut cursor = body.walk();
-                    for child in body.children(&mut cursor) {
-                        walk_rust_node(child, content, file, Some(name), symbols);
-                    }
+                // Recurse into trait items
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    walk_rust_node(child, content, file, Some(name), symbols, depth + 1);
                 }
                 return;
             }
@@ -88,7 +93,7 @@ fn walk_rust_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.children(&mut cursor) {
-                    walk_rust_node(child, content, file, type_name, symbols);
+                    walk_rust_node(child, content, file, type_name, symbols, depth + 1);
                 }
                 return;
             }
@@ -117,7 +122,7 @@ fn walk_rust_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_rust_node(child, content, file, parent_type, symbols);
+        walk_rust_node(child, content, file, parent_type, symbols, depth + 1);
     }
 }
 
@@ -138,6 +143,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         &mut mentions,
         &mut call_counts,
         &mut member_calls,
+        0,
     );
 
     Symbol {
@@ -164,7 +170,11 @@ fn collect_references(
     mentions: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     fn push_call(
         calls: &mut Vec<String>,
         counts: &mut std::collections::HashMap<String, u32>,
@@ -177,10 +187,10 @@ fn collect_references(
             return;
         }
         *counts.entry(name.to_string()).or_insert(0) += 1;
-        if !calls.contains(&name.to_string()) {
+        if !calls.iter().any(|c| c == name) {
             calls.push(name.to_string());
         }
-        if is_member && !member_calls.contains(&name.to_string()) {
+        if is_member && !member_calls.iter().any(|c| c == name) {
             member_calls.push(name.to_string());
         }
     }
@@ -215,11 +225,19 @@ fn collect_references(
             }
         } else if child.kind() == "type_identifier" {
             let tname = node_text(child, content).trim();
-            if !tname.is_empty() && !mentions.contains(&tname.to_string()) {
+            if !tname.is_empty() && !mentions.iter().any(|m| m == tname) {
                 mentions.push(tname.to_string());
             }
         }
-        collect_references(child, content, calls, mentions, counts, member_calls);
+        collect_references(
+            child,
+            content,
+            calls,
+            mentions,
+            counts,
+            member_calls,
+            depth + 1,
+        );
     }
 }
 

@@ -64,24 +64,30 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     drop(_p);
     let _p = crate::Phase::start("db write");
     let mut unparsed = Vec::new();
+    let mut batch_updates = Vec::with_capacity(parsed.len());
 
-    for (rel, mtime, hash, symbols) in parsed {
+    for (rel, mtime, hash, symbols) in &parsed {
         // A file that fails to parse is still recorded, with zero symbols. Not
         // recording it left `needs_reparse` true forever, so every subsequent
         // command re-read and re-parsed it, invisibly.
-        let syms = symbols.unwrap_or_else(|| {
-            unparsed.push(rel.clone());
-            Vec::new()
-        });
-        db.save_file_and_symbols(&rel, mtime, &hash, &syms)?;
+        let syms: &[crate::model::Symbol] = match symbols {
+            Some(syms) => syms.as_slice(),
+            None => {
+                unparsed.push(rel.clone());
+                &[]
+            }
+        };
+        batch_updates.push((rel.as_str(), *mtime, hash.as_str(), syms));
     }
 
-    for (db_path_str, (file_id, _, _)) in db_files {
-        if !disk_paths.contains(&db_path_str) {
-            db.delete_file_by_id(file_id)?;
+    let mut deleted_file_ids = Vec::new();
+    for (db_path_str, (file_id, _, _)) in &db_files {
+        if !disk_paths.contains(db_path_str) {
+            deleted_file_ids.push(*file_id);
         }
     }
 
+    db.save_batch(&batch_updates, &deleted_file_ids)?;
     drop(_p);
     if !unparsed.is_empty() {
         eprintln!(

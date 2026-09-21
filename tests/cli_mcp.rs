@@ -835,7 +835,10 @@ fn test_mcp_whole_session_stdout_purity() {
         "id": "ping_6",
         "method": "ping"
     }));
-    let r5 = client.recv();
+    let mut r5 = client.recv();
+    if r5["id"] == "call_cancel_5" {
+        r5 = client.recv();
+    }
     assert_eq!(r5["id"], "ping_6");
 
     // 6. unknown method

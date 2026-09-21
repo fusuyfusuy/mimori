@@ -146,7 +146,7 @@ impl AliasSet {
         let mut visited_configs = HashSet::new();
         for config in &configs {
             let mut paths = Vec::new();
-            collect_paths(config, &packages, &mut visited_configs, &mut paths);
+            collect_paths(root, config, &packages, &mut visited_configs, &mut paths);
             for (key, replacements) in paths {
                 if let Some(pattern) = pattern_for(&key, &replacements) {
                     if !set.patterns.contains(&pattern) {
@@ -265,6 +265,14 @@ fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             }
         }
     }
+    let canon_root = root.canonicalize().ok();
+    package_dirs.retain(|d| {
+        if let (Some(cr), Ok(cd)) = (&canon_root, d.canonicalize()) {
+            cd.starts_with(cr)
+        } else {
+            d.starts_with(root)
+        }
+    });
     package_dirs.sort();
     package_dirs.dedup();
     package_dirs
@@ -331,15 +339,28 @@ fn pattern_for(key: &str, replacements: &[String]) -> Option<AliasPattern> {
 }
 
 fn collect_paths(
+    root: &Path,
     config: &Path,
     packages: &[(String, PathBuf)],
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
     // Symlinked configs and `a extends b extends a` cycles both land here.
-    if !visited.insert(config.to_path_buf()) {
+    // Canonicalize or normalize to prevent infinite expansion on relative cycles (`a/../b/../a`).
+    let normalized = config
+        .canonicalize()
+        .unwrap_or_else(|_| config.to_path_buf());
+    if !visited.insert(normalized.clone()) {
         return;
     }
+
+    // Enforce workspace confinement: do not follow configs escaping the workspace root.
+    if let Ok(canon_root) = root.canonicalize() {
+        if !normalized.starts_with(&canon_root) {
+            return;
+        }
+    }
+
     let Ok(raw) = std::fs::read_to_string(config) else {
         return;
     };
@@ -352,10 +373,10 @@ fn collect_paths(
     };
 
     match json.get("extends") {
-        Some(Value::String(parent)) => follow_extends(config, parent, packages, visited, out),
+        Some(Value::String(parent)) => follow_extends(root, config, parent, packages, visited, out),
         Some(Value::Array(parents)) => {
             for parent in parents.iter().filter_map(Value::as_str) {
-                follow_extends(config, parent, packages, visited, out);
+                follow_extends(root, config, parent, packages, visited, out);
             }
         }
         _ => {}
@@ -365,7 +386,7 @@ fn collect_paths(
         for r in refs {
             let ref_path = r.as_str().or_else(|| r.get("path").and_then(Value::as_str));
             if let Some(target_spec) = ref_path {
-                follow_reference(config, target_spec, packages, visited, out);
+                follow_reference(root, config, target_spec, packages, visited, out);
             }
         }
     }
@@ -399,6 +420,7 @@ fn collect_paths(
 }
 
 fn follow_extends(
+    root: &Path,
     config: &Path,
     parent: &str,
     packages: &[(String, PathBuf)],
@@ -427,10 +449,11 @@ fn follow_extends(
         }
         target
     };
-    collect_paths(&target, packages, visited, out);
+    collect_paths(root, &target, packages, visited, out);
 }
 
 fn follow_reference(
+    root: &Path,
     config: &Path,
     target_spec: &str,
     packages: &[(String, PathBuf)],
@@ -462,7 +485,7 @@ fn follow_reference(
         candidate.join("tsconfig.json")
     };
 
-    collect_paths(&target, packages, visited, out);
+    collect_paths(root, &target, packages, visited, out);
 }
 
 fn collect_base_url_aliases(config: &Path, base_url: &str, out: &mut Vec<(String, Vec<String>)>) {

@@ -65,7 +65,11 @@ pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
                     if req.method == "notifications/cancelled" {
                         if let Some(params) = &req.params {
                             if let Some(req_id) = params.get("requestId") {
-                                cancelled_ids_reader.lock().unwrap().insert(req_id.clone());
+                                let mut set = cancelled_ids_reader.lock().unwrap();
+                                if set.len() >= 256 {
+                                    set.clear();
+                                }
+                                set.insert(req_id.clone());
                             }
                         }
                         continue;

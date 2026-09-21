@@ -48,7 +48,18 @@ impl Coordinate {
 
         // Split on the first ':' only when what precedes it looks like a path.
         // Otherwise the whole string is a name, which keeps `Store::save` intact.
-        if let Some(idx) = raw.find(':') {
+        // On Windows, absolute paths start with a drive letter (`C:\...` or `C:/...`).
+        let split_idx = if raw.len() >= 3
+            && raw.as_bytes()[0].is_ascii_alphabetic()
+            && raw.as_bytes()[1] == b':'
+            && (raw.as_bytes()[2] == b'\\' || raw.as_bytes()[2] == b'/')
+        {
+            raw[2..].find(':').map(|i| i + 2)
+        } else {
+            raw.find(':')
+        };
+
+        if let Some(idx) = split_idx {
             let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
             if looks_like_path(head) {
                 if tail.is_empty() {

@@ -1,3 +1,4 @@
+use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::ffi::OsStr;
@@ -237,6 +238,50 @@ pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     }
 
     target_dir.to_path_buf()
+}
+
+pub fn is_system_directory(path: &Path) -> bool {
+    let system_prefixes = [
+        "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/sys", "/proc", "/dev",
+        "/boot", "/root",
+    ];
+    if path == Path::new("/") {
+        return true;
+    }
+    for prefix in system_prefixes {
+        if path.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
+    let canon_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("Invalid workspace root '{}'", workspace_root.display()))?;
+
+    let target = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace_root.join(candidate)
+    };
+
+    let canon_candidate = match target.canonicalize() {
+        Ok(c) => c,
+        Err(e) => {
+            if target.is_absolute() && !target.starts_with(&canon_root) {
+                bail!("Path escapes workspace: {}", candidate.display());
+            }
+            bail!("Cannot resolve path '{}': {}", candidate.display(), e);
+        }
+    };
+
+    if canon_candidate.starts_with(&canon_root) {
+        Ok(canon_candidate)
+    } else {
+        bail!("Path escapes workspace: {}", candidate.display());
+    }
 }
 
 #[cfg(test)]

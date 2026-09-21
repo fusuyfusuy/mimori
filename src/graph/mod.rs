@@ -207,6 +207,7 @@ impl SymbolGraph {
                     same_file.push(callable[i].1);
                     i += 1;
                 }
+                let has_self = same_file.contains(&u_idx);
                 same_file.retain(|&v| v != u_idx);
                 if same_file.len() == 1 {
                     add_weighted_edge(
@@ -221,6 +222,10 @@ impl SymbolGraph {
                     continue;
                 } else if same_file.len() > 1 {
                     stats.ambiguous_dropped += 1;
+                    continue;
+                } else if has_self {
+                    // Self-recursive call: resolved locally, do not fall through to foreign symbols.
+                    stats.resolved += 1;
                     continue;
                 }
                 // Member-call receiver rule: `X.foo()` without a resolvable

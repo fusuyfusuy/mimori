@@ -23,7 +23,7 @@ pub fn parse_typescript(
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
-    walk_ts_node(root, content, file, None, &mut symbols);
+    walk_ts_node(root, content, file, None, &mut symbols, 0);
     // File-level facts stamp every symbol identically; threading them
     // through the walker would churn a dozen call sites for no gain.
     let external_imports = collect_external_imports(root, content, aliases);
@@ -34,13 +34,19 @@ pub fn parse_typescript(
     Ok(symbols)
 }
 
+const MAX_AST_DEPTH: usize = 256;
+
 fn walk_ts_node(
     node: Node,
     content: &str,
     file: &str,
     parent_class: Option<&str>,
     symbols: &mut Vec<Symbol>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     match kind {
         "function_declaration" => {
@@ -61,7 +67,7 @@ fn walk_ts_node(
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut cursor = body.walk();
                     for child in body.children(&mut cursor) {
-                        walk_ts_node(child, content, file, Some(name), symbols);
+                        walk_ts_node(child, content, file, Some(name), symbols, depth + 1);
                     }
                 }
                 return;
@@ -172,7 +178,7 @@ fn walk_ts_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_ts_node(child, content, file, parent_class, symbols);
+        walk_ts_node(child, content, file, parent_class, symbols, depth + 1);
     }
 }
 
@@ -235,6 +241,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         &mut mentions,
         &mut call_counts,
         &mut member_calls,
+        0,
     );
 
     Symbol {
@@ -261,7 +268,11 @@ fn collect_references(
     mentions: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
+    depth: usize,
 ) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
@@ -275,7 +286,7 @@ fn collect_references(
             }
             // Call args are value mentions, not call edges.
             if let Some(args_node) = child.child_by_field_name("arguments") {
-                collect_value_mentions(args_node, content, mentions);
+                collect_value_mentions(args_node, content, mentions, depth + 1);
             }
         } else if child.kind() == "new_expression" {
             // `new ExecError(...)` is a caller edge to the class and ctor.
@@ -302,12 +313,20 @@ fn collect_references(
             }
         } else if child.kind() == "template_substitution" {
             // Template interpolation identifiers are mentions, not calls.
-            collect_value_mentions(child, content, mentions);
+            collect_value_mentions(child, content, mentions, depth + 1);
         } else if child.kind() == "type_identifier" {
             let tname = node_text(child, content).trim();
             push_mention(mentions, tname);
         }
-        collect_references(child, content, calls, mentions, counts, member_calls);
+        collect_references(
+            child,
+            content,
+            calls,
+            mentions,
+            counts,
+            member_calls,
+            depth + 1,
+        );
     }
 }
 
@@ -323,10 +342,10 @@ fn push_call(
         return;
     }
     *counts.entry(name.to_string()).or_insert(0) += 1;
-    if !calls.contains(&name.to_string()) {
+    if !calls.iter().any(|c| c == name) {
         calls.push(name.to_string());
     }
-    if is_member && !member_calls.contains(&name.to_string()) {
+    if is_member && !member_calls.iter().any(|c| c == name) {
         member_calls.push(name.to_string());
     }
 }
@@ -336,7 +355,7 @@ fn push_mention(mentions: &mut Vec<String>, name: &str) {
     if name.is_empty() || name == "this" || name == "super" {
         return;
     }
-    if !mentions.contains(&name.to_string()) {
+    if !mentions.iter().any(|m| m == name) {
         mentions.push(name.to_string());
     }
 }
@@ -346,7 +365,10 @@ fn push_mention(mentions: &mut Vec<String>, name: &str) {
 /// bare `identifier` names and `member_expression` properties, so
 /// `execAsync(commandWithLog)` records `commandWithLog` and
 /// `f(error.command)` records `command`.
-fn collect_value_mentions(node: Node, content: &str, mentions: &mut Vec<String>) {
+fn collect_value_mentions(node: Node, content: &str, mentions: &mut Vec<String>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     if kind == "identifier" {
         push_mention(mentions, node_text(node, content).trim());
@@ -357,7 +379,7 @@ fn collect_value_mentions(node: Node, content: &str, mentions: &mut Vec<String>)
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_value_mentions(child, content, mentions);
+        collect_value_mentions(child, content, mentions, depth + 1);
     }
 }
 

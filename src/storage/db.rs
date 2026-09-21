@@ -29,6 +29,7 @@ impl Database {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
 
              CREATE TABLE IF NOT EXISTS files (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +154,70 @@ impl Database {
         Ok(map)
     }
 
+    pub fn save_batch(
+        &mut self,
+        updates: &[(&str, i64, &str, &[Symbol])],
+        deleted_file_ids: &[i64],
+    ) -> Result<()> {
+        if updates.is_empty() && deleted_file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+
+        for &file_id in deleted_file_ids {
+            tx.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
+        }
+
+        {
+            let mut del_stmt = tx.prepare_cached("DELETE FROM files WHERE path = ?")?;
+            let mut ins_file_stmt =
+                tx.prepare_cached("INSERT INTO files (path, mtime, hash) VALUES (?, ?, ?)")?;
+            let mut ins_sym_stmt = tx.prepare_cached(
+                "INSERT INTO symbols (file_id, name, kind, start_line, end_line, signature, body, centrality, references_json, mentions_json, call_counts_json, member_calls_json, external_imports_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+
+            for &(file_path, mtime, hash, symbols) in updates {
+                del_stmt.execute(params![file_path])?;
+                ins_file_stmt.execute(params![file_path, mtime, hash])?;
+                let file_id = tx.last_insert_rowid();
+
+                for s in symbols {
+                    // references_json stores calls (column name kept for schema stability).
+                    let calls_json =
+                        serde_json::to_string(&s.calls).unwrap_or_else(|_| "[]".to_string());
+                    let mentions_json =
+                        serde_json::to_string(&s.mentions).unwrap_or_else(|_| "[]".to_string());
+                    let counts_json =
+                        serde_json::to_string(&s.call_counts).unwrap_or_else(|_| "{}".to_string());
+                    let member_json =
+                        serde_json::to_string(&s.member_calls).unwrap_or_else(|_| "[]".to_string());
+                    let imports_json = serde_json::to_string(&s.external_imports)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    ins_sym_stmt.execute(params![
+                        file_id,
+                        s.name,
+                        s.kind.as_str(),
+                        s.start_line as i64,
+                        s.end_line as i64,
+                        s.signature,
+                        s.body,
+                        s.centrality,
+                        calls_json,
+                        mentions_json,
+                        counts_json,
+                        member_json,
+                        imports_json
+                    ])?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn save_file_and_symbols(
         &mut self,
         file_path: &str,
@@ -160,55 +225,7 @@ impl Database {
         hash: &str,
         symbols: &[Symbol],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
-
-        // Delete existing file entry if present
-        tx.execute("DELETE FROM files WHERE path = ?", params![file_path])?;
-
-        tx.execute(
-            "INSERT INTO files (path, mtime, hash) VALUES (?, ?, ?)",
-            params![file_path, mtime, hash],
-        )?;
-        let file_id = tx.last_insert_rowid();
-
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO symbols (file_id, name, kind, start_line, end_line, signature, body, centrality, references_json, mentions_json, call_counts_json, member_calls_json, external_imports_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-
-            for s in symbols {
-                // references_json stores calls (column name kept for schema stability).
-                let calls_json =
-                    serde_json::to_string(&s.calls).unwrap_or_else(|_| "[]".to_string());
-                let mentions_json =
-                    serde_json::to_string(&s.mentions).unwrap_or_else(|_| "[]".to_string());
-                let counts_json =
-                    serde_json::to_string(&s.call_counts).unwrap_or_else(|_| "{}".to_string());
-                let member_json =
-                    serde_json::to_string(&s.member_calls).unwrap_or_else(|_| "[]".to_string());
-                let imports_json =
-                    serde_json::to_string(&s.external_imports).unwrap_or_else(|_| "[]".to_string());
-                stmt.execute(params![
-                    file_id,
-                    s.name,
-                    s.kind.as_str(),
-                    s.start_line as i64,
-                    s.end_line as i64,
-                    s.signature,
-                    s.body,
-                    s.centrality,
-                    calls_json,
-                    mentions_json,
-                    counts_json,
-                    member_json,
-                    imports_json
-                ])?;
-            }
-        }
-
-        tx.commit()?;
-        Ok(())
+        self.save_batch(&[(file_path, mtime, hash, symbols)], &[])
     }
 
     pub fn delete_file_by_id(&self, file_id: i64) -> Result<()> {

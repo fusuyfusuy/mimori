@@ -9,6 +9,8 @@ use std::path::Path;
 pub struct DumpResult {
     pub budget: usize,
     pub estimated_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epics: Option<String>,
     pub vocab_gotchas: Option<String>,
     pub active_debt: Vec<String>,
     pub debt_count: usize,
@@ -26,10 +28,14 @@ pub fn generate_dump(
     // 1. Read memory ledger if exists
     let ledger = MemoryLedger::load(workspace_root).ok();
 
+    let mut epics = None;
     let mut vocab_gotchas = None;
     let mut active_debt = Vec::new();
 
     if let Some(l) = &ledger {
+        if !l.epics.trim().is_empty() {
+            epics = Some(l.epics.trim().to_string());
+        }
         if !l.vocab_gotchas.trim().is_empty() {
             vocab_gotchas = Some(l.vocab_gotchas.trim().to_string());
         }
@@ -40,8 +46,14 @@ pub fn generate_dump(
 
     let debt_count = active_debt.len();
 
-    // Estimate chars for vocab and debt
+    // Estimate chars for epics, vocab and debt
     let mut vocab_debt_md = String::new();
+
+    if let Some(ep) = &epics {
+        vocab_debt_md.push_str("## ACTIVE EPICS & SCALE\n");
+        vocab_debt_md.push_str(ep);
+        vocab_debt_md.push_str("\n\n");
+    }
 
     if let Some(vg) = &vocab_gotchas {
         vocab_debt_md.push_str("## DOMAIN VOCABULARY & GOTCHAS\n");
@@ -110,6 +122,7 @@ pub fn generate_dump(
     Ok(DumpResult {
         budget,
         estimated_tokens,
+        epics,
         vocab_gotchas,
         active_debt,
         debt_count,

@@ -429,7 +429,7 @@ pub fn call_tool(
             let args: SliceToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_slice': {}", e))
             })?;
-            let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let coord = Coordinate::parse(&args.coordinate).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid coordinate '{}': {}", args.coordinate, e))
             })?;
@@ -441,9 +441,9 @@ pub fn call_tool(
                 let full = if file.is_absolute() {
                     file.clone()
                 } else {
-                    session.root.join(file)
+                    scope_dir.join(file)
                 };
-                let confined = confine(&session.root, &full)?;
+                let confined = confine(&scope_dir, &full)?;
                 let slice = slice_line_coordinate(&confined, *start, *end, with_imports)
                     .map_err(|e| ToolError::Execution(e.to_string()))?;
                 if let Some(b) = args.budget {
@@ -453,9 +453,9 @@ pub fn call_tool(
                 }
             } else {
                 let graph = cache
-                    .get_graph(&session.root)
+                    .get_graph(&scope_dir)
                     .map_err(|e| ToolError::Execution(e.to_string()))?;
-                let norm_coord = coord.normalize_against(&session.root);
+                let norm_coord = coord.normalize_against(&scope_dir);
                 let slice = graph
                     .build_slice(&norm_coord, follow_local, with_imports)
                     .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -470,9 +470,9 @@ pub fn call_tool(
             let args: MapToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_map': {}", e))
             })?;
-            let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let base_graph = cache
-                .get_graph(&session.root)
+                .get_graph(&scope_dir)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             let mut graph = (*base_graph).clone();
 
@@ -480,7 +480,7 @@ pub fn call_tool(
                 &mut graph,
                 args.focus.as_deref(),
                 args.seed.as_deref(),
-                &session.root,
+                &scope_dir,
             )
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
@@ -508,13 +508,13 @@ pub fn call_tool(
             let args: BlastToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_blast': {}", e))
             })?;
-            let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let graph = cache
-                .get_graph(&session.root)
+                .get_graph(&scope_dir)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             let coord = Coordinate::parse(&args.target)
                 .map_err(|e| ToolError::InvalidParams(e.to_string()))?
-                .normalize_against(&session.root);
+                .normalize_against(&scope_dir);
 
             let depth = args.depth.unwrap_or(3);
             let down = args.down.unwrap_or(false);
@@ -531,7 +531,7 @@ pub fn call_tool(
             let sink_hits = if sinks.is_empty() {
                 Vec::new()
             } else {
-                sweep_literal_sinks(&session.root, &graph, &sinks)
+                sweep_literal_sinks(&scope_dir, &graph, &sinks)
             };
 
             let mut md = blast_res.to_markdown();
@@ -555,13 +555,13 @@ pub fn call_tool(
             let args: GraphToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_graph': {}", e))
             })?;
-            let _scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let graph = cache
-                .get_graph(&session.root)
+                .get_graph(&scope_dir)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             let coord = Coordinate::parse(&args.target)
                 .map_err(|e| ToolError::InvalidParams(e.to_string()))?
-                .normalize_against(&session.root);
+                .normalize_against(&scope_dir);
 
             match args.direction.as_str() {
                 "up" => {
