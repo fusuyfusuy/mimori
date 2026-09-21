@@ -8,3 +8,6 @@ By exposing `mimori` as an MCP server with core tools (`mimori_slice`, `mimori_m
 
 ## Addendum (2026-09-14, v2.4.0)
 Amended by ADR-0006 to add `mimori_memory` (read, lint, and resolve `.agents/memory.md`) and `mimori_debt` (scan, check, and sync in-code ponytail markers) to the MCP tool registry, giving agents native, non-destructive access to the project memory substrate and debt proof gates.
+
+## Addendum (2026-09-21, v2.4.3)
+Added `mimori_dump` (budget-bounded Turn-0 context snapshot: PageRank map, domain vocabulary and gotchas, active debt) to the registry, and made `numbered` an explicit `mimori_slice` parameter instead of a CLI-only flag. `mimori_map` now treats `scope` as a path filter inside the workspace root resolved from `workspace_dir`; previously `workspace_dir` was also reused as the scope string, which filtered out every symbol.

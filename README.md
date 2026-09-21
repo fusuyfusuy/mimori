@@ -141,8 +141,9 @@ Add to your MCP client configuration:
 }
 ```
 
-Exposes 7 high-leverage tools directly to LLMs with warm in-memory caching:
+Exposes 8 high-leverage tools directly to LLMs with warm in-memory caching:
 - `mimori_slice`: AST slice with signature, body, line numbering (`numbered: true`), and 1-hop callers/callees.
+- `mimori_dump`: Turn-0 packed context snapshot (PageRank map, domain vocabulary, gotchas, active debt) under a token budget (`budget` defaults to 1500).
 - `mimori_map`: Centrality-ranked PageRank codebase outline.
 - `mimori_find`: Fast PageRank-ordered symbol and file search (`limit` defaults to 50).
 - `mimori_blast`: Upstream/downstream impact analysis with literal sink detection.

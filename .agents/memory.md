@@ -17,3 +17,4 @@
 - Centrality: Graph-theoretic score measuring symbol's structural importance based on inbound dependency topology (In-Degree PageRank).
 - Gotcha: `.mimori/` is ephemeral cache (gitignored); `.agents/` is living git-tracked domain memory.
 - Gotcha: Ponytail technical debt comments (`# ponytail: <what> <- <ceiling> -> <upgrade_trigger>`) sync deterministically to `.agents/memory.md` with hard 30-item ceiling.
+- Gotcha: Skill spec lives in two tracked copies (`SKILL.md`, `skills/mimori/SKILL.md`) plus the installed copy under `~/configs/agents-config/skills/mimori/`; editing one silently drifts the others.

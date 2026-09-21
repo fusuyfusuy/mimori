@@ -67,10 +67,6 @@ impl SliceResult {
         self.render_markdown_budgeted(budget_tokens, false)
     }
 
-    pub fn to_markdown_budgeted_numbered(&self, budget_tokens: usize) -> String {
-        self.render_markdown_budgeted(budget_tokens, true)
-    }
-
     pub fn render_markdown_budgeted(&self, budget_tokens: usize, numbered: bool) -> String {
         let header = self.header_markdown();
         let core_body = if numbered {
