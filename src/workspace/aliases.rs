@@ -157,7 +157,10 @@ impl AliasSet {
         }
 
         // Fingerprint all manifests and all visited configs
-        for path in manifests.iter().chain(visited_configs.iter()) {
+        let mut all_paths: Vec<_> = manifests.iter().chain(visited_configs.iter()).collect();
+        all_paths.sort();
+        all_paths.dedup();
+        for path in all_paths {
             let rel = path.strip_prefix(root).unwrap_or(path);
             hash = crate::workspace::walker::fnv1a_hash(rel.to_string_lossy().as_bytes())
                 ^ hash.wrapping_mul(0x100000001b3);
@@ -396,7 +399,7 @@ fn collect_paths(
         .and_then(|c| c.get("baseUrl"))
         .and_then(Value::as_str)
     {
-        collect_base_url_aliases(config, base_url, out);
+        collect_base_url_aliases(root, config, base_url, out);
     }
 
     let Some(paths) = json
@@ -488,10 +491,26 @@ fn follow_reference(
     collect_paths(root, &target, packages, visited, out);
 }
 
-fn collect_base_url_aliases(config: &Path, base_url: &str, out: &mut Vec<(String, Vec<String>)>) {
+fn collect_base_url_aliases(
+    root: &Path,
+    config: &Path,
+    base_url: &str,
+    out: &mut Vec<(String, Vec<String>)>,
+) {
     let config_dir = config.parent().unwrap_or(Path::new(""));
     let base_dir = config_dir.join(base_url);
-    let Ok(entries) = std::fs::read_dir(&base_dir) else {
+
+    let Ok(canon_root) = root.canonicalize() else {
+        return;
+    };
+    let Ok(canon_base_dir) = base_dir.canonicalize() else {
+        return;
+    };
+    if !canon_base_dir.starts_with(&canon_root) {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(&canon_base_dir) else {
         return;
     };
     let is_root_like = base_url == "." || base_url == "./";
@@ -936,5 +955,50 @@ mod tests {
         .unwrap();
         let second = AliasSet::collect(root);
         assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn base_url_strictly_confined_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Create a directory outside the workspace root
+        let outside_dir = dir.path().join("outside_secret");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        // tsconfig attempts to set baseUrl to parent (escaping workspace)
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": "../" } }"#,
+        )
+        .unwrap();
+
+        let set = AliasSet::collect(&root);
+        assert!(!set.matches("outside_secret"));
+        assert!(!set.matches("outside_secret/file"));
+    }
+
+    #[test]
+    fn fingerprint_deterministic_sorting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("b_pkg")).unwrap();
+        std::fs::create_dir_all(root.join("a_pkg")).unwrap();
+        std::fs::write(
+            root.join("b_pkg/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@b/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a_pkg/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@a/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+
+        let set1 = AliasSet::collect(root);
+        let set2 = AliasSet::collect(root);
+        assert_eq!(set1.fingerprint(), set2.fingerprint());
+        assert!(!set1.fingerprint().is_empty());
     }
 }

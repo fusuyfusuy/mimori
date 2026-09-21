@@ -163,7 +163,19 @@ pub fn parse_ponytail_line(line: &str, file: &str, line_no: usize) -> Option<InC
 
 pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> {
     let scan_root = match scope {
-        Some(s) => root.join(s),
+        Some(s) => {
+            let joined = root.join(s);
+            let Ok(canon_root) = root.canonicalize() else {
+                return Vec::new();
+            };
+            let Ok(canon_joined) = joined.canonicalize() else {
+                return Vec::new();
+            };
+            if !canon_joined.starts_with(&canon_root) {
+                return Vec::new();
+            }
+            joined
+        }
         None => root.to_path_buf(),
     };
     if !scan_root.exists() {

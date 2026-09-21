@@ -288,12 +288,17 @@ impl MemoryLedger {
     }
 
     pub fn resolve(&mut self, pattern: &str) -> Result<usize> {
+        let pattern_trimmed = pattern.trim();
+        if pattern_trimmed.is_empty() {
+            anyhow::bail!("Cannot resolve debt item: pattern must not be empty");
+        }
+
         let lines: Vec<&str> = self.raw_content.lines().collect();
         let mut new_lines = Vec::with_capacity(lines.len());
         let mut in_debt_section = false;
         let mut deleted_count = 0;
 
-        let pattern_lower = pattern.to_lowercase();
+        let pattern_lower = pattern_trimmed.to_lowercase();
 
         for line in lines {
             let trimmed = line.trim();

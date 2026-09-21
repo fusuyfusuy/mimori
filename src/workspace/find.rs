@@ -93,18 +93,35 @@ pub fn execute_find(
 
     if !symbols_only {
         let mut seen_files = HashSet::new();
+        let db_path = root.join(".mimori").join("index.db");
+        let mut files_to_check = Vec::new();
+
+        if db_path.exists() {
+            if let Ok(db) = crate::storage::db::Database::open_or_create(&db_path) {
+                if let Ok(records) = db.get_file_records() {
+                    for path in records.keys() {
+                        files_to_check.push(path.clone());
+                    }
+                }
+            }
+        }
+
         for s in &graph.symbols {
-            if !seen_files.contains(&s.file) {
-                seen_files.insert(s.file.clone());
-                if s.file.to_lowercase().contains(&q_lower) {
+            files_to_check.push(s.file.clone());
+        }
+
+        for path in files_to_check {
+            if !seen_files.contains(&path) {
+                seen_files.insert(path.clone());
+                if path.to_lowercase().contains(&q_lower) {
                     matches.push(FindMatch {
-                        name: Path::new(&s.file)
+                        name: Path::new(&path)
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                         kind: "file".to_string(),
-                        file: s.file.clone(),
-                        coordinate: s.file.clone(),
+                        file: path.clone(),
+                        coordinate: path.clone(),
                         start_line: 1,
                         end_line: 1,
                         signature: String::new(),

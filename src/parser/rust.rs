@@ -22,7 +22,7 @@ pub fn parse_rust(file: &str, content: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
-const MAX_AST_DEPTH: usize = 256;
+const MAX_AST_DEPTH: usize = 512;
 
 fn walk_rust_node(
     node: Node,
@@ -271,11 +271,14 @@ fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
 /// names are external, never resolved locally.
 fn collect_file_external_imports(root: Node, content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    collect_uses(root, content, &mut out);
+    collect_uses(root, content, &mut out, 0);
     out
 }
 
-fn collect_uses(node: Node, content: &str, out: &mut Vec<String>) {
+fn collect_uses(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     if node.kind() == "use_declaration" {
         let mut text = node_text(node, content).trim();
         if let Some(rest) = text.strip_prefix("pub") {
@@ -299,7 +302,7 @@ fn collect_uses(node: Node, content: &str, out: &mut Vec<String>) {
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_uses(c, content, out);
+        collect_uses(c, content, out, depth + 1);
     }
 }
 

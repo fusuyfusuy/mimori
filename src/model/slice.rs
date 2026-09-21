@@ -268,10 +268,13 @@ impl SliceResult {
                 .max(1);
 
             for (i, line) in main.lines().enumerate() {
-                let (lineno, content) = if let Some((num_part, code_part)) = line.split_once(" | ")
-                {
-                    if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
-                        (parsed_num, code_part)
+                let (lineno, content) = if self.symbol.is_none() {
+                    if let Some((num_part, code_part)) = line.split_once(" | ") {
+                        if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
+                            (parsed_num, code_part)
+                        } else {
+                            (start_line + i, line)
+                        }
                     } else {
                         (start_line + i, line)
                     }
@@ -452,5 +455,16 @@ mod tests {
         assert!(md.contains("L42: line a"));
         assert!(md.contains("L43: line b"));
         assert!(md.contains("L44: line c"));
+    }
+
+    #[test]
+    fn numbered_render_preserves_pipe_characters_in_symbol_slice() {
+        let mut s = fixture();
+        s.content = "match x {\n    1 | 2 => true,\n    _ => false,\n}\n".into();
+        let md = s.to_markdown_numbered();
+        assert!(md.contains("L1: match x {"));
+        assert!(md.contains("L2:     1 | 2 => true,"));
+        assert!(md.contains("L3:     _ => false,"));
+        assert!(md.contains("L4: }"));
     }
 }

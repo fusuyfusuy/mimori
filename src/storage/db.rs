@@ -163,7 +163,9 @@ impl Database {
             return Ok(());
         }
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         for &file_id in deleted_file_ids {
             tx.execute("DELETE FROM files WHERE id = ?", params![file_id])?;

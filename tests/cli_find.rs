@@ -157,3 +157,28 @@ fn test_cli_find_limit_flag() {
         .stdout(predicate::str::contains("0 matches of 10 [--limit]"))
         .stdout(predicate::str::contains("No matches found"));
 }
+
+#[test]
+fn test_cli_find_symbol_less_file() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    // A file without any symbols (e.g. empty or only comments)
+    let symbol_less_file = src_dir.join("marker_types.ts");
+    fs::write(
+        &symbol_less_file,
+        "// just comments and type declarations without AST symbols\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path())
+        .arg("find")
+        .arg("marker_types")
+        .arg("-f");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("src/marker_types.ts"));
+}

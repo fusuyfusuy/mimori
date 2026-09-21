@@ -195,7 +195,11 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         }
         // Index-barrel re-exports: anything defined in an index file is public
         // surface by construction.
-        if stem == "index" || stem == "mod" {
+        if stem == "index"
+            || (stem == "mod"
+                && (sym.kind == crate::model::SymbolKind::TypeAlias
+                    || sym.signature.starts_with("pub ")))
+        {
             return true;
         }
         false
@@ -224,12 +228,19 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         .symbols
         .iter()
         .enumerate()
-        .map(|(idx, s)| HubSymbol {
-            name: s.name.clone(),
-            kind: s.kind.as_str().to_string(),
-            coordinate: s.coordinate(),
-            fan_in: graph.callers_map.get(&idx).map_or(0, |v| v.len()),
-            centrality: s.centrality,
+        .filter_map(|(idx, s)| {
+            let fan_in = graph.callers_map.get(&idx).map_or(0, |v| v.len());
+            if fan_in > 0 {
+                Some(HubSymbol {
+                    name: s.name.clone(),
+                    kind: s.kind.as_str().to_string(),
+                    coordinate: s.coordinate(),
+                    fan_in,
+                    centrality: s.centrality,
+                })
+            } else {
+                None
+            }
         })
         .collect();
     hubs.sort_by(|a, b| {

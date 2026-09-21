@@ -295,7 +295,8 @@ fn main() -> ExitCode {
             }
         }
         Commands::Map(args) => {
-            let mut graph = match get_or_sync_graph(&current_dir) {
+            let root = find_workspace_root(None, &current_dir);
+            let mut graph = match get_or_sync_graph(&root) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("Error syncing workspace: {}", e);
@@ -307,7 +308,7 @@ fn main() -> ExitCode {
                 &mut graph,
                 args.focus.as_deref(),
                 args.seed.as_deref(),
-                &current_dir,
+                &root,
             ) {
                 eprintln!("Error: {}", e);
                 return ExitCode::FAILURE;
@@ -407,7 +408,8 @@ fn main() -> ExitCode {
             }
         }
         Commands::Doctor(args) => {
-            let graph = match get_or_sync_graph(&current_dir) {
+            let root = find_workspace_root(None, &current_dir);
+            let graph = match get_or_sync_graph(&root) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("Error syncing workspace: {}", e);
@@ -428,22 +430,26 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Commands::Clean(args) => match clean_cache(&current_dir, args.all) {
-            Ok(_) => {
-                if cli.json {
-                    println!("{}", json!({ "cleaned": true, "all": args.all }));
-                } else {
-                    println!("Cleaned .mimori cache.");
+        Commands::Clean(args) => {
+            let root = find_workspace_root(None, &current_dir);
+            match clean_cache(&root, args.all) {
+                Ok(_) => {
+                    if cli.json {
+                        println!("{}", json!({ "cleaned": true, "all": args.all }));
+                    } else {
+                        println!("Cleaned .mimori cache.");
+                    }
+                    ExitCode::SUCCESS
                 }
-                ExitCode::SUCCESS
+                Err(e) => {
+                    eprintln!("Error cleaning cache: {}", e);
+                    ExitCode::FAILURE
+                }
             }
-            Err(e) => {
-                eprintln!("Error cleaning cache: {}", e);
-                ExitCode::FAILURE
-            }
-        },
+        }
         Commands::Init(args) => {
-            let mimori_dir = current_dir.join(".mimori");
+            let root = find_workspace_root(None, &current_dir);
+            let mimori_dir = root.join(".mimori");
             if let Err(e) = fs::create_dir_all(&mimori_dir) {
                 eprintln!(
                     "INIT_FAIL: create dir {}: {}; exit 1.",
@@ -453,7 +459,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let gitignore_path = current_dir.join(".gitignore");
+            let gitignore_path = root.join(".gitignore");
             let gitignore_status = if gitignore_path.exists() {
                 let content = fs::read_to_string(&gitignore_path).unwrap_or_default();
                 if content
@@ -475,8 +481,10 @@ fn main() -> ExitCode {
                 "created"
             };
 
-            let (mem_created, dec_created) = match MemoryLedger::scaffold(&current_dir, args.force)
-            {
+            let (mem_created, dec_created) = match MemoryLedger::scaffold(
+                &find_workspace_root(None, &current_dir),
+                args.force,
+            ) {
                 Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("INIT_FAIL: scaffold .agents: {}; exit 1.", e);
@@ -510,7 +518,7 @@ fn main() -> ExitCode {
         }
         Commands::Memory(args) => match args.command {
             Some(MemoryCommand::Lint) | Some(MemoryCommand::Check) => {
-                let ledger = match MemoryLedger::load(&current_dir) {
+                let ledger = match MemoryLedger::load(&find_workspace_root(None, &current_dir)) {
                     Ok(l) => l,
                     Err(e) => {
                         eprintln!("MEM_LINT_FAIL: load .agents/memory.md: {}; exit 1.", e);
@@ -536,7 +544,8 @@ fn main() -> ExitCode {
                 }
             }
             Some(MemoryCommand::Resolve(res_args)) => {
-                let mut ledger = match MemoryLedger::load(&current_dir) {
+                let mut ledger = match MemoryLedger::load(&find_workspace_root(None, &current_dir))
+                {
                     Ok(l) => l,
                     Err(e) => {
                         eprintln!("MEM_RESOLVE_FAIL: load .agents/memory.md: {}; exit 1.", e);
@@ -570,7 +579,7 @@ fn main() -> ExitCode {
                 }
             }
             Some(MemoryCommand::Show(show_args)) => {
-                let ledger = match MemoryLedger::load(&current_dir) {
+                let ledger = match MemoryLedger::load(&find_workspace_root(None, &current_dir)) {
                     Ok(l) => l,
                     Err(e) => {
                         eprintln!("MEM_SHOW_FAIL: load .agents/memory.md: {}; exit 1.", e);
@@ -614,7 +623,7 @@ fn main() -> ExitCode {
                 }
             }
             None => {
-                let ledger = match MemoryLedger::load(&current_dir) {
+                let ledger = match MemoryLedger::load(&find_workspace_root(None, &current_dir)) {
                     Ok(l) => l,
                     Err(e) => {
                         eprintln!("MEM_SHOW_FAIL: load .agents/memory.md: {}; exit 1.", e);
@@ -658,7 +667,7 @@ fn main() -> ExitCode {
         },
         Commands::Debt(args) => match args.command {
             Some(DebtCommand::Check) => {
-                let (passed, output) = check_debt(&current_dir);
+                let (passed, output) = check_debt(&find_workspace_root(None, &current_dir));
                 if cli.json {
                     println!("{}", json!({ "passed": passed, "output": output }));
                 } else {
@@ -670,7 +679,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
-            Some(DebtCommand::Sync) => match sync_debt(&current_dir) {
+            Some(DebtCommand::Sync) => match sync_debt(&find_workspace_root(None, &current_dir)) {
                 Ok((in_code, manual, synced, output)) => {
                     if cli.json {
                         println!(
@@ -694,7 +703,7 @@ fn main() -> ExitCode {
             },
             Some(DebtCommand::List(list_args)) => {
                 let scope = list_args.scope.as_deref().or(args.scope.as_deref());
-                let (markers, output) = list_debt(&current_dir, scope);
+                let (markers, output) = list_debt(&find_workspace_root(None, &current_dir), scope);
                 if cli.json {
                     match serde_json::to_string_pretty(&markers) {
                         Ok(j) => println!("{}", j),
@@ -709,7 +718,10 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             None => {
-                let (markers, output) = list_debt(&current_dir, args.scope.as_deref());
+                let (markers, output) = list_debt(
+                    &find_workspace_root(None, &current_dir),
+                    args.scope.as_deref(),
+                );
                 if cli.json {
                     match serde_json::to_string_pretty(&markers) {
                         Ok(j) => println!("{}", j),
@@ -725,7 +737,11 @@ fn main() -> ExitCode {
             }
         },
         Commands::Dump(args) => {
-            match generate_dump(&current_dir, args.budget, args.focus.as_deref()) {
+            match generate_dump(
+                &find_workspace_root(None, &current_dir),
+                args.budget,
+                args.focus.as_deref(),
+            ) {
                 Ok(dump) => {
                     if cli.json {
                         match serde_json::to_string_pretty(&dump) {

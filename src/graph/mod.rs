@@ -208,6 +208,10 @@ impl SymbolGraph {
                     i += 1;
                 }
                 let has_self = same_file.contains(&u_idx);
+                if has_self && symbols[u_idx].name == *ref_name {
+                    stats.resolved += 1;
+                    continue;
+                }
                 same_file.retain(|&v| v != u_idx);
                 if same_file.len() == 1 {
                     add_weighted_edge(
@@ -545,7 +549,11 @@ impl SymbolGraph {
                 for suffix in ["::constructor", "::new"] {
                     let ctor = format!("{}{}", sym.name, suffix);
                     if let Some(more) = self.name_to_indices.get(&ctor) {
-                        extra.extend(more.iter().copied());
+                        extra.extend(
+                            more.iter()
+                                .copied()
+                                .filter(|&e| self.symbols[e].file == sym.file),
+                        );
                     }
                 }
             }
@@ -772,7 +780,12 @@ pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
         if in_multiline_import {
             multiline_buf.push_str(line);
             multiline_buf.push('\n');
-            if trimmed.contains(')') || trimmed.contains('}') || trimmed.ends_with(';') {
+            let expects_paren = multiline_buf.contains('(') || multiline_buf.contains('{');
+            if trimmed.contains(')')
+                || trimmed.contains('}')
+                || trimmed.ends_with(';')
+                || (!expects_paren && !trimmed.ends_with(',') && !trimmed.ends_with('\\'))
+            {
                 in_multiline_import = false;
                 imports.push(multiline_buf.trim_end().to_string());
                 multiline_buf.clear();
@@ -794,8 +807,17 @@ pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
         } else if trimmed.starts_with("import ")
             || trimmed.starts_with("import{")
             || trimmed.starts_with("import type ")
+            || trimmed.starts_with("import (")
+            || trimmed.starts_with("import(")
         {
-            if trimmed.ends_with(';') || trimmed.ends_with('\'') || trimmed.ends_with('"') {
+            if trimmed.ends_with(';')
+                || trimmed.ends_with('\'')
+                || trimmed.ends_with('"')
+                || (!trimmed.contains('{')
+                    && !trimmed.contains('(')
+                    && !trimmed.ends_with(',')
+                    && !trimmed.ends_with('\\'))
+            {
                 imports.push(trimmed.to_string());
             } else {
                 in_multiline_import = true;

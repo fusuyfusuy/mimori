@@ -22,7 +22,7 @@ pub fn parse_python(file: &str, content: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
-const MAX_AST_DEPTH: usize = 256;
+const MAX_AST_DEPTH: usize = 512;
 
 fn walk_python_node(
     node: Node,
@@ -241,11 +241,54 @@ fn extract_signature(body: &str) -> String {
 /// binds `z`; `from .local import y` binds nothing (resolvable locally).
 fn collect_file_external_imports(root: Node, content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    collect_py_imports(root, content, &mut out);
+    collect_py_imports(root, content, &mut out, 0);
     out
 }
 
-fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>) {
+const PYTHON_STDLIB: &[&str] = &[
+    "os",
+    "sys",
+    "math",
+    "json",
+    "re",
+    "typing",
+    "collections",
+    "itertools",
+    "functools",
+    "pathlib",
+    "logging",
+    "asyncio",
+    "datetime",
+    "subprocess",
+    "unittest",
+    "time",
+    "random",
+    "hashlib",
+    "io",
+    "urllib",
+    "http",
+    "abc",
+    "copy",
+    "tempfile",
+    "shutil",
+    "glob",
+    "pickle",
+    "sqlite3",
+    "threading",
+    "multiprocessing",
+    "socket",
+    "dataclasses",
+    "enum",
+    "struct",
+    "inspect",
+    "traceback",
+    "warnings",
+];
+
+fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     if kind == "import_statement" {
         // `import a.b as c` binds `c`, else the top segment `a`.
@@ -254,10 +297,15 @@ fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>) {
         for part in clause.split(',') {
             let part = part.trim();
             if let Some((_, alias)) = part.split_once(" as ") {
-                push_import(out, alias.trim());
+                let top = part.split('.').next().unwrap_or(part).trim();
+                if PYTHON_STDLIB.contains(&top) {
+                    push_import(out, alias.trim());
+                }
             } else {
                 let top = part.split('.').next().unwrap_or(part).trim();
-                push_import(out, top);
+                if PYTHON_STDLIB.contains(&top) {
+                    push_import(out, top);
+                }
             }
         }
         return;
@@ -267,15 +315,18 @@ fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>) {
         let after_from = text.strip_prefix("from").unwrap_or(text).trim();
         if let Some((module, names)) = after_from.split_once(" import ") {
             if !module.trim().starts_with('.') {
-                for part in names.split(',') {
-                    let part = part.trim().trim_matches(['(', ')', ' ']);
-                    if part.is_empty() || part == "*" {
-                        continue;
-                    }
-                    if let Some((_, alias)) = part.split_once(" as ") {
-                        push_import(out, alias.trim());
-                    } else {
-                        push_import(out, part.split('.').next().unwrap_or(part));
+                let top_segment = module.split('.').next().unwrap_or(module).trim();
+                if PYTHON_STDLIB.contains(&top_segment) {
+                    for part in names.split(',') {
+                        let part = part.trim().trim_matches(['(', ')', ' ']);
+                        if part.is_empty() || part == "*" {
+                            continue;
+                        }
+                        if let Some((_, alias)) = part.split_once(" as ") {
+                            push_import(out, alias.trim());
+                        } else {
+                            push_import(out, part.split('.').next().unwrap_or(part));
+                        }
                     }
                 }
             }
@@ -284,7 +335,7 @@ fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>) {
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_py_imports(c, content, out);
+        collect_py_imports(c, content, out, depth + 1);
     }
 }
 

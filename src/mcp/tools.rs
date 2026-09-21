@@ -37,18 +37,24 @@ pub fn confine(session_root: &Path, candidate: &Path) -> Result<PathBuf, ToolErr
         ))
     })?;
 
-    let canon_candidate = match candidate.canonicalize() {
+    let resolved_candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        session_root.join(candidate)
+    };
+
+    let canon_candidate = match resolved_candidate.canonicalize() {
         Ok(c) => c,
         Err(e) => {
-            if candidate.is_absolute() && !candidate.starts_with(&canon_root) {
+            if resolved_candidate.is_absolute() && !resolved_candidate.starts_with(&canon_root) {
                 return Err(ToolError::InvalidParams(format!(
                     "path escapes workspace: {}",
-                    candidate.display()
+                    resolved_candidate.display()
                 )));
             }
             return Err(ToolError::InvalidParams(format!(
                 "Cannot resolve path '{}': {}",
-                candidate.display(),
+                resolved_candidate.display(),
                 e
             )));
         }
@@ -686,6 +692,9 @@ pub fn call_tool(
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_debt': {}", e))
             })?;
             let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            if let Some(s) = &args.scope {
+                confine(&scope_dir, Path::new(s))?;
+            }
 
             match args.action.as_str() {
                 "list" => {

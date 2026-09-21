@@ -34,7 +34,7 @@ pub fn parse_typescript(
     Ok(symbols)
 }
 
-const MAX_AST_DEPTH: usize = 256;
+const MAX_AST_DEPTH: usize = 512;
 
 fn walk_ts_node(
     node: Node,
@@ -492,13 +492,16 @@ fn collect_external_imports(root: Node, content: &str, aliases: &AliasSet) -> Ve
         }
         let mut ccursor = child.walk();
         for item in child.children(&mut ccursor) {
-            collect_import_binding(item, content, &mut out);
+            collect_import_binding(item, content, &mut out, 0);
         }
     }
     out
 }
 
-fn collect_import_binding(node: Node, content: &str, out: &mut Vec<String>) {
+fn collect_import_binding(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     match node.kind() {
         "default_import" | "namespace_import" | "identifier" => {
             push_unique(out, node_text(node, content).trim());
@@ -515,7 +518,7 @@ fn collect_import_binding(node: Node, content: &str, out: &mut Vec<String>) {
         _ => {
             let mut cursor = node.walk();
             for c in node.children(&mut cursor) {
-                collect_import_binding(c, content, out);
+                collect_import_binding(c, content, out, depth + 1);
             }
         }
     }

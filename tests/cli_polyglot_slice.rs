@@ -113,3 +113,72 @@ func (s *Server) Start() error {
         .stdout(predicate::str::contains("func (s *Server) Start() error"))
         .stdout(predicate::str::contains("Server running"));
 }
+
+#[test]
+fn test_cli_go_cross_package_call_disambiguation() {
+    let dir = tempdir().unwrap();
+    let pkg_file = dir.path().join("service.go");
+    fs::write(
+        &pkg_file,
+        r#"package service
+
+func ProcessData(x int) int {
+    return x * 2
+}
+"#,
+    )
+    .unwrap();
+
+    let main_file = dir.path().join("main.go");
+    fs::write(
+        &main_file,
+        r#"package main
+
+import "myproject/service"
+
+func Run() {
+    service.ProcessData(42)
+}
+"#,
+    )
+    .unwrap();
+
+    // Verify ProcessData is resolved as a callee of Run
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path()).arg("slice").arg("Run");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("ProcessData"));
+}
+
+#[test]
+fn test_cli_python_absolute_import_not_external() {
+    let dir = tempdir().unwrap();
+    let models_file = dir.path().join("models.py");
+    fs::write(
+        &models_file,
+        r#"class User:
+    def __init__(self, name):
+        self.name = name
+"#,
+    )
+    .unwrap();
+
+    let app_file = dir.path().join("app.py");
+    fs::write(
+        &app_file,
+        r#"from models import User
+
+def create_user(name: str):
+    return User(name)
+"#,
+    )
+    .unwrap();
+
+    // Verify User is resolved as a callee of create_user
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path()).arg("slice").arg("create_user");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("User"));
+}

@@ -52,14 +52,19 @@ pub fn compute_weighted_pagerank(
     // Personalization vector
     let personalization: Vec<f64> = match focus_indices {
         Some(indices) if !indices.is_empty() => {
-            let mut p = vec![0.0; n];
-            let mass = 1.0 / indices.len() as f64;
-            for &idx in indices {
-                if idx < n {
+            let mut valid: Vec<usize> = indices.iter().copied().filter(|&i| i < n).collect();
+            valid.sort_unstable();
+            valid.dedup();
+            if valid.is_empty() {
+                vec![1.0 / n as f64; n]
+            } else {
+                let mut p = vec![0.0; n];
+                let mass = 1.0 / valid.len() as f64;
+                for idx in valid {
                     p[idx] = mass;
                 }
+                p
             }
-            p
         }
         _ => vec![1.0 / n as f64; n],
     };

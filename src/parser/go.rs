@@ -13,7 +13,8 @@ pub fn parse_go(file: &str, content: &str) -> Result<Vec<Symbol>> {
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
-    walk_go_node(root, content, file, &mut symbols, 0);
+    let imported_packages = collect_file_imported_packages(root, content);
+    walk_go_node(root, content, file, &mut symbols, &imported_packages, 0);
     let external_imports = collect_file_external_imports(root, content);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
@@ -22,9 +23,59 @@ pub fn parse_go(file: &str, content: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
-const MAX_AST_DEPTH: usize = 256;
+const MAX_AST_DEPTH: usize = 512;
 
-fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>, depth: usize) {
+fn collect_file_imported_packages(root: Node, content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_go_all_imports(root, content, &mut out, 0);
+    out
+}
+
+fn collect_go_all_imports(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
+    if node.kind() == "import_spec" {
+        let mut name: Option<&str> = None;
+        let mut path: Option<&str> = None;
+        let mut cursor = node.walk();
+        for c in node.children(&mut cursor) {
+            match c.kind() {
+                "package_identifier" | "identifier" | "blank_identifier" | "dot" => {
+                    name = Some(node_text(c, content).trim());
+                }
+                "interpreted_string_literal" | "raw_string_literal" => {
+                    path = Some(node_text(c, content).trim_matches(['"', '`', ' ']));
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = path {
+            match name {
+                Some("_") | Some(".") | None => {
+                    if name.is_none() {
+                        push_import(out, p.rsplit('/').next().unwrap_or(p));
+                    }
+                }
+                Some(n) => push_import(out, n),
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        collect_go_all_imports(c, content, out, depth + 1);
+    }
+}
+
+fn walk_go_node(
+    node: Node,
+    content: &str,
+    file: &str,
+    symbols: &mut Vec<Symbol>,
+    imported_packages: &[String],
+    depth: usize,
+) {
     if depth >= MAX_AST_DEPTH {
         return;
     }
@@ -33,8 +84,14 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
         "function_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                let symbol =
-                    create_symbol(node, content, file, name.to_string(), SymbolKind::Function);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    name.to_string(),
+                    SymbolKind::Function,
+                    imported_packages,
+                );
                 symbols.push(symbol);
             }
         }
@@ -47,7 +104,14 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
                     None => name.to_string(),
                 };
 
-                let symbol = create_symbol(node, content, file, full_name, SymbolKind::Method);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    full_name,
+                    SymbolKind::Method,
+                    imported_packages,
+                );
                 symbols.push(symbol);
             }
         }
@@ -71,7 +135,14 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
                     };
 
                     let sym_node = if is_grouped { child } else { node };
-                    let symbol = create_symbol(sym_node, content, file, name.to_string(), sym_kind);
+                    let symbol = create_symbol(
+                        sym_node,
+                        content,
+                        file,
+                        name.to_string(),
+                        sym_kind,
+                        imported_packages,
+                    );
                     symbols.push(symbol);
                 }
             }
@@ -88,6 +159,7 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
                             file,
                             name.to_string(),
                             SymbolKind::Constant,
+                            imported_packages,
                         );
                         symbols.push(symbol);
                     }
@@ -99,7 +171,7 @@ fn walk_go_node(node: Node, content: &str, file: &str, symbols: &mut Vec<Symbol>
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_go_node(child, content, file, symbols, depth + 1);
+        walk_go_node(child, content, file, symbols, imported_packages, depth + 1);
     }
 }
 
@@ -120,7 +192,14 @@ fn extract_receiver_type<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str
     None
 }
 
-fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: SymbolKind) -> Symbol {
+fn create_symbol(
+    node: Node,
+    content: &str,
+    file: &str,
+    name: String,
+    kind: SymbolKind,
+    imported_packages: &[String],
+) -> Symbol {
     let start_pos = node.start_position();
     let end_pos = node.end_position();
     let body = node_text(node, content).to_string();
@@ -136,6 +215,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         &mut calls,
         &mut call_counts,
         &mut member_calls,
+        imported_packages,
         0,
     );
 
@@ -162,6 +242,7 @@ fn collect_references(
     calls: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
+    imported_packages: &[String],
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
@@ -172,7 +253,16 @@ fn collect_references(
         if child.kind() == "call_expression" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 // `x.F()` (selector) is a member call: file-local only.
-                let is_member = func_node.kind() == "selector_expression";
+                let mut is_member = func_node.kind() == "selector_expression";
+                if is_member {
+                    if let Some(operand) = func_node.child_by_field_name("operand") {
+                        let op_text = node_text(operand, content);
+                        if imported_packages.contains(&op_text.to_string()) {
+                            is_member = false;
+                        }
+                    }
+                }
+
                 let text = node_text(func_node, content);
                 let func_name = text.rsplit('.').next().unwrap_or(text).trim();
                 if !func_name.is_empty() {
@@ -186,7 +276,15 @@ fn collect_references(
                 }
             }
         }
-        collect_references(child, content, calls, counts, member_calls, depth + 1);
+        collect_references(
+            child,
+            content,
+            calls,
+            counts,
+            member_calls,
+            imported_packages,
+            depth + 1,
+        );
     }
 }
 
@@ -206,11 +304,14 @@ fn extract_signature(body: &str) -> String {
 /// the local package may itself be indexed.
 fn collect_file_external_imports(root: Node, content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    collect_go_imports(root, content, &mut out);
+    collect_go_imports(root, content, &mut out, 0);
     out
 }
 
-fn collect_go_imports(node: Node, content: &str, out: &mut Vec<String>) {
+fn collect_go_imports(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     if node.kind() == "import_spec" {
         let mut name: Option<&str> = None;
         let mut path: Option<&str> = None;
@@ -242,7 +343,7 @@ fn collect_go_imports(node: Node, content: &str, out: &mut Vec<String>) {
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_go_imports(c, content, out);
+        collect_go_imports(c, content, out, depth + 1);
     }
 }
 

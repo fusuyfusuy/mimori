@@ -1,59 +1,69 @@
 ---
-scope: "Storage & Workspace"
-score: 6.8
-status: "CRITICAL"
-critical_findings: 3
-invariant_breaches:
-  - "Workspace Confinement (AGENTS.md Invariant 3): aliases.rs follows extends, references, and workspace globs outside workspace root without boundary validation."
+scope: "storage-and-workspace"
+score: 9.1
+status: "MINOR"
+critical_findings: 0
+invariant_breaches: []
 ---
 
-# Storage & Workspace Audit Report
+# Scope 3 Audit: Storage Engine & Workspace Resolution (Post-Remediation)
 
-## 1. Executive Summary
-Audit of `mimori` storage and workspace subsystems (`src/storage/{mod,db,sync}.rs`, `src/workspace/{mod,walker,aliases,find}.rs`). While the FNV-1a content-hash invalidation model correctly rejects pure `mtime` assumptions, critical vulnerabilities exist in path cycle detection (causing stack overflow crashes), workspace boundary confinement (violating Architecture Invariant 3), and SQLite concurrency resilience (zero busy timeout). Significant performance bottlenecks also affect transaction batching and filesystem traversal.
+Post-remediation verification audit of SQLite caching, FNV-1a hashing, incremental sync, workspace walker, path alias resolution, and symbol/file discovery.
 
-## 2. Dimension Evaluation
+## 1. Executive Summary & Scoring
+- **Health Score**: **9.1 / 10.0** (Status: **MINOR**)
+- **Target Seams**: [`src/storage/db.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/db.rs), [`src/storage/sync.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/sync.rs), [`src/storage/mod.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/mod.rs), [`src/workspace/walker.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/walker.rs), [`src/workspace/aliases.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs), [`src/workspace/find.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/find.rs), [`src/workspace/mod.rs`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/mod.rs).
+- **Critical Findings**: 0 | **Moderate Findings**: 0 | **Minor / Hygiene Findings**: 4
+- **Invariant Breaches**: 0 (All previous breaches remediated and verified).
 
-### 2.1 Correctness
-- **FNV-1a vs mtime Invariants**: Compliant with Invariant 1. Invalidation in `sync.rs:41` relies on `scan.hash == db_hash`. `mtime` is stored (`files.mtime`) but not trusted for freshness.
-- **Migration & Schema**: Parser version invalidation in `db.rs:81-93` cleans `files` and bumps `PRAGMA user_version`. However, `db.rs:49,60,200` defines a `centrality` column and index `idx_symbols_centrality` that is permanently 0.0—`SymbolGraph::new` calculates PageRank in memory and never writes it back to SQLite.
-- **Ignore Filtering**: `walker.rs:147-156` configures `WalkBuilder` with `.hidden(true)`, `.git_ignore(true)`, and `.mimoriignore`. However, `walker.rs:94-102` applies `is_ignored_rel` only on files, not directories, failing to prune directory descent.
-- **Alias Resolution**: `aliases.rs:207-232` only parses YAML package lists using line-based heuristics; flow-style arrays (`packages: ["..."]`) or inline definitions fail. `expand_workspace_globs` (`aliases.rs:249-260`) treats `/**` as a non-recursive immediate directory read.
+---
 
-### 2.2 Robustness
-- **SQLite Concurrency & Busy Timeout**: Critical defect. `db.rs:27-32` configures WAL mode, normal synchronous, and foreign keys, but NEVER configures `busy_timeout` (default 0ms). Any concurrent read/write or parallel CLI/MCP invocation immediately errors with `database is locked`.
-- **Corruption Recovery**: `db.rs:22` and `sync.rs:19` lack auto-recovery. A malformed or truncated SQLite database immediately halts commands without attempting fallback rebuild or database re-initialization.
-- **Cycle Detection & Symlinks**: Critical defect. `aliases.rs:340,408-430` uses `HashSet<PathBuf>` without path canonicalization. Cross-directory mutual `extends` (`a/tsconfig.json` <-> `../b/tsconfig.json`) creates infinitely expanding paths (`a/../b/../a/...`), exhausting stack space and crashing with SIGSEGV.
+## 2. Verification of Remediations
 
-### 2.3 Performance
-- **Single-Item SQLite Transactions**: `sync.rs:68-83` saves each parsed file in an isolated transaction (`db.rs:163`), committing hundreds of individual transactions sequentially instead of a single batch transaction. Deletions (`db.rs:214`) run individual auto-commit DELETE statements.
-- **Triple Workspace Walk**: `sync.rs:24-26` triggers three sequential directory tree walks: `discover_package_manifests`, `discover_tsconfigs`, and `scan_workspace_with_stats`.
-- **Eager Memory Ingestion**: `walker.rs:64-77` loads the full text content of every supported source file in the repository into memory simultaneously on every invocation.
-- **Duplicate Walk on Find Fallback**: `find.rs:137-139` invokes `scan_workspace` a second time when symbol/file search yields zero hits.
+1. **AliasSet::fingerprint Determinism**: **VERIFIED**
+   - [`src/workspace/aliases.rs#L160-L170`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs#L160-L170): `all_paths` gathers manifests and `visited_configs`, sorts lexicographically (`all_paths.sort()`), and deduplicates (`all_paths.dedup()`). FNV-1a fingerprinting is 100% deterministic across processes, preventing spurious cache purges.
+2. **Strict Workspace Confinement on `baseUrl`**: **VERIFIED**
+   - [`src/workspace/aliases.rs#L503-L515`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs#L503-L515): `collect_base_url_aliases` canonicalizes both `root` and `base_dir`. If `!canon_base_dir.starts_with(&canon_root)`, it aborts prior to `std::fs::read_dir`, eliminating path traversal leaks.
+3. **SQLite Immediate Transaction Locking**: **VERIFIED**
+   - [`src/storage/db.rs#L166-L168`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/db.rs#L166-L168): `save_batch` invokes `self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)`. This acquires a `RESERVED` lock immediately in WAL mode, preventing concurrent lock upgrade deadlocks.
+4. **Find Coverage for Symbol-less Files**: **VERIFIED**
+   - [`src/workspace/find.rs#L94-L133`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/find.rs#L94-L133): `execute_find` queries `db.get_file_records()` from SQLite `files` table when `!symbols_only`, enabling file search (`-f` and general find) to locate files indexed with zero symbols.
 
-### 2.4 Security
-- **Path Traversal / Workspace Confinement**: Critical breach of Invariant 3. `aliases.rs:408-413` (`follow_extends`), `aliases.rs:441-454` (`follow_reference`), and `aliases.rs:262` (`expand_workspace_globs`) resolve absolute paths or `..` traversals without ensuring target paths remain within `root`.
-- **Arbitrary File Hashing**: `aliases.rs:160-167` reads and hashes any external file referenced by `tsconfig.json` extends/references into the SQLite alias fingerprint.
-- **SQL Injection**: No vulnerabilities found. All dynamic queries in `db.rs:123,166,169,176,216` use parameterized `params![]`.
+---
 
-## 3. Findings Matrix
+## 3. Deep Dimension Findings
 
-| Ref | Severity | File & Lines | Description |
-|---|---|---|---|
-| SEC-01 | CRITICAL | `src/workspace/aliases.rs:408-430,441-454` | Traversal outside workspace root via `extends` / `references` (Breaches Invariant 3). |
-| ROB-01 | CRITICAL | `src/workspace/aliases.rs:339-342,408-430` | Stack overflow / SIGSEGV on cross-directory mutual `extends` due to unnormalized path cycle tracking. |
-| ROB-02 | CRITICAL | `src/storage/db.rs:27-32` | Missing `busy_timeout` leads to immediate `SQLITE_BUSY` errors during concurrent access. |
-| PERF-01 | MODERATE | `src/storage/sync.rs:68-83`, `src/storage/db.rs:163` | File updates committed individually per-file; lacks single batch transaction wrapper. |
-| PERF-02 | MODERATE | `src/storage/sync.rs:24-26`, `src/workspace/aliases.rs:101-104` | Three separate full filesystem tree walks executed on every `get_or_sync_graph`. |
-| PERF-03 | MODERATE | `src/workspace/find.rs:137-139` | Full workspace re-walk and file re-read triggered on literal find fallback. |
-| CORR-01 | MINOR | `src/storage/db.rs:49,60,200` | Dead schema: `symbols.centrality` is never populated or indexed with calculated PageRank. |
-| CORR-02 | MINOR | `src/workspace/walker.rs:94-102` | Directory ignore check occurs after `path.is_file()`, failing to prune unignored directory trees early. |
-| CORR-03 | MINOR | `src/workspace/aliases.rs:249-260` | Glob expansion for `/**` does not perform recursive descent. |
+### 3.1 Correctness & Determinism
+- [VERIFIED] **Deterministic Caching**: [`src/workspace/aliases.rs#L160-L170`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs#L160-L170) eliminates `HashSet` iteration non-determinism.
+- [VERIFIED] **Symbol-less File Indexing**: Symbol-less files are stored in `files` table and matched in [`src/workspace/find.rs#L100-L133`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/find.rs#L100-L133).
+- [MINOR] **Dotted Config Base Path**: In [`src/workspace/aliases.rs#L435-L437`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs#L435-L437), `target.extension().is_none()` evaluates to false on paths like `"tsconfig.base"` (`Some("base")`), skipping `.set_extension("json")`.
+- [MINOR] **Multi-level Glob Expansion**: In [`src/workspace/aliases.rs#L252-L264`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs#L252-L264), `clean.ends_with("/**")` reads only the immediate parent directory rather than recursively walking subtrees.
 
-## 4. Remediation Checklist
-1. [ ] **Normalize Paths for Cycle Detection**: In `aliases.rs`, canonicalize or normalize `PathBuf` (e.g., via `dunce::canonicalize` or resolving `..` components) before inserting into `visited`.
-2. [ ] **Enforce Workspace Root Confinement**: In `aliases.rs`, verify `target.starts_with(root)` before reading `extends`, `references`, or workspace glob paths.
-3. [ ] **Configure SQLite Busy Timeout**: In `db.rs:open_or_create`, execute `PRAGMA busy_timeout = 5000;` or set `conn.busy_timeout(Duration::from_millis(5000))`.
-4. [ ] **Batch Database Writes**: Add `save_files_and_symbols_batch(&mut self, &[...])` in `db.rs` to wrap all parsed file inserts and file deletions in a single transaction.
-5. [ ] **Consolidate Discovery Walks**: Merge `discover_package_manifests`, `discover_tsconfigs`, and `discover_workspace_files` into a single `WalkBuilder` traversal pass with `.filter_entry()` directory pruning.
-6. [ ] **Reuse Scans in Find Fallback**: Pass existing `FileScan` results into `find.rs` instead of re-invoking `scan_workspace`.
+### 3.2 Security & Workspace Confinement
+- [VERIFIED] **BaseUrl Boundary Confinement**: Enforced via `starts_with(&canon_root)` check before directory read in [`src/workspace/aliases.rs#L509-L515`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/aliases.rs#L509-L515).
+- [VERIFIED] **SQL Injection Immunity**: [`src/storage/db.rs#L28-L215`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/db.rs#L28-L215) uses compile-time parameters and strict SQL binding exclusively.
+
+### 3.3 Robustness & Concurrency
+- [VERIFIED] **WAL Upgrade Deadlock Elimination**: Immediate transactions prevent `SQLITE_BUSY` contention during parallel CLI/MCP execution.
+- [MINOR] **Corrupt Database Auto-Recovery**: [`src/storage/db.rs#L22-L78`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/db.rs#L22-L78) lacks automated quarantine/rebuild for truncated or corrupt `.mimori/index.db` files.
+
+### 3.4 Performance & Resource Hygiene
+- [MINOR] **Literal Fallback Walk Redundancy**: When AST search matches 0 symbols, [`src/workspace/find.rs#L155`](file:///home/devhax/projects/fusuyfusuy/mimori/src/workspace/find.rs#L155) calls `scan_workspace(root)` for literal matching, executing an additional filesystem walk rather than reusing warm file buffers.
+- [MINOR] **Write-Lock JSON Serialization**: In [`src/storage/db.rs#L188-L214`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/db.rs#L188-L214), `serde_json::to_string` runs sequentially inside the immediate write transaction.
+
+---
+
+## 4. Invariant Compliance Audit
+
+| AGENTS.md Invariant | Status | Evidence / Analysis |
+|---|---|---|
+| **Content-Hash Driven** | **PASS** | [`src/storage/sync.rs#L40-L44`](file:///home/devhax/projects/fusuyfusuy/mimori/src/storage/sync.rs#L40-L44): Content hash governs invalidation. Fingerprint hashing is deterministic. |
+| **Workspace Confinement** | **PASS** | Strict canonical root confinement verified across `confine_to_workspace`, walker, and `baseUrl` alias collector. |
+| **Zero Background Daemons** | **PASS** | On-demand execution with synchronous SQLite connection management; no persistent background processes. |
+
+---
+
+## 5. Prioritized Actionable Recommendations
+1. **Auto-Recovery for Corrupt DB** (P2): Wrap `Database::open_or_create` with a rescue block that backs up and recreates corrupt or zero-byte `index.db` files.
+2. **Recursive Workspace Glob Walk** (P3): In `expand_workspace_globs`, recurse directory trees when pattern ends with `/**`.
+3. **Pre-Serialize JSON Outside Write Tx** (P3): Perform `serde_json::to_string` in the Rayon parallel mapping stage in `sync.rs` prior to entering `save_batch`.

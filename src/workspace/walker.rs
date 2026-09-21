@@ -219,12 +219,10 @@ pub fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// callers elsewhere and writing a stray SQLite index into a source folder.
 /// Step 3 survives only for a target that lies outside any known workspace.
 pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
-    let Some(target_dir) = target_dir else {
-        return cwd.to_path_buf();
-    };
+    let start_dir = target_dir.unwrap_or(cwd);
 
     for marker in [".mimori", ".git"] {
-        let mut dir = Some(target_dir);
+        let mut dir = Some(start_dir);
         while let Some(d) = dir {
             if d.join(marker).exists() {
                 return d.to_path_buf();
@@ -233,11 +231,14 @@ pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
         }
     }
 
-    if target_dir.starts_with(cwd) {
-        return cwd.to_path_buf();
+    if let Some(target) = target_dir {
+        if target.starts_with(cwd) {
+            return cwd.to_path_buf();
+        }
+        target.to_path_buf()
+    } else {
+        cwd.to_path_buf()
     }
-
-    target_dir.to_path_buf()
 }
 
 pub fn is_system_directory(path: &Path) -> bool {
