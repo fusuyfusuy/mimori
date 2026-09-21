@@ -11,8 +11,8 @@ description: >
 ```text
 KERNEL:
   TARGET: Autonomous Agent Execution & Code Intelligence Substrate
-  BINARY: ~/.local/bin/mimori (CLI) | mimori mcp (JSON-RPC stdio)
-  VERSION: 2.4.1
+  BINARY: ~/.cargo/bin/mimori (CLI) | mimori mcp (JSON-RPC stdio)
+  VERSION: 2.4.2
   INVARIANTS:
     1_HASH:       Content-Hash Governed (FNV-1a) — mtime purely untrusted
     2_PURITY:     Deterministic & Non-Interactive — zero background daemons
@@ -49,13 +49,13 @@ CANOPY -> SLICE -> BLAST -> MUTATE -> PROVE -> RECONCILE
 ```
 
 1. **TURN-0 (Orientation)**:
-   - `mimori dump --budget 1500` | MCP: `mimori_memory(action="show")`
+   - `mimori dump --budget 1500` | MCP: `mimori_dump(budget=1500)`
    - Injects domain vocabulary, gotchas, active debt, and PageRank entry points.
 2. **CANOPY (Topography)**:
    - `mimori map --limit 25` | MCP: `mimori_map(limit=25)`
    - Identifies high-centrality symbols and entry points without reading raw files.
 3. **SLICE (Targeted Reading)**:
-   - `mimori slice <coord> -f -i -n` | MCP: `mimori_slice(coordinate=C, follow_local=true)`
+   - `mimori slice <coord> -f -i -n` | MCP: `mimori_slice(coordinate=C, follow_local=true, numbered=true)`
    - Emits exact declaration body with 1-hop callers, callees, and inlined private helpers. Consumes ~120 tokens vs 3,000+ for raw file reads.
 4. **BLAST (Pre-Mutation Safety Gate)**:
    - `mimori blast <coord> -d 3` | MCP: `mimori_blast(target=C, depth=3)`
@@ -187,7 +187,8 @@ Run stdio daemon: `mimori mcp [--workspace <dir>]`
 
 | MCP Tool | CLI Equivalent | Key Arguments |
 | :--- | :--- | :--- |
-| `mimori_slice` | `mimori slice` | `coordinate`, `follow_local`, `with_imports`, `budget` |
+| `mimori_dump` | `mimori dump` | `budget`, `focus`, `workspace_dir` |
+| `mimori_slice` | `mimori slice` | `coordinate`, `follow_local`, `with_imports`, `numbered`, `budget` |
 | `mimori_map` | `mimori map` | `scope`, `focus`, `seed`, `limit` |
 | `mimori_find` | `mimori find` | `pattern`, `symbols_only`, `files_only`, `limit` |
 | `mimori_blast` | `mimori blast` | `target`, `depth`, `down`, `with_sinks` |

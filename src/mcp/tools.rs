@@ -138,12 +138,37 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                         "type": "boolean",
                         "description": "Include top-of-file import statements in slice header"
                     },
+                    "numbered": {
+                        "type": "boolean",
+                        "description": "Prefix body lines with 1-based line coordinates (L{n}: ...)"
+                    },
                     "workspace_dir": {
                         "type": "string",
                         "description": "Optional workspace directory (defaults to current working directory)"
                     }
                 },
                 "required": ["coordinate"]
+            }
+        }),
+        json!({
+            "name": "mimori_dump",
+            "description": "Generate Turn-0 packed context snapshot: PageRank architectural map, domain vocabulary, empirical gotchas, and active debt under token budget.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "budget": {
+                        "type": "integer",
+                        "description": "Token budget for context snapshot (default: 1500 tokens)"
+                    },
+                    "focus": {
+                        "type": "string",
+                        "description": "Optional focus symbol or coordinate to personalize the architectural map"
+                    },
+                    "workspace_dir": {
+                        "type": "string",
+                        "description": "Optional workspace directory relative to session root"
+                    }
+                }
             }
         }),
         json!({
@@ -325,6 +350,18 @@ struct SliceToolArgs {
     #[serde(default)]
     with_imports: Option<bool>,
     #[serde(default)]
+    numbered: Option<bool>,
+    #[serde(default)]
+    workspace_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DumpToolArgs {
+    #[serde(default)]
+    budget: Option<usize>,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
     workspace_dir: Option<String>,
 }
 
@@ -436,6 +473,7 @@ pub fn call_tool(
 
             let with_imports = args.with_imports.unwrap_or(false);
             let follow_local = args.follow_local.unwrap_or(false);
+            let numbered = args.numbered.unwrap_or(false);
 
             if let Coordinate::Lines { file, start, end } = &coord {
                 let full = if file.is_absolute() {
@@ -447,9 +485,9 @@ pub fn call_tool(
                 let slice = slice_line_coordinate(&confined, *start, *end, with_imports)
                     .map_err(|e| ToolError::Execution(e.to_string()))?;
                 if let Some(b) = args.budget {
-                    Ok(slice.to_markdown_budgeted(b))
+                    Ok(slice.render_markdown_budgeted(b, numbered))
                 } else {
-                    Ok(slice.to_markdown())
+                    Ok(slice.render_markdown(numbered))
                 }
             } else {
                 let graph = cache
@@ -460,9 +498,9 @@ pub fn call_tool(
                     .build_slice(&norm_coord, follow_local, with_imports)
                     .map_err(|e| ToolError::Execution(e.to_string()))?;
                 if let Some(b) = args.budget {
-                    Ok(slice.to_markdown_budgeted(b))
+                    Ok(slice.render_markdown_budgeted(b, numbered))
                 } else {
-                    Ok(slice.to_markdown())
+                    Ok(slice.render_markdown(numbered))
                 }
             }
         }
@@ -484,7 +522,7 @@ pub fn call_tool(
             )
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
-            let scope = args.scope.as_deref().or(args.workspace_dir.as_deref());
+            let scope = args.scope.as_deref();
             let map_result = generate_map(&graph, scope, args.focus.as_deref(), args.limit);
             Ok(map_result.to_markdown())
         }
@@ -669,6 +707,17 @@ pub fn call_tool(
                     other
                 ))),
             }
+        }
+        "mimori_dump" => {
+            let args: DumpToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_dump': {}", e))
+            })?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let budget = args.budget.unwrap_or(1500);
+            let dump =
+                crate::memory::dump::generate_dump(&scope_dir, budget, args.focus.as_deref())
+                    .map_err(|e| ToolError::Execution(e.to_string()))?;
+            Ok(dump.markdown)
         }
         unknown => Err(ToolError::NotFound(unknown.to_string())),
     }

@@ -102,13 +102,14 @@ fn test_mcp_tools_list() {
     let resp = client.recv();
     assert_eq!(resp["id"], 1);
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 8);
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
         vec![
             "mimori_slice",
+            "mimori_dump",
             "mimori_map",
             "mimori_find",
             "mimori_blast",
@@ -301,6 +302,51 @@ pub fn query_user(id: &str) -> String {
     assert!(
         text.contains("v2_user_"),
         "expected updated body, got: {}",
+        text
+    );
+
+    // 8. Tool call: mimori_slice with numbered: true
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_slice",
+            "arguments": {
+                "coordinate": "src/db.rs:query_user",
+                "numbered": true
+            }
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], 17);
+    assert_eq!(resp["result"]["isError"], false);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("L2:"),
+        "expected numbered lines, got: {}",
+        text
+    );
+
+    // 9. Tool call: mimori_dump
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 18,
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_dump",
+            "arguments": {
+                "budget": 1500
+            }
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], 18);
+    assert_eq!(resp["result"]["isError"], false);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("MIMORI TURN-0 CONTEXT"),
+        "expected turn-0 context, got: {}",
         text
     );
 }
@@ -586,6 +632,12 @@ fn test_mcp_workspace_dir_confinement() {
     let resp = client.recv();
     assert_eq!(resp["id"], 52);
     assert_eq!(resp["result"]["isError"], false);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("hello"),
+        "mimori_map in scoped workspace_dir must contain symbols: {}",
+        text
+    );
 }
 
 #[test]
