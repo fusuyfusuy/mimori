@@ -182,3 +182,29 @@ fn test_cli_find_symbol_less_file() {
         .success()
         .stdout(predicate::str::contains("src/marker_types.ts"));
 }
+
+#[test]
+fn test_cli_find_files_nonexistent_does_not_return_literal_matches() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let rs_file = src_dir.join("main.rs");
+    fs::write(
+        &rs_file,
+        "pub fn run() {\n    let fallback_only_literal_match = 100;\n}\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path())
+        .arg("find")
+        .arg("--files")
+        .arg("fallback_only_literal_match");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("0 matches"))
+        .stdout(predicate::str::contains("literal match").not())
+        .stdout(predicate::str::contains("No matches found"));
+}

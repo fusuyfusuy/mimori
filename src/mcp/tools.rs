@@ -322,7 +322,7 @@ pub fn list_tools() -> Vec<serde_json::Value> {
         }),
         json!({
             "name": "mimori_debt",
-            "description": "Scan, check, or sync in-code ponytail technical debt markers (# ponytail: <what> <- <ceiling> -> <trigger>).",
+            "description": "Scan, check, or sync in-code mimodept technical debt markers (# mimodept: <what> <- <ceiling> -> <trigger>).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

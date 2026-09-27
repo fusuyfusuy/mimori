@@ -3,7 +3,7 @@ name: mimori
 description: >
   Zero-config AST code-intelligence, symbol-graph, context-slicing, and project memory engine.
   Use for symbol search, 1-hop AST slicing, PageRank architectural mapping, blast-radius analysis,
-  Turn-0 context dumping, and project memory/ponytail debt tracking. Native CLI and MCP stdio.
+  Turn-0 context dumping, and project memory/mimodept debt tracking. Native CLI and MCP stdio.
 ---
 
 # MIMORI(1) — AST Intelligence & Memory Substrate
@@ -12,7 +12,7 @@ description: >
 KERNEL:
   TARGET: Autonomous Agent Execution & Code Intelligence Substrate
   BINARY: ~/.cargo/bin/mimori (CLI) | mimori mcp (JSON-RPC stdio)
-  VERSION: 2.4.4
+  VERSION: 2.4.5
   INVARIANTS:
     1_HASH:       Content-Hash Governed (FNV-1a) — mtime purely untrusted
     2_PURITY:     Deterministic & Non-Interactive — zero background daemons
@@ -65,7 +65,7 @@ CANOPY -> SLICE -> BLAST -> MUTATE -> PROVE -> RECONCILE
    - Enforces 30-line debt ceiling and validates 3-tuple debt schema.
 6. **DEBT RECONCILIATION**:
    - `mimori debt sync`
-   - Syncs in-code `# ponytail:` markers into `.agents/memory.md`, preserving `- accepted ...` waivers.
+   - Syncs in-code `# mimodept:` markers into `.agents/memory.md`, preserving `- accepted ...` waivers.
 
 ---
 
@@ -137,11 +137,11 @@ mimori memory [show|lint|resolve] [--section <sec>] [--budget <N>] [--json]
 - `lint`: Enforces 30-line ceiling, 3-tuple format, rejects completed checkboxes/strikethroughs.
 - `resolve <pattern>`: Surgically deletes matched debt lines without altering adjacent formatting.
 
-### `debt` — Ponytail Technical Debt Engine
+### `debt` — Mimodept Technical Debt Engine
 ```shell
 mimori debt [list|check|sync] [--scope <dir>] [--json]
 ```
-- Multi-threaded Rayon scanner discovering `# ponytail:` markers across all source languages.
+- Multi-threaded Rayon scanner discovering `# mimodept:` markers across all source languages.
 - `list`: Surfaces all in-code markers, ceilings, and triggers.
 - `check`: CI validation gate verifying non-empty ceilings, valid triggers, and 30-line ceiling.
 - `sync`: Reconciles in-code markers into `.agents/memory.md` under `## KNOWN DEBT`, preserving operator waivers (`- accepted ...`) while purging stale markers.
@@ -198,14 +198,14 @@ Run stdio daemon: `mimori mcp [--workspace <dir>]`
 
 ---
 
-## PONYTAIL DEBT SYNTAX CONTRACT
+## MIMODEPT DEBT SYNTAX CONTRACT
 
 In-code comments format:
 ```text
-# ponytail: <what> <- <ceiling> -> <upgrade_trigger>
-// ponytail: <what> <- <ceiling> -> <upgrade_trigger>
-/* ponytail: <what> <- <ceiling> -> <upgrade_trigger> */
--- ponytail: <what> <- <ceiling> -> <upgrade_trigger>
+# mimodept: <what> <- <ceiling> -> <upgrade_trigger>
+// mimodept: <what> <- <ceiling> -> <upgrade_trigger>
+/* mimodept: <what> <- <ceiling> -> <upgrade_trigger> */
+-- mimodept: <what> <- <ceiling> -> <upgrade_trigger>
 ```
 
 - `<what>`: Concrete simplification or pragmatic deferral.

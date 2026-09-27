@@ -151,7 +151,7 @@ pub fn execute_find(
 
     // Hybrid fallback: when zero symbols and files match, scan workspace files
     // line by line, emitting one hit per matching line (P0b: `rg -c` parity).
-    if matches.is_empty() {
+    if matches.is_empty() && !files_only {
         let scans = crate::workspace::walker::scan_workspace(root);
         for scan in scans {
             let rel = scan.rel.to_string_lossy();

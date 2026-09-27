@@ -937,7 +937,7 @@ fn test_mcp_memory_and_debt_tools() {
     let code_file = src_dir.join("cache.rs");
     fs::write(
         &code_file,
-        "// ponytail: bypass cache <- max 100 req/s -> implement redis pool\npub fn get_cache() {}\n",
+        "// mimodept: bypass cache <- max 100 req/s -> implement redis pool\npub fn get_cache() {}\n",
     )
     .unwrap();
 

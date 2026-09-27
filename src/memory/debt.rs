@@ -19,18 +19,26 @@ pub struct InCodeMarker {
     pub raw: String,
 }
 
-pub fn parse_ponytail_line(line: &str, file: &str, line_no: usize) -> Option<InCodeMarker> {
-    if !line
-        .as_bytes()
-        .windows(8)
-        .any(|w| w.eq_ignore_ascii_case(b"ponytail"))
-    {
+pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InCodeMarker> {
+    if !line.as_bytes().windows(8).any(|w| {
+        w.eq_ignore_ascii_case(b"mimodept")
+            || w.eq_ignore_ascii_case(b"mimodebt")
+            || w.eq_ignore_ascii_case(b"ponytail")
+    }) {
         return None;
     }
 
     let bytes = line.as_bytes();
     let is_rust = file.ends_with(".rs");
     let prefixes = [
+        "# mimodept:",
+        "// mimodept:",
+        "/* mimodept:",
+        "-- mimodept:",
+        "# mimodebt:",
+        "// mimodebt:",
+        "/* mimodebt:",
+        "-- mimodebt:",
         "# ponytail:",
         "// ponytail:",
         "/* ponytail:",
@@ -222,7 +230,7 @@ pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> 
             };
             let mut file_markers = Vec::new();
             for (line_idx, line) in content.lines().enumerate() {
-                if let Some(marker) = parse_ponytail_line(line, &rel_path, line_idx + 1) {
+                if let Some(marker) = parse_mimodept_line(line, &rel_path, line_idx + 1) {
                     file_markers.push(marker);
                 }
             }

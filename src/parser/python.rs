@@ -136,13 +136,14 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
     let signature = extract_signature(&body);
 
     let mut calls = Vec::new();
-    let mentions = Vec::new();
+    let mut mentions = Vec::new();
     let mut call_counts = std::collections::HashMap::new();
     let mut member_calls = Vec::new();
     collect_references(
         node,
         content,
         &mut calls,
+        &mut mentions,
         &mut call_counts,
         &mut member_calls,
         0,
@@ -169,6 +170,7 @@ fn collect_references(
     node: Node,
     content: &str,
     calls: &mut Vec<String>,
+    mentions: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
     depth: usize,
@@ -178,7 +180,8 @@ fn collect_references(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "call" {
+        let kind = child.kind();
+        if kind == "call" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 // `x.build()` (attribute function) is a member call:
                 // file-local only. Bare `build()` may resolve globally.
@@ -195,8 +198,75 @@ fn collect_references(
                     }
                 }
             }
+            if let Some(args_node) = child.child_by_field_name("arguments") {
+                let mut acursor = args_node.walk();
+                for arg in args_node.children(&mut acursor) {
+                    if arg.kind() == "identifier" {
+                        push_mention(mentions, node_text(arg, content));
+                    } else if arg.kind() == "attribute" {
+                        if let Some(attr) = arg.child_by_field_name("attribute") {
+                            push_mention(mentions, node_text(attr, content));
+                        }
+                    } else if arg.kind() == "keyword_argument" {
+                        if let Some(val) = arg.child_by_field_name("value") {
+                            if val.kind() == "identifier" {
+                                push_mention(mentions, node_text(val, content));
+                            } else if val.kind() == "attribute" {
+                                if let Some(attr) = val.child_by_field_name("attribute") {
+                                    push_mention(mentions, node_text(attr, content));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if kind == "attribute" {
+            if let Some(attr) = child.child_by_field_name("attribute") {
+                push_mention(mentions, node_text(attr, content));
+            }
+        } else if kind == "type" {
+            collect_type_mentions(child, content, mentions);
         }
-        collect_references(child, content, calls, counts, member_calls, depth + 1);
+        collect_references(
+            child,
+            content,
+            calls,
+            mentions,
+            counts,
+            member_calls,
+            depth + 1,
+        );
+    }
+}
+
+fn collect_type_mentions(node: Node, content: &str, mentions: &mut Vec<String>) {
+    let kind = node.kind();
+    if kind == "identifier" {
+        push_mention(mentions, node_text(node, content));
+    } else if kind == "attribute" {
+        if let Some(attr) = node.child_by_field_name("attribute") {
+            push_mention(mentions, node_text(attr, content));
+        }
+    } else if kind == "type" {
+        let text = node_text(node, content).trim();
+        if !text.is_empty() && !text.contains('[') && !text.contains('(') && !text.contains('|') {
+            let simple = text.rsplit('.').next().unwrap_or(text).trim();
+            push_mention(mentions, simple);
+        }
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        collect_type_mentions(c, content, mentions);
+    }
+}
+
+fn push_mention(mentions: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() || name == "self" || name == "cls" {
+        return;
+    }
+    if !mentions.iter().any(|m| m == name) {
+        mentions.push(name.to_string());
     }
 }
 
@@ -348,4 +418,60 @@ fn push_import(out: &mut Vec<String>, name: &str) {
 
 fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
     &content[node.start_byte()..node.end_byte()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_python_mentions_collected() {
+        let code = r#"
+def handle_request(user: User, config: AppConfig) -> Response:
+    settings = user.profile
+    validate(user, setting_val=config.timeout)
+"#;
+        let symbols = parse_python("test.py", code).unwrap();
+        let sym = symbols.iter().find(|s| s.name == "handle_request").unwrap();
+
+        // 1. Type annotations: User, AppConfig, Response
+        assert!(
+            sym.mentions.contains(&"User".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+        assert!(
+            sym.mentions.contains(&"AppConfig".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+        assert!(
+            sym.mentions.contains(&"Response".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+
+        // 2. Call arguments: user, timeout
+        assert!(
+            sym.mentions.contains(&"user".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+
+        // 3. Attributes: profile, timeout
+        assert!(
+            sym.mentions.contains(&"profile".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+        assert!(
+            sym.mentions.contains(&"timeout".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+
+        // Ensure calls is intact and not polluted by mentions
+        assert!(sym.calls.contains(&"validate".to_string()));
+        assert!(!sym.calls.contains(&"user".to_string()));
+    }
 }

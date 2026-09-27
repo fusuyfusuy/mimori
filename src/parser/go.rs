@@ -206,13 +206,14 @@ fn create_symbol(
     let signature = extract_signature(&body);
 
     let mut calls = Vec::new();
-    let mentions = Vec::new();
+    let mut mentions = Vec::new();
     let mut call_counts = std::collections::HashMap::new();
     let mut member_calls = Vec::new();
     collect_references(
         node,
         content,
         &mut calls,
+        &mut mentions,
         &mut call_counts,
         &mut member_calls,
         imported_packages,
@@ -236,10 +237,12 @@ fn create_symbol(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_references(
     node: Node,
     content: &str,
     calls: &mut Vec<String>,
+    mentions: &mut Vec<String>,
     counts: &mut std::collections::HashMap<String, u32>,
     member_calls: &mut Vec<String>,
     imported_packages: &[String],
@@ -250,7 +253,8 @@ fn collect_references(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "call_expression" {
+        let kind = child.kind();
+        if kind == "call_expression" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 // `x.F()` (selector) is a member call: file-local only.
                 let mut is_member = func_node.kind() == "selector_expression";
@@ -275,16 +279,42 @@ fn collect_references(
                     }
                 }
             }
+            if let Some(args_node) = child.child_by_field_name("arguments") {
+                let mut acursor = args_node.walk();
+                for arg in args_node.children(&mut acursor) {
+                    if arg.kind() == "identifier" {
+                        push_mention(mentions, node_text(arg, content));
+                    }
+                }
+            }
+        } else if kind == "selector_expression" {
+            if let Some(field) = child.child_by_field_name("field") {
+                push_mention(mentions, node_text(field, content));
+            }
+        } else if kind == "type_identifier" {
+            push_mention(mentions, node_text(child, content));
         }
+
         collect_references(
             child,
             content,
             calls,
+            mentions,
             counts,
             member_calls,
             imported_packages,
             depth + 1,
         );
+    }
+}
+
+fn push_mention(mentions: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    if !mentions.iter().any(|m| m == name) {
+        mentions.push(name.to_string());
     }
 }
 
@@ -356,4 +386,64 @@ fn push_import(out: &mut Vec<String>, name: &str) {
 
 fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
     &content[node.start_byte()..node.end_byte()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_go_mentions_collected() {
+        let code = r#"
+package main
+
+func ProcessUser(u User, item *Item) Result {
+    val := u.Name
+    helper(val, item)
+    return Result{}
+}
+"#;
+        let symbols = parse_go("main.go", code).unwrap();
+        let sym = symbols.iter().find(|s| s.name == "ProcessUser").unwrap();
+
+        // 1. type_identifier nodes: User, Item, Result
+        assert!(
+            sym.mentions.contains(&"User".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+        assert!(
+            sym.mentions.contains(&"Item".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+        assert!(
+            sym.mentions.contains(&"Result".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+
+        // 2. selector_expression field access: Name
+        assert!(
+            sym.mentions.contains(&"Name".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+
+        // 3. Call arguments that are identifiers: val, item
+        assert!(
+            sym.mentions.contains(&"val".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+        assert!(
+            sym.mentions.contains(&"item".to_string()),
+            "Mentions: {:?}",
+            sym.mentions
+        );
+
+        // Ensure calls is intact and not polluted by mentions
+        assert!(sym.calls.contains(&"helper".to_string()));
+        assert!(!sym.calls.contains(&"val".to_string()));
+    }
 }

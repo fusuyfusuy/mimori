@@ -57,7 +57,7 @@ pub enum Commands {
     #[command(about = "Read, lint, or resolve project memory (.agents/memory.md)")]
     Memory(MemoryArgs),
 
-    #[command(about = "Scan, check, or sync in-code ponytail technical debt")]
+    #[command(about = "Scan, check, or sync in-code mimodept technical debt")]
     Debt(DebtArgs),
 
     #[command(about = "Generate Turn-0 budget-aware prompt snapshot")]
@@ -102,7 +102,7 @@ pub struct FindArgs {
     )]
     pub symbols_only: bool,
 
-    #[arg(short = 'f', long, help = "Files only")]
+    #[arg(short = 'f', long, visible_alias = "files", help = "Files only")]
     pub files_only: bool,
 
     #[arg(short, long, help = "Maximum number of results to display")]
@@ -252,7 +252,7 @@ pub struct DebtArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum DebtCommand {
-    #[command(about = "Scan source files for in-code ponytail debt markers")]
+    #[command(about = "Scan source files for in-code mimodept debt markers")]
     List(DebtListArgs),
 
     #[command(about = "Synchronize in-code markers into .agents/memory.md")]

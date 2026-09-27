@@ -4,7 +4,7 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn test_cli_debt_list_finds_polyglot_ponytail_markers() {
+fn test_cli_debt_list_finds_polyglot_mimodept_markers() {
     let dir = tempdir().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -12,28 +12,28 @@ fn test_cli_debt_list_finds_polyglot_ponytail_markers() {
     // 1. Rust file
     fs::write(
         src.join("auth.rs"),
-        "// ponytail: bypass cache <- max 100 req/s -> implement redis pool\npub fn auth() {}\n",
+        "// mimodept: bypass cache <- max 100 req/s -> implement redis pool\npub fn auth() {}\n",
     )
     .unwrap();
 
     // 2. Python file
     fs::write(
         src.join("scraper.py"),
-        "# ponytail: unthrottled fetch <- 5 req/s -> add token bucket\ndef scrape(): pass\n",
+        "# mimodept: unthrottled fetch <- 5 req/s -> add token bucket\ndef scrape(): pass\n",
     )
     .unwrap();
 
     // 3. CSS/TS block comment
     fs::write(
         src.join("styles.ts"),
-        "/* ponytail: inline style <- width 0 -> use ResizeObserver */\nexport const x = 1;\n",
+        "/* mimodept: inline style <- width 0 -> use ResizeObserver */\nexport const x = 1;\n",
     )
     .unwrap();
 
     // 4. SQL comment
     fs::write(
         src.join("query.sql"),
-        "-- ponytail: full table scan <- rows < 1000 -> create index on user_id\nSELECT 1;\n",
+        "-- mimodept: full table scan <- rows < 1000 -> create index on user_id\nSELECT 1;\n",
     )
     .unwrap();
 
@@ -68,7 +68,7 @@ fn test_cli_debt_check_passes_and_fails() {
     let code_path = src.join("app.rs");
     fs::write(
         &code_path,
-        "// ponytail: valid marker <- ceiling ok -> trigger ok\npub fn run() {}\n",
+        "// mimodept: valid marker <- ceiling ok -> trigger ok\npub fn run() {}\n",
     )
     .unwrap();
 
@@ -81,7 +81,7 @@ fn test_cli_debt_check_passes_and_fails() {
     // Add marker missing trigger
     fs::write(
         src.join("broken.rs"),
-        "// ponytail: broken marker <- ceiling only\npub fn broken() {}\n",
+        "// mimodept: broken marker <- ceiling only\npub fn broken() {}\n",
     )
     .unwrap();
 
@@ -122,7 +122,7 @@ fn test_cli_debt_sync_merges_and_cleans_stale() {
     fs::create_dir_all(&src).unwrap();
     fs::write(
         src.join("pool.rs"),
-        "// ponytail: connection pool bypass <- 20 rps -> add deadpool\npub fn pool() {}\n",
+        "// mimodept: connection pool bypass <- 20 rps -> add deadpool\npub fn pool() {}\n",
     )
     .unwrap();
 
@@ -154,14 +154,14 @@ fn test_cli_debt_rust_lifetime_and_unicode_handling() {
     // Line with single lifetime 'a before comment marker
     fs::write(
         src.join("lifetime.rs"),
-        "pub fn parse<'a>(s: &str) { // ponytail: lifetime debt <- cap 1 -> fix lifetime\n}\n",
+        "pub fn parse<'a>(s: &str) { // mimodept: lifetime debt <- cap 1 -> fix lifetime\n}\n",
     )
     .unwrap();
 
     // Line with non-ASCII / Turkish / German characters
     fs::write(
         src.join("unicode.rs"),
-        "// İSTANBUL & GROßE // ponytail: unicode debt <- cap 2 -> test trigger\n",
+        "// İSTANBUL & GROßE // mimodept: unicode debt <- cap 2 -> test trigger\n",
     )
     .unwrap();
 
@@ -192,17 +192,17 @@ fn test_cli_debt_nested_ignore_directories() {
 
     fs::write(
         nested_nm.join("ignored.js"),
-        "// ponytail: nm debt <- cap -> trigger\n",
+        "// mimodept: nm debt <- cap -> trigger\n",
     )
     .unwrap();
     fs::write(
         nested_target.join("ignored.rs"),
-        "// ponytail: target debt <- cap -> trigger\n",
+        "// mimodept: target debt <- cap -> trigger\n",
     )
     .unwrap();
     fs::write(
         valid_src.join("core.rs"),
-        "// ponytail: valid pkg debt <- cap 5 -> trigger ok\n",
+        "// mimodept: valid pkg debt <- cap 5 -> trigger ok\n",
     )
     .unwrap();
 
@@ -215,5 +215,37 @@ fn test_cli_debt_nested_ignore_directories() {
         ))
         .stdout(predicate::str::contains(
             "packages/core/src/core.rs:1: valid pkg debt",
+        ));
+}
+
+#[test]
+fn test_cli_debt_legacy_ponytail_and_mimodebt_fallback() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(
+        src.join("legacy.rs"),
+        "// ponytail: legacy debt <- cap 1 -> trigger 1\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("typo.rs"),
+        "// mimodebt: typo debt <- cap 2 -> trigger 2\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("mimori").unwrap();
+    cmd.current_dir(dir.path()).arg("debt").arg("list");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "DEBT_SCAN: 2 markers found across 2 files:",
+        ))
+        .stdout(predicate::str::contains(
+            "src/legacy.rs:1: legacy debt <- cap 1 -> trigger 1",
+        ))
+        .stdout(predicate::str::contains(
+            "src/typo.rs:1: typo debt <- cap 2 -> trigger 2",
         ));
 }

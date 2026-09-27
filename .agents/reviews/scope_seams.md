@@ -1,40 +1,38 @@
 ---
-title: "Scope 5 (Cross-Boundary Seams) Verification Audit"
-date: "2026-09-21"
-score: 10
-status: "Exemplary"
+scope: "cross-boundary-seams"
+score: 8.4
+status: "MODERATE"
+contract_divergences: 2
 ---
 
-# Scope 5: Cross-Boundary Seams Audit Report
+# Scope 6: Cross-Boundary Seams & Contract Interfaces Audit
 
-## 1. MCP vs CLI Workspace Confinement
-- **File**: `src/mcp/tools.rs#confine`
-- **Verification**: Properly resolves both absolute and relative paths against `session_root`. Validates the canonicalized path by asserting `canon_candidate.starts_with(&canon_root)`, explicitly neutralizing path-traversal (`../`) attacks.
-- **Status**: **Pass** (Strictly satisfies Architecture Invariant 3).
+## Overview
+Evaluated cross-boundary contracts and interface invariants across Parsers, Models, Storage, Graph Analytics, Memory, CLI, and MCP stdio interfaces.
 
-## 2. Parser -> Graph Seam
-- **Files**: `src/graph/mod.rs`, `src/parser/python.rs`, `src/parser/go.rs`
-- **Verification**:
-  - `extract_file_imports` correctly scans up to 400 lines, ensuring large block comments or licenses don't truncate structural imports.
-  - The Python AST parser selectively quarantines built-in dependencies (`os`, `sys`, etc.) into `external_imports` using the strict `PYTHON_STDLIB` list. This guarantees that non-standard library packages remain resolvable locally, preserving cross-file edges.
-  - The Go AST parser uses a dotless-path heuristic (`!p.contains('.')`) to designate standard library imports as `external_imports`, which elegantly allows dot-qualified modules (e.g., `github.com/...`) to retain their cross-file mappings.
-- **Status**: **Pass** (Cross-file edges cleanly maintained across language domains).
+## Findings
 
-## 3. Storage -> Model Seam
-- **Files**: `src/storage/db.rs`, `src/storage/sync.rs`
-- **Verification**:
-  - Database writes batch cleanly inside an `Immediate` SQLite transaction to avert race conditions or partial schema violations.
-  - Storage invalidation expressly discards `mtime` as a sole indicator (`sync.rs:43`), enforcing deterministic structural validation against the content `hash` to prevent silent desyncs from `rsync` or `touch`.
-- **Status**: **Pass** (Highly deterministic caching mechanics).
+### 1. Seam Divergence: Parser Mention Collection vs Graph Consumer Contract (Moderate)
+- **Location**: [`src/parser/python.rs#L139`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/parser/python.rs#L139), [`src/parser/go.rs#L209`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/parser/go.rs#L209) vs [`src/graph/blast.rs#L244`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/graph/blast.rs#L244), [`src/graph/mod.rs#L555`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/graph/mod.rs#L555)
+- **Detail**: The `Symbol` schema contract defines `pub mentions: Vec<String>` to power non-call mention tracking (`mimori uses` in CLI and `mimori_graph(direction="uses")` in MCP, plus `value_uses` in `mimori blast`). While `src/parser/typescript.rs` and `src/parser/rust.rs` extract mentions (arguments, property reads, template strings, type references), `python.rs` and `go.rs` instantiate an empty `mentions = Vec::new()` and never populate it. Downstream consumers assume uniform language capability, but value-mention tracking silently yields 0 hits for Python and Go codebases.
 
-## 4. Memory & Debt Seams
-- **Files**: `src/memory/debt.rs`, `src/memory/ledger.rs`
-- **Verification**:
-  - Scope confinement in `scan_debt_markers` confirms `canon_joined.starts_with(&canon_root)` before returning markers.
-  - Pattern validation strictly adheres to `AGENTS.md` instructions. The `parse_debt_line` extracts the exact format (`- <what> <- <why> -> <trigger>`).
-  - Strikethroughs (`~~`) and checked items (`[x]`) are hard-rejected in `ledger.lint()`, rigorously enforcing the "Open-only" requirement, and properly honoring the `MAX_DEBT_CEILING` boundary of 30.
-- **Status**: **Pass** (Exemplary adherence to the behavioral ledger model).
+### 2. Contract Drift: CLI Filter Flag Intent vs Fallback Execution Seam (Minor)
+- **Location**: [`src/cli/args.rs#L97-L104`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/cli/args.rs#L97-L104) vs [`src/workspace/find.rs#L152-L174`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/workspace/find.rs#L152-L174)
+- **Detail**: The CLI contract specifies `--files-only` (`-f`) to restrict queries to file paths. When zero files match the query, `execute_find` invokes an unconditioned literal code content fallback. This violates the caller's explicit filter contract by returning code line snippets when only file paths were requested.
 
-## Final Score
-**10 (Exemplary)**
-No remediation required. Cross-boundary constraints operate reliably across graph, caching, language parsing, and conversational ledger contexts.
+### 3. Persistence Schema Contract: SQLite Table vs In-Memory `Symbol` (Exemplary)
+- **Location**: [`src/storage/db.rs#L41-L57`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/storage/db.rs#L41-L57), [`src/model/symbol.rs#L10-L24`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/model/symbol.rs#L10-L24)
+- **Detail**: Zero contract drift between SQLite columns and Rust struct members across all 13 fields. All JSON serializations handle decoding errors explicitly via `rusqlite::Error::FromSqlConversionFailure` without silent `unwrap_or_default` fallback masking. `PARSER_VERSION = 7` pragma guarantees schema migration safety.
+
+### 4. Architectural Invariant Enforcement: `AGENTS.md` vs Runtime Paths (Exemplary)
+- **Location**: `AGENTS.md` rules vs [`src/workspace/walker.rs`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/workspace/walker.rs), [`src/storage/sync.rs`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/storage/sync.rs), [`src/main.rs`](file:///home/fusuyfusuy/Projects/fusuyfusuy/mimori/src/main.rs)
+- **Detail**:
+  - **Content-Hash Invariant**: Verified. Invalidation relies purely on FNV-1a content hashes (`mtime` is never trusted).
+  - **Deterministic Non-Interactive Invariant**: Verified. Unambiguous `--json` and deterministic non-zero exit codes.
+  - **Workspace Confinement Invariant**: Verified. Both CLI and MCP paths enforce `confine_to_workspace` and system directory guards.
+  - **Zero Background Daemons**: Verified. Stdio and CLI operate on-demand.
+  - **Skill Spec Synchronization**: Verified. Tracked copies (`SKILL.md`, `skills/mimori/SKILL.md`) and the active installation copy are bit-for-bit identical.
+
+## Recommendations
+1. Populate `mentions` in `python.rs` and `go.rs` parsers to restore cross-language contract parity.
+2. In `src/workspace/find.rs`, suppress the literal line search fallback when `files_only` is true.
