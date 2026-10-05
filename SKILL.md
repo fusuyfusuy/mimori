@@ -61,7 +61,7 @@ CANOPY -> SLICE -> BLAST -> MUTATE -> PROVE -> RECONCILE
    - `mimori blast <coord> -d 3` | MCP: `mimori_blast(target=C, depth=3)`
    - Computes transitive ripple impact across callers, entry points, and test suites before editing.
 5. **PROOF GATE (Validation)**:
-   - `mimori memory lint ∧ mimori debt check == exit 0`
+   - `(mimori memory lint AND mimori debt check) == exit 0`
    - Enforces 30-line debt ceiling and validates 3-tuple debt schema.
 6. **DEBT RECONCILIATION**:
    - `mimori debt sync`
