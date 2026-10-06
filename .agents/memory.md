@@ -2,6 +2,7 @@
 
 ## Active Epics & Scale
 - Scale: Baseline architecture initialized.
+- Epic: Whole-Fleet AST Symbol Index & Temporal Churn Analytics (ClickHouse): Export Tree-sitter symbol AST tables across all 116 repos into ClickHouse MergeTree. Enables sub-5ms cross-repo symbol lookups (fleet_find), dead code anti-joins across repositories, and temporal AST mutation churn analysis (predicting regression blast-radii from historical co-mutation git diffs).
 
 ## KNOWN DEBT (open only — one line per item, delete when done)
 # Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>
