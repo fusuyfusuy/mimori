@@ -16,7 +16,7 @@ pub fn parse_file(path: &Path, content: &str, aliases: &AliasSet) -> Result<Vec<
     let file_str = path.to_str().unwrap_or("");
 
     match lang {
-        Language::Rust => rust::parse_rust(file_str, content),
+        Language::Rust => rust::parse_rust(file_str, content, aliases),
         Language::TypeScript | Language::JavaScript => {
             typescript::parse_typescript(file_str, content, false, aliases)
         }

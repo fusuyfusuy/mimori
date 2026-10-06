@@ -289,13 +289,21 @@ fn traverse(
 /// `handle_`, and any file whose path contained `main.`, `index.` or `app.`,
 /// so every getter in the codebase was reported as an affected entry point.
 pub(crate) fn is_entry_point(graph: &SymbolGraph, idx: usize, sym: &Symbol) -> bool {
-    if sym.name == "main" || sym.name.ends_with("::main") {
+    if is_program_entry(sym) {
         return true;
     }
-    graph
+    let has_no_callers = graph
         .callers_map
         .get(&idx)
-        .is_none_or(|callers| callers.is_empty())
+        .is_none_or(|callers| callers.is_empty());
+
+    let is_exported = sym.signature.starts_with("pub ")
+        || sym.signature.starts_with("pub(")
+        || sym.signature.starts_with("export ")
+        || (sym.file.ends_with(".go") && sym.name.chars().next().is_some_and(|c| c.is_uppercase()))
+        || (sym.file.ends_with(".py") && !sym.name.starts_with('_'));
+
+    has_no_callers && is_exported
 }
 
 /// A program entry by name (`main`). Narrower than `is_entry_point`, which

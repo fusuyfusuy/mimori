@@ -109,13 +109,14 @@ impl McpCache {
 
 fn compute_fingerprint(root: &Path) -> String {
     let aliases = crate::workspace::AliasSet::collect(root);
-    let (scans, _) = crate::workspace::scan_workspace_with_stats(root);
+    let (file_stats, _) = crate::workspace::walker::discover_workspace_file_stats(root);
 
     let mut hasher = DefaultHasher::new();
     aliases.fingerprint().hash(&mut hasher);
-    for scan in scans {
-        scan.rel.hash(&mut hasher);
-        scan.hash.hash(&mut hasher);
+    for (rel, mtime, size) in file_stats {
+        rel.hash(&mut hasher);
+        mtime.hash(&mut hasher);
+        size.hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
 }

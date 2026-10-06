@@ -65,7 +65,7 @@ pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
     let scans = paths
         .supported
         .into_par_iter()
-        .filter_map(|(rel, full, mtime)| {
+        .filter_map(|(rel, full, mtime, _size)| {
             let content = fs::read_to_string(&full).ok()?;
             let hash = format!("{:x}", fnv1a_hash(content.as_bytes()));
             Some(FileScan {
@@ -80,9 +80,24 @@ pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
 }
 
 struct DiscoveredFiles {
-    supported: Vec<(PathBuf, PathBuf, i64)>,
+    supported: Vec<(PathBuf, PathBuf, i64, u64)>,
     crawled: usize,
     unindexed_exts: Vec<String>,
+}
+
+pub fn discover_workspace_file_stats(root: &Path) -> (Vec<(PathBuf, i64, u64)>, ScanStats) {
+    let discovered = discover_workspace_files(root);
+    let stats = ScanStats {
+        indexed_files: discovered.supported.len(),
+        crawled_files: discovered.crawled,
+        unindexed_exts: discovered.unindexed_exts,
+    };
+    let file_stats = discovered
+        .supported
+        .into_iter()
+        .map(|(rel, _full, mtime, size)| (rel, mtime, size))
+        .collect();
+    (file_stats, stats)
 }
 
 fn discover_workspace_files(root: &Path) -> DiscoveredFiles {
@@ -112,15 +127,16 @@ fn discover_workspace_files(root: &Path) -> DiscoveredFiles {
             continue;
         }
 
-        let mtime = entry
-            .metadata()
-            .ok()
+        let meta = entry.metadata().ok();
+        let mtime = meta
+            .as_ref()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
-        supported.push((rel, path.to_path_buf(), mtime));
+        supported.push((rel, path.to_path_buf(), mtime, size));
     }
 
     let mut unindexed_exts: Vec<String> = ext_counts
@@ -221,7 +237,8 @@ pub fn fnv1a_hash(bytes: &[u8]) -> u64 {
 pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     let start_dir = target_dir.unwrap_or(cwd);
 
-    for marker in [".mimori", ".git"] {
+    // Prioritize VCS root (.git, .hg) first so a stray nested .mimori directory never hijacks the workspace.
+    for marker in [".git", ".hg", ".mimori"] {
         let mut dir = Some(start_dir);
         while let Some(d) = dir {
             if d.join(marker).exists() {

@@ -9,10 +9,9 @@ use std::path::Path;
 /// time and yields an empty reference list rather than an error -- a graph with
 /// zero edges, on a database that reports itself as fresh.
 ///
-/// v7: path-alias imports (`tsconfig.json` `compilerOptions.paths`) are no
-/// longer classified as external packages. Cached rows carry the old, wrong
-/// `external_imports`, so they must go.
-pub const PARSER_VERSION: i64 = 7;
+/// v9: polyglot workspace package discovery (Cargo.toml, go.mod), recognizing
+/// library crate imports as first-party code.
+pub const PARSER_VERSION: i64 = 9;
 
 pub struct Database {
     conn: Connection,

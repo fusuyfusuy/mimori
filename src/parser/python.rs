@@ -101,22 +101,29 @@ fn walk_python_node(
                 return;
             }
         }
-        "assignment" if parent_class.is_none() => {
-            if let Some(left) = node.child_by_field_name("left") {
+        "assignment" | "annotated_assignment" if parent_class.is_none() => {
+            let left_node = node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("target"));
+            if let Some(left) = left_node {
                 if left.kind() == "identifier" {
                     let name = node_text(left, content);
-                    if name.chars().any(|c| c.is_alphabetic())
-                        && name.chars().all(|c| !c.is_alphabetic() || c.is_uppercase())
-                    {
-                        let symbol = create_symbol(
-                            node,
-                            content,
-                            file,
-                            name.to_string(),
-                            SymbolKind::Constant,
-                        );
-                        symbols.push(symbol);
-                    }
+                    let is_upper = name.chars().any(|c| c.is_alphabetic())
+                        && name.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+                    let sym_kind = if is_upper {
+                        SymbolKind::Constant
+                    } else {
+                        let right = node
+                            .child_by_field_name("right")
+                            .or_else(|| node.child_by_field_name("value"));
+                        if matches!(right.map(|r| r.kind()), Some("call") | Some("await")) {
+                            SymbolKind::Variable
+                        } else {
+                            SymbolKind::Constant
+                        }
+                    };
+                    let symbol = create_symbol(node, content, file, name.to_string(), sym_kind);
+                    symbols.push(symbol);
                 }
             }
         }
@@ -133,7 +140,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
     let start_pos = node.start_position();
     let end_pos = node.end_position();
     let body = node_text(node, content).to_string();
-    let signature = extract_signature(&body);
+    let signature = extract_signature(node, content, &body);
 
     let mut calls = Vec::new();
     let mut mentions = Vec::new();
@@ -270,40 +277,28 @@ fn push_mention(mentions: &mut Vec<String>, name: &str) {
     }
 }
 
-fn extract_signature(body: &str) -> String {
+fn extract_signature(node: Node, content: &str, body: &str) -> String {
     let first_line = body.lines().next().unwrap_or("").trim();
-    let mut paren_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
-    let mut brace_depth: usize = 0;
-    let mut in_quote: Option<char> = None;
-    let mut prev_char = ' ';
 
-    for (idx, ch) in body.char_indices() {
-        if let Some(q) = in_quote {
-            if ch == q && prev_char != '\\' {
-                in_quote = None;
-            }
-        } else {
-            match ch {
-                '\'' | '"' => in_quote = Some(ch),
-                '(' => paren_depth += 1,
-                ')' => paren_depth = paren_depth.saturating_sub(1),
-                '[' => bracket_depth += 1,
-                ']' => bracket_depth = bracket_depth.saturating_sub(1),
-                '{' => brace_depth += 1,
-                '}' => brace_depth = brace_depth.saturating_sub(1),
-                ':' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
-                    let sig = body[..idx].trim().replace('\n', " ");
-                    if !sig.is_empty() {
-                        return sig;
-                    }
-                    break;
-                }
-                _ => {}
-            }
+    // If node is a decorated_definition, unpack the inner definition.
+    let def_node = if node.kind() == "decorated_definition" {
+        node.child_by_field_name("definition").unwrap_or(node)
+    } else {
+        node
+    };
+
+    if let Some(body_node) = def_node.child_by_field_name("body") {
+        let sig_raw = &content[def_node.start_byte()..body_node.start_byte()];
+        let sig = sig_raw
+            .trim()
+            .trim_end_matches(':')
+            .trim()
+            .replace('\n', " ");
+        if !sig.is_empty() {
+            return sig;
         }
-        prev_char = ch;
     }
+
     first_line.to_string()
 }
 

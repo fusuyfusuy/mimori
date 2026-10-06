@@ -120,6 +120,21 @@ fn walk_ts_node(
                 node.child_by_field_name("name"),
                 node.child_by_field_name("value"),
             ) {
+                if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                    let mut names = Vec::new();
+                    extract_pattern_names(name_node, content, &mut names);
+                    for pname in names {
+                        let symbol = create_symbol(
+                            node,
+                            content,
+                            file,
+                            pname.to_string(),
+                            SymbolKind::Variable,
+                        );
+                        symbols.push(symbol);
+                    }
+                    return;
+                }
                 let name = node_text(name_node, content);
                 let val_kind = value_node.kind();
                 if val_kind == "arrow_function" || val_kind == "function" {
@@ -528,6 +543,28 @@ fn push_unique(out: &mut Vec<String>, name: &str) {
     let name = name.trim();
     if !name.is_empty() && !out.contains(&name.to_string()) {
         out.push(name.to_string());
+    }
+}
+
+fn extract_pattern_names<'a>(node: Node<'a>, content: &'a str, out: &mut Vec<&'a str>) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let s = node_text(node, content).trim();
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        "pair_pattern" => {
+            if let Some(val) = node.child_by_field_name("value") {
+                extract_pattern_names(val, content, out);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_pattern_names(child, content, out);
+            }
+        }
     }
 }
 

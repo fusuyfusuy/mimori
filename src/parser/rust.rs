@@ -1,8 +1,9 @@
 use crate::model::{Symbol, SymbolKind};
+use crate::workspace::AliasSet;
 use anyhow::Result;
 use tree_sitter::{Node, Parser};
 
-pub fn parse_rust(file: &str, content: &str) -> Result<Vec<Symbol>> {
+pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
     let mut parser = Parser::new();
     let language = tree_sitter_rust::LANGUAGE.into();
     parser.set_language(&language)?;
@@ -14,7 +15,7 @@ pub fn parse_rust(file: &str, content: &str) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
     let root = tree.root_node();
     walk_rust_node(root, content, file, None, &mut symbols, 0);
-    let external_imports = collect_file_external_imports(root, content);
+    let external_imports = collect_file_external_imports(root, content, aliases);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
     }
@@ -130,7 +131,7 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
     let start_pos = node.start_position();
     let end_pos = node.end_position();
     let body = node_text(node, content).to_string();
-    let signature = extract_signature(&body, &kind);
+    let signature = extract_signature(node, content, &body, &kind);
 
     let mut calls = Vec::new();
     let mut mentions = Vec::new();
@@ -205,21 +206,21 @@ fn collect_references(
                 let is_member = func_node.kind() == "field_expression";
                 let func_name = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
                 push_call(calls, counts, member_calls, func_name, is_member);
-                // P0 parity: `S::new()` / `S::default()` constructs `S`.
-                // Qualified refs are bare evidence (exact-name resolution).
-                if func_name == "new" || func_name == "default" {
-                    if let Some(sep) = text.rfind("::").or_else(|| text.rfind('.')) {
-                        let ty = text[..sep].rsplit([':', '.']).next().unwrap_or("").trim();
-                        if !ty.is_empty() && ty != "self" && ty != "Self" {
+
+                // Preserve qualified calls (e.g. S::method) for exact resolution.
+                if let Some(sep) = text.rfind("::") {
+                    let ty = text[..sep].rsplit("::").next().unwrap_or("").trim();
+                    if !ty.is_empty() && ty != "self" && ty != "Self" {
+                        if func_name == "new" || func_name == "default" {
                             push_call(calls, counts, member_calls, ty, false);
-                            push_call(
-                                calls,
-                                counts,
-                                member_calls,
-                                &format!("{}::{}", ty, func_name),
-                                false,
-                            );
                         }
+                        push_call(
+                            calls,
+                            counts,
+                            member_calls,
+                            &format!("{}::{}", ty, func_name),
+                            false,
+                        );
                     }
                 }
             }
@@ -241,15 +242,21 @@ fn collect_references(
     }
 }
 
-fn extract_signature(body: &str, kind: &SymbolKind) -> String {
+fn extract_signature(node: Node, content: &str, body: &str, kind: &SymbolKind) -> String {
     let first_line = body.lines().next().unwrap_or("").trim();
 
-    // A const or static has no body to split off, and its initializer may well
-    // contain a brace inside a string literal. The other three parsers already
-    // special-case these; rust.rs ignored `kind` entirely and truncated
-    // `const B: &str = "{ .. }"` to `const B: &str = "`.
+    // A const or static has no body to split off.
     if matches!(kind, SymbolKind::Constant | SymbolKind::Variable) {
         return first_line.to_string();
+    }
+
+    // Prefer AST body node boundary over string searching so braces in doc comments/generics don't corrupt the signature.
+    if let Some(body_node) = node.child_by_field_name("body") {
+        let sig_raw = &content[node.start_byte()..body_node.start_byte()];
+        let sig = sig_raw.trim().replace('\n', " ");
+        if !sig.is_empty() {
+            return sig;
+        }
     }
 
     if let Some(idx) = body.find('{') {
@@ -269,13 +276,19 @@ fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
 /// namespace (`crate::`, `self::`, `super::` stay local). `std::` and third-
 /// party crates can never be workspace symbols, so calls matching these
 /// names are external, never resolved locally.
-fn collect_file_external_imports(root: Node, content: &str) -> Vec<String> {
+fn collect_file_external_imports(root: Node, content: &str, aliases: &AliasSet) -> Vec<String> {
     let mut out = Vec::new();
-    collect_uses(root, content, &mut out, 0);
+    collect_uses(root, content, &mut out, aliases, 0);
     out
 }
 
-fn collect_uses(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+fn collect_uses(
+    node: Node,
+    content: &str,
+    out: &mut Vec<String>,
+    aliases: &AliasSet,
+    depth: usize,
+) {
     if depth >= MAX_AST_DEPTH {
         return;
     }
@@ -295,14 +308,19 @@ fn collect_uses(node: Node, content: &str, out: &mut Vec<String>, depth: usize) 
             .trim()
             .trim_end_matches(';')
             .trim();
-        if !(tree.starts_with("crate") || tree.starts_with("self") || tree.starts_with("super")) {
+        let tree_first = tree.split("::").next().unwrap_or(tree).trim();
+        if !(tree_first == "crate"
+            || tree_first == "self"
+            || tree_first == "super"
+            || aliases.matches(tree_first))
+        {
             collect_use_tree_names(tree, out);
         }
         return;
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_uses(c, content, out, depth + 1);
+        collect_uses(c, content, out, aliases, depth + 1);
     }
 }
 
@@ -377,7 +395,7 @@ mod tests {
     use super::*;
 
     fn refs_of(src: &str, symbol: &str) -> Vec<String> {
-        parse_rust("t.rs", src)
+        parse_rust("t.rs", src, &AliasSet::default())
             .unwrap()
             .into_iter()
             .find(|s| s.name == symbol)
@@ -402,7 +420,7 @@ mod tests {
         // Regression S4: extract_signature ignored `kind` in this parser only,
         // truncating at the first '{' wherever it appeared.
         let src = r#"pub const BRACE: &str = "{ not a body }";"#;
-        let sym = parse_rust("t.rs", src)
+        let sym = parse_rust("t.rs", src, &AliasSet::default())
             .unwrap()
             .into_iter()
             .find(|s| s.name == "BRACE")
@@ -417,7 +435,7 @@ mod tests {
     #[test]
     fn function_signatures_still_stop_at_the_body() {
         let src = "pub fn real(x: u64) -> u64 { x }";
-        let sym = parse_rust("t.rs", src)
+        let sym = parse_rust("t.rs", src, &AliasSet::default())
             .unwrap()
             .into_iter()
             .find(|s| s.name == "real")
@@ -442,7 +460,7 @@ mod tests {
     fn nested_use_trees_extract_clean_identifiers() {
         let src =
             "use std::{collections::{HashMap, HashSet}, io};\nfn f() { let _ = HashMap::new(); }";
-        let syms = parse_rust("t.rs", src).unwrap();
+        let syms = parse_rust("t.rs", src, &AliasSet::default()).unwrap();
         let f = syms.iter().find(|s| s.name == "f").unwrap();
         assert!(
             f.external_imports.contains(&"HashMap".to_string()),
@@ -469,7 +487,7 @@ mod tests {
     #[test]
     fn pub_use_crate_is_not_external_import() {
         let src = "pub use crate::db::query_user;\npub(crate) use crate::model::User;\nuse anyhow::Result;\nfn f() {}";
-        let syms = parse_rust("t.rs", src).unwrap();
+        let syms = parse_rust("t.rs", src, &AliasSet::default()).unwrap();
         let f = syms.iter().find(|s| s.name == "f").unwrap();
         assert!(
             !f.external_imports.contains(&"query_user".to_string()),

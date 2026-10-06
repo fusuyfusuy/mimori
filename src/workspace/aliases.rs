@@ -135,6 +135,9 @@ impl AliasSet {
             }
         }
 
+        read_cargo_package_names(root, &mut set.packages);
+        read_go_module_names(root, &mut set.packages);
+
         let mut hash: u64 = 0xcbf29ce484222325;
         let pnpm_yaml = root.join("pnpm-workspace.yaml");
         if pnpm_yaml.is_file() {
@@ -310,6 +313,42 @@ fn read_package_names(manifests: &[std::path::PathBuf]) -> Vec<(String, std::pat
     }
     out.sort();
     out
+}
+
+fn read_cargo_package_names(root: &Path, out: &mut Vec<String>) {
+    let cargo_toml = root.join("Cargo.toml");
+    if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
+        let mut in_package = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_package = trimmed == "[package]";
+            } else if in_package && trimmed.starts_with("name") {
+                if let Some((_, val)) = trimmed.split_once('=') {
+                    let name = val.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !name.is_empty() && !out.contains(&name.to_string()) {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn read_go_module_names(root: &Path, out: &mut Vec<String>) {
+    let go_mod = root.join("go.mod");
+    if let Ok(content) = std::fs::read_to_string(&go_mod) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("module ") {
+                let mod_name = trimmed.strip_prefix("module ").unwrap_or("").trim();
+                let mod_name = mod_name.trim_matches('"').trim();
+                if !mod_name.is_empty() && !out.contains(&mod_name.to_string()) {
+                    out.push(mod_name.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// A key is a usable alias only when it cannot swallow the whole npm registry
