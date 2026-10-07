@@ -448,7 +448,7 @@ fn main() -> ExitCode {
             }
         }
         Commands::Init(args) => {
-            let root = find_workspace_root(None, &current_dir);
+            let root = &current_dir;
             let mimori_dir = root.join(".mimori");
             if let Err(e) = fs::create_dir_all(&mimori_dir) {
                 eprintln!(
@@ -481,10 +481,7 @@ fn main() -> ExitCode {
                 "created"
             };
 
-            let (mem_created, dec_created) = match MemoryLedger::scaffold(
-                &find_workspace_root(None, &current_dir),
-                args.force,
-            ) {
+            let (mem_created, dec_created) = match MemoryLedger::scaffold(root, args.force) {
                 Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("INIT_FAIL: scaffold .agents: {}; exit 1.", e);
