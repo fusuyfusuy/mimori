@@ -170,7 +170,11 @@ pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InC
 }
 
 pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> {
+    if crate::workspace::walker::is_disallowed_workspace_root(root) {
+        return Vec::new();
+    }
     let scan_root = match scope {
+
         Some(s) => {
             let joined = root.join(s);
             let Ok(canon_root) = root.canonicalize() else {
@@ -280,6 +284,15 @@ pub fn list_debt(root: &Path, scope: Option<&str>) -> (Vec<InCodeMarker>, String
 }
 
 pub fn check_debt(root: &Path) -> (bool, String) {
+    if crate::workspace::walker::is_disallowed_workspace_root(root) {
+        return (
+            false,
+            format!(
+                "DEBT_CHECK_FAIL: Refusing to check debt in home or system directory '{}'; exit 1.",
+                root.display()
+            ),
+        );
+    }
     let markers = scan_debt_markers(root, None);
     let total_markers = markers.len();
     let valid_count = markers.iter().filter(|m| m.valid_trigger).count();
@@ -331,7 +344,14 @@ pub fn check_debt(root: &Path) -> (bool, String) {
 }
 
 pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
+    if crate::workspace::walker::is_disallowed_workspace_root(root) {
+        anyhow::bail!(
+            "Refusing to sync debt in home or system directory '{}'",
+            root.display()
+        );
+    }
     let markers = scan_debt_markers(root, None);
+
     let valid_markers: Vec<_> = markers.iter().filter(|m| m.valid_trigger).collect();
 
     if !MemoryLedger::memory_path(root).exists() {

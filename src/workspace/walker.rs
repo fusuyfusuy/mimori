@@ -241,6 +241,9 @@ pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     for marker in [".git", ".hg", ".mimori"] {
         let mut dir = Some(start_dir);
         while let Some(d) = dir {
+            if is_disallowed_workspace_root(d) {
+                break;
+            }
             if d.join(marker).exists() {
                 return d.to_path_buf();
             }
@@ -249,7 +252,7 @@ pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     }
 
     if let Some(target) = target_dir {
-        if target.starts_with(cwd) {
+        if target.starts_with(cwd) && !is_disallowed_workspace_root(cwd) {
             return cwd.to_path_buf();
         }
         target.to_path_buf()
@@ -258,12 +261,43 @@ pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     }
 }
 
+pub fn is_home_directory(path: &Path) -> bool {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let home_path = Path::new(&home);
+            if path == home_path {
+                return true;
+            }
+            if let (Ok(canon_path), Ok(canon_home)) = (path.canonicalize(), home_path.canonicalize()) {
+                if canon_path == canon_home {
+                    return true;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        if !userprofile.is_empty() {
+            let up_path = Path::new(&userprofile);
+            if path == up_path {
+                return true;
+            }
+            if let (Ok(canon_path), Ok(canon_up)) = (path.canonicalize(), up_path.canonicalize()) {
+                if canon_path == canon_up {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn is_system_directory(path: &Path) -> bool {
     let system_prefixes = [
         "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/sys", "/proc", "/dev",
         "/boot", "/root",
     ];
-    if path == Path::new("/") {
+    if path == Path::new("/") || path == Path::new("/home") {
         return true;
     }
     for prefix in system_prefixes {
@@ -273,6 +307,11 @@ pub fn is_system_directory(path: &Path) -> bool {
     }
     false
 }
+
+pub fn is_disallowed_workspace_root(path: &Path) -> bool {
+    is_system_directory(path) || is_home_directory(path)
+}
+
 
 pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
     let canon_root = workspace_root
@@ -389,4 +428,30 @@ mod tests {
             fnv1a_hash(b"pub fn bbb() {}")
         );
     }
+
+    #[test]
+    fn home_and_system_directories_are_disallowed_workspace_roots() {
+        assert!(is_disallowed_workspace_root(Path::new("/")));
+        assert!(is_disallowed_workspace_root(Path::new("/home")));
+        assert!(is_disallowed_workspace_root(Path::new("/etc")));
+        assert!(is_disallowed_workspace_root(Path::new("/usr")));
+
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                assert!(is_home_directory(Path::new(&home)));
+                assert!(is_disallowed_workspace_root(Path::new(&home)));
+            }
+        }
+    }
+
+    #[test]
+    fn marker_search_does_not_escape_into_home_directory() {
+        if let Ok(home) = std::env::var("HOME") {
+            let home_path = PathBuf::from(&home);
+            let child = home_path.join("non_existent_subdir_for_mimori_test_12345");
+            let root = find_workspace_root(None, &child);
+            assert_ne!(root, home_path);
+        }
+    }
 }
+

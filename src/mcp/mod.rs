@@ -33,6 +33,13 @@ pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
         }
     };
 
+    if crate::workspace::walker::is_disallowed_workspace_root(&canonical_root) {
+        anyhow::bail!(
+            "Refusing to run MCP server with home or system directory as workspace root: '{}'",
+            canonical_root.display()
+        );
+    }
+
     eprintln!(
         "mimori MCP server running on stdio (root: {})",
         canonical_root.display()

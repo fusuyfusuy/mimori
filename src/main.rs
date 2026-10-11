@@ -30,9 +30,9 @@ fn main() -> ExitCode {
             // A line range is read straight off disk; it needs no index.
             let built = if let Coordinate::Lines { file, start, end } = &coord {
                 let root = find_workspace_root(coord.absolute_parent().as_deref(), &current_dir);
-                if mimori::workspace::walker::is_system_directory(&root) {
+                if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
                     eprintln!(
-                        "Error: Cannot access system directory '{}' as workspace",
+                        "Error: Cannot access home or system directory '{}' as workspace",
                         root.display()
                     );
                     return ExitCode::FAILURE;
@@ -449,6 +449,13 @@ fn main() -> ExitCode {
         }
         Commands::Init(args) => {
             let root = &current_dir;
+            if mimori::workspace::walker::is_disallowed_workspace_root(root) {
+                eprintln!(
+                    "INIT_FAIL: Cannot initialize mimori in home or system directory '{}'; exit 1.",
+                    root.display()
+                );
+                return ExitCode::FAILURE;
+            }
             let mimori_dir = root.join(".mimori");
             if let Err(e) = fs::create_dir_all(&mimori_dir) {
                 eprintln!(
@@ -804,9 +811,9 @@ fn parse_and_prepare(raw: &str, cwd: &Path) -> Result<(SymbolGraph, Coordinate)>
 
 fn prepare(coord: Coordinate, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
     let root = find_workspace_root(coord.absolute_parent().as_deref(), cwd);
-    if mimori::workspace::walker::is_system_directory(&root) {
+    if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
         bail!(
-            "Cannot access system directory '{}' as workspace",
+            "Cannot access home or system directory '{}' as workspace",
             root.display()
         );
     }

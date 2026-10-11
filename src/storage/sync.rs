@@ -10,7 +10,15 @@ use std::fs;
 use std::path::Path;
 
 pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
+    if crate::workspace::walker::is_disallowed_workspace_root(root) {
+        anyhow::bail!(
+            "Refusing to index home or system directory '{}' as workspace root",
+            root.display()
+        );
+    }
+
     let mimori_dir = root.join(".mimori");
+
     if !mimori_dir.exists() {
         fs::create_dir_all(&mimori_dir)?;
     }

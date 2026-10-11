@@ -446,7 +446,7 @@ fn resolve_workspace_scope(
     workspace_dir: Option<&str>,
     session_root: &Path,
 ) -> Result<PathBuf, ToolError> {
-    match workspace_dir {
+    let resolved = match workspace_dir {
         Some(ws) => {
             let path = Path::new(ws);
             if path.is_absolute() {
@@ -456,10 +456,19 @@ fn resolve_workspace_scope(
                 )));
             }
             let target = session_root.join(path);
-            confine(session_root, &target)
+            confine(session_root, &target)?
         }
-        None => Ok(session_root.to_path_buf()),
+        None => session_root.to_path_buf(),
+    };
+
+    if crate::workspace::walker::is_disallowed_workspace_root(&resolved) {
+        return Err(ToolError::Execution(format!(
+            "Refusing to operate on home or system directory '{}' as workspace",
+            resolved.display()
+        )));
     }
+
+    Ok(resolved)
 }
 
 pub fn call_tool(
