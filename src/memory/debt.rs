@@ -382,6 +382,14 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         }
     }
 
+    let pruned: Vec<String> = ledger
+        .debt_items
+        .iter()
+        .filter(|d| !d.is_accepted)
+        .map(|d| format!("- {} <- {} -> {}", d.what, d.why, d.trigger))
+        .filter(|l| !combined_lines.contains(l))
+        .collect();
+
     let total_before_ceiling = combined_lines.len();
     let ceiling_breached = total_before_ceiling > MAX_DEBT_CEILING;
     if ceiling_breached {
@@ -405,6 +413,17 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         format!(
             "DEBT_SYNC: in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
             in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
+        )
+    };
+
+    let output = if pruned.is_empty() {
+        output
+    } else {
+        format!(
+            "{} PRUNED {} ledger line(s) with no in-code marker and no `accepted` prefix: {}",
+            output,
+            pruned.len(),
+            pruned.join(" | ")
         )
     };
 

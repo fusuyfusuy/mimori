@@ -14,6 +14,53 @@ use std::sync::{mpsc, Arc, Mutex};
 enum IncomingRpc {
     Request(JsonRpcRequest),
     ParseError(String),
+    TooLarge,
+}
+
+/// Hard cap on one JSON-RPC line; larger frames are drained and rejected.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+enum LineRead {
+    Eof,
+    Line,
+    Oversized,
+}
+
+/// Reads one `\n`-terminated line into `buf`, never holding more than
+/// `MAX_LINE_BYTES`. An oversized line is drained to its newline and discarded.
+fn read_bounded_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<LineRead> {
+    buf.clear();
+    let mut oversized = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(match (oversized, buf.is_empty()) {
+                (true, _) => LineRead::Oversized,
+                (false, true) => LineRead::Eof,
+                (false, false) => LineRead::Line,
+            });
+        }
+        let (take, found_nl) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if !oversized {
+            if buf.len() + take > MAX_LINE_BYTES {
+                oversized = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        reader.consume(take);
+        if found_nl {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else {
+                LineRead::Line
+            });
+        }
+    }
 }
 
 pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
@@ -55,13 +102,20 @@ pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
     let cancelled_ids_reader = Arc::clone(&cancelled_ids);
 
     std::thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-
+        let mut stdin = io::stdin().lock();
+        let mut raw = Vec::new();
+        loop {
+            match read_bounded_line(&mut stdin, &mut raw) {
+                Ok(LineRead::Line) => {}
+                Ok(LineRead::Oversized) => {
+                    if tx.send(IncomingRpc::TooLarge).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(LineRead::Eof) | Err(_) => break,
+            }
+            let line = String::from_utf8_lossy(&raw);
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -101,6 +155,14 @@ pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
         match msg {
             IncomingRpc::ParseError(err_msg) => {
                 let resp = JsonRpcResponse::error(serde_json::Value::Null, -32700, err_msg);
+                send_response(&mut stdout, &resp)?;
+            }
+            IncomingRpc::TooLarge => {
+                let resp = JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    -32600,
+                    format!("Request exceeds {} byte limit", MAX_LINE_BYTES),
+                );
                 send_response(&mut stdout, &resp)?;
             }
             IncomingRpc::Request(req) => {

@@ -11,7 +11,7 @@ use std::path::Path;
 ///
 /// v9: polyglot workspace package discovery (Cargo.toml, go.mod), recognizing
 /// library crate imports as first-party code.
-pub const PARSER_VERSION: i64 = 9;
+pub const PARSER_VERSION: i64 = 10;
 
 pub struct Database {
     conn: Connection,

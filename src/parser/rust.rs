@@ -229,6 +229,8 @@ fn collect_references(
             if !tname.is_empty() && !mentions.iter().any(|m| m == tname) {
                 mentions.push(tname.to_string());
             }
+        } else if let Some((name, is_member)) = macro_token_call(child, content) {
+            push_call(calls, counts, member_calls, name, is_member);
         }
         collect_references(
             child,
@@ -240,6 +242,21 @@ fn collect_references(
             depth + 1,
         );
     }
+}
+
+/// Macro arguments (`format!("{}", self.f())`) parse as flat token trees, not
+/// `call_expression`s. An identifier directly followed by a `(...)` token tree
+/// is a call; a preceding `.` marks it a member call.
+fn macro_token_call<'a>(node: Node, content: &'a str) -> Option<(&'a str, bool)> {
+    if node.kind() != "identifier" || node.parent()?.kind() != "token_tree" {
+        return None;
+    }
+    let next = node.next_sibling()?;
+    if next.kind() != "token_tree" || !node_text(next, content).starts_with('(') {
+        return None;
+    }
+    let is_member = node.prev_sibling().is_some_and(|p| p.kind() == ".");
+    Some((node_text(node, content), is_member))
 }
 
 fn extract_signature(node: Node, content: &str, body: &str, kind: &SymbolKind) -> String {
