@@ -293,6 +293,26 @@ pub fn is_home_directory(path: &Path) -> bool {
 }
 
 pub fn is_system_directory(path: &Path) -> bool {
+    // Ephemeral / temporary directories are valid workspace roots (e.g. tests, CI).
+    let temp = std::env::temp_dir();
+    if path.starts_with(&temp) {
+        return false;
+    }
+    if let Ok(canon_temp) = temp.canonicalize() {
+        if path.starts_with(&canon_temp) {
+            return false;
+        }
+    }
+    if path.starts_with("/tmp")
+        || path.starts_with("/private/tmp")
+        || path.starts_with("/var/tmp")
+        || path.starts_with("/private/var/tmp")
+        || path.starts_with("/var/folders")
+        || path.starts_with("/private/var/folders")
+    {
+        return false;
+    }
+
     let system_prefixes = [
         "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/sys", "/proc", "/dev",
         "/boot", "/root",
