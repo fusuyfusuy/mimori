@@ -15,6 +15,9 @@ pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<S
     let mut symbols = Vec::new();
     let root = tree.root_node();
     walk_rust_node(root, content, file, None, &mut symbols, 0);
+    let mut import_aliases = std::collections::HashMap::new();
+    collect_local_use_aliases(root, content, &mut import_aliases, aliases, 0);
+    super::apply_import_aliases(&mut symbols, &import_aliases);
     let external_imports = collect_file_external_imports(root, content, aliases);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
@@ -297,6 +300,90 @@ fn collect_file_external_imports(root: Node, content: &str, aliases: &AliasSet) 
     let mut out = Vec::new();
     collect_uses(root, content, &mut out, aliases, 0);
     out
+}
+
+fn collect_local_use_aliases(
+    node: Node,
+    content: &str,
+    out: &mut std::collections::HashMap<String, (String, String)>,
+    aliases: &AliasSet,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
+    if node.kind() == "use_declaration" {
+        let mut text = node_text(node, content).trim();
+        if let Some(rest) = text.strip_prefix("pub") {
+            text = rest.trim();
+            if let Some(rest_paren) = text.strip_prefix('(') {
+                if let Some((_, after)) = rest_paren.split_once(')') {
+                    text = after.trim();
+                }
+            }
+        }
+        let tree = text
+            .strip_prefix("use")
+            .unwrap_or(text)
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        let tree_first = tree.split("::").next().unwrap_or(tree).trim();
+        if tree_first == "crate"
+            || tree_first == "self"
+            || tree_first == "super"
+            || aliases.matches(tree_first)
+        {
+            collect_use_tree_aliases(tree, "", out);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        collect_local_use_aliases(c, content, out, aliases, depth + 1);
+    }
+}
+
+fn collect_use_tree_aliases(
+    tree: &str,
+    prefix: &str,
+    out: &mut std::collections::HashMap<String, (String, String)>,
+) {
+    let tree = tree.trim();
+    if let Some((head, rest)) = tree.split_once('{') {
+        let head = head.trim().trim_end_matches("::");
+        let next_prefix = if prefix.is_empty() {
+            head.to_string()
+        } else if head.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}::{head}")
+        };
+        let rest = rest.trim_end_matches('}');
+        for part in split_top_level_comma(rest) {
+            collect_use_tree_aliases(part.trim(), &next_prefix, out);
+        }
+        return;
+    }
+    if let Some((orig_path, alias)) = tree.split_once(" as ") {
+        let alias = alias.trim();
+        let full_path = if prefix.is_empty() {
+            orig_path.trim().to_string()
+        } else {
+            format!("{prefix}::{}", orig_path.trim())
+        };
+        let mut segs: Vec<&str> = full_path
+            .split("::")
+            .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+            .collect();
+        if let Some(orig) = segs.pop() {
+            let orig = orig.trim();
+            if !orig.is_empty() && !alias.is_empty() && alias != "_" && orig != alias {
+                let hint = segs.join("/");
+                out.insert(alias.to_string(), (hint, orig.to_string()));
+            }
+        }
+    }
 }
 
 fn collect_uses(

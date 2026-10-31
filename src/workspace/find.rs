@@ -2,7 +2,7 @@ use crate::storage::get_or_sync_graph;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindMatch {
@@ -80,15 +80,46 @@ impl FindResult {
     }
 }
 
+fn normalize_scope(scope: Option<&str>) -> Option<String> {
+    let raw = scope?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = Path::new(raw)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn matches_scope(file: &str, norm_scope: Option<&str>) -> bool {
+    let Some(sc) = norm_scope else {
+        return true;
+    };
+    file == sc
+        || (file.len() > sc.len()
+            && file.starts_with(sc)
+            && file.as_bytes()[sc.len()] == b'/')
+}
+
 pub fn execute_find(
     root: &Path,
     query: &str,
     symbols_only: bool,
     files_only: bool,
+    scope: Option<&str>,
     limit: Option<usize>,
 ) -> Result<FindResult> {
     let graph = get_or_sync_graph(root)?;
     let q_lower = query.to_lowercase();
+    let norm_scope = normalize_scope(scope);
     let mut matches = Vec::new();
 
     if !symbols_only {
@@ -113,7 +144,9 @@ pub fn execute_find(
         for path in files_to_check {
             if !seen_files.contains(&path) {
                 seen_files.insert(path.clone());
-                if path.to_lowercase().contains(&q_lower) {
+                if matches_scope(&path, norm_scope.as_deref())
+                    && path.to_lowercase().contains(&q_lower)
+                {
                     matches.push(FindMatch {
                         name: Path::new(&path)
                             .file_name()
@@ -134,7 +167,9 @@ pub fn execute_find(
 
     if !files_only {
         for s in &graph.symbols {
-            if s.name.to_lowercase().contains(&q_lower) {
+            if matches_scope(&s.file, norm_scope.as_deref())
+                && s.name.to_lowercase().contains(&q_lower)
+            {
                 matches.push(FindMatch {
                     name: s.name.clone(),
                     kind: s.kind.as_str().to_string(),
@@ -155,6 +190,9 @@ pub fn execute_find(
         let scans = crate::workspace::walker::scan_workspace(root);
         for scan in scans {
             let rel = scan.rel.to_string_lossy();
+            if !matches_scope(&rel, norm_scope.as_deref()) {
+                continue;
+            }
             for (idx, line) in scan.content.lines().enumerate() {
                 if line.to_lowercase().contains(&q_lower) {
                     let line_no = idx + 1;

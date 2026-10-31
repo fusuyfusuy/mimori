@@ -11,7 +11,7 @@ use std::path::Path;
 ///
 /// v9: polyglot workspace package discovery (Cargo.toml, go.mod), recognizing
 /// library crate imports as first-party code.
-pub const PARSER_VERSION: i64 = 10;
+pub const PARSER_VERSION: i64 = 12;
 
 pub struct Database {
     conn: Connection,
@@ -70,7 +70,7 @@ impl Database {
             let _ = conn.execute(alter, []);
         }
 
-        let db = Database { conn };
+        let mut db = Database { conn };
         db.enforce_parser_version()?;
         db.init_alias_fingerprint()?;
         Ok(db)
@@ -78,15 +78,18 @@ impl Database {
 
     /// Discard everything cached by an older parser. Deleting from `files`
     /// cascades to `symbols`.
-    fn enforce_parser_version(&self) -> Result<()> {
+    fn enforce_parser_version(&mut self) -> Result<()> {
         let found: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
         if found != PARSER_VERSION {
-            self.conn.execute("DELETE FROM files", [])?;
-            self.conn
-                .execute_batch(&format!("PRAGMA user_version = {PARSER_VERSION};"))?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute("DELETE FROM files", [])?;
+            tx.execute_batch(&format!("PRAGMA user_version = {PARSER_VERSION};"))?;
+            tx.commit()?;
         }
 
         Ok(())
@@ -107,7 +110,7 @@ impl Database {
     }
 
     /// Drop the cached parse when the workspace's alias config changed.
-    pub fn enforce_alias_fingerprint(&self, fingerprint: &str) -> Result<()> {
+    pub fn enforce_alias_fingerprint(&mut self, fingerprint: &str) -> Result<()> {
         let stored: Option<String> = self
             .conn
             .query_row(
@@ -119,12 +122,16 @@ impl Database {
         if stored.as_deref() == Some(fingerprint) {
             return Ok(());
         }
-        self.conn.execute("DELETE FROM files", [])?;
-        self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM files", [])?;
+        tx.execute(
             "INSERT INTO meta (key, value) VALUES ('alias_fingerprint', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![fingerprint],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

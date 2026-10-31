@@ -261,55 +261,71 @@ pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     }
 }
 
+fn same_dir_or_canon(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(ca), Ok(cb)) if ca == cb
+        )
+}
+
 pub fn is_home_directory(path: &Path) -> bool {
     if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            let home_path = Path::new(&home);
-            if path == home_path {
-                return true;
-            }
-            if let (Ok(canon_path), Ok(canon_home)) = (path.canonicalize(), home_path.canonicalize()) {
-                if canon_path == canon_home {
-                    return true;
-                }
-            }
+        if !home.is_empty() && same_dir_or_canon(path, Path::new(&home)) {
+            return true;
         }
     }
     #[cfg(windows)]
-    if let Ok(userprofile) = std::env::var("USERPROFILE") {
-        if !userprofile.is_empty() {
-            let up_path = Path::new(&userprofile);
-            if path == up_path {
-                return true;
-            }
-            if let (Ok(canon_path), Ok(canon_up)) = (path.canonicalize(), up_path.canonicalize()) {
-                if canon_path == canon_up {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-pub fn is_system_directory(path: &Path) -> bool {
-    let system_prefixes = [
-        "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/sys", "/proc", "/dev",
-        "/boot", "/root",
-    ];
-    if path == Path::new("/") || path == Path::new("/home") {
-        return true;
-    }
-    for prefix in system_prefixes {
-        if path.starts_with(prefix) {
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        if !up.is_empty() && same_dir_or_canon(path, Path::new(&up)) {
             return true;
         }
     }
     false
 }
 
+pub fn is_system_directory(path: &Path) -> bool {
+    const EXACT_CONTAINERS: &[&str] = &[
+        "/",
+        "/home",
+        "/Users",
+        "/var",
+        "/tmp",
+        "/var/tmp",
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/private/var/tmp",
+    ];
+    const SYSTEM_PREFIXES: &[&str] = &[
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/sys",
+        "/proc",
+        "/dev",
+        "/boot",
+        "/root",
+        "/var/log",
+        "/var/lib",
+        "/var/run",
+        "/var/cache",
+        "/var/spool",
+        "/var/lock",
+        "/var/backups",
+        "/var/db",
+    ];
+    EXACT_CONTAINERS.iter().any(|&c| path == Path::new(c))
+        || SYSTEM_PREFIXES.iter().any(|&p| path.starts_with(p))
+}
+
 pub fn is_disallowed_workspace_root(path: &Path) -> bool {
-    is_system_directory(path) || is_home_directory(path)
+    is_system_directory(path)
+        || is_home_directory(path)
+        || same_dir_or_canon(path, &std::env::temp_dir())
 }
 
 

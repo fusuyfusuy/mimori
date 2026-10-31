@@ -1,4 +1,5 @@
 pub mod blast;
+pub mod diff;
 pub mod doctor;
 pub mod map;
 pub mod missing;
@@ -182,7 +183,14 @@ impl SymbolGraph {
                     .copied()
                     .unwrap_or(1);
                 let w = multiplicity_weight(count) * test_penalty;
-                let Some(candidates) = by_name.get(ref_name.as_str()) else {
+                let (mod_hint, lookup_name) = match ref_name
+                    .split_once(':')
+                    .filter(|_| !ref_name.contains("::"))
+                {
+                    Some((m, n)) => (Some(m), n),
+                    None => (None, ref_name.as_str()),
+                };
+                let Some(candidates) = by_name.get(lookup_name) else {
                     stats.unresolved += 1;
                     continue;
                 };
@@ -195,6 +203,47 @@ impl SymbolGraph {
                     .collect();
                 if callable.is_empty() {
                     stats.unresolved += 1;
+                    continue;
+                }
+
+                // Tier 0: module-qualified import alias (`<module_hint>:<exported_name>`).
+                // Skips same-file (`f != u_file`) so a local helper with the same name
+                // never shadows an explicitly aliased import (`import { x as y } from ...`).
+                if let Some(hint) = mod_hint {
+                    let foreign: Vec<usize> = callable
+                        .iter()
+                        .filter(|&&(f, _)| f != u_file)
+                        .map(|&(_, v)| v)
+                        .collect();
+                    let hinted: Vec<usize> = if hint.is_empty() {
+                        Vec::new()
+                    } else {
+                        foreign
+                            .iter()
+                            .copied()
+                            .filter(|&v| module_hint_matches(&symbols[v].file, hint))
+                            .collect()
+                    };
+                    let resolved_target = if hinted.len() == 1 {
+                        Some(hinted[0])
+                    } else if hinted.is_empty() && foreign.len() == 1 {
+                        Some(foreign[0])
+                    } else {
+                        None
+                    };
+                    if let Some(v_idx) = resolved_target {
+                        add_weighted_edge(
+                            u_idx,
+                            v_idx,
+                            w,
+                            &mut callers_map,
+                            &mut callees_map,
+                            &mut edge_weights,
+                        );
+                        stats.resolved += 1;
+                    } else {
+                        stats.ambiguous_dropped += 1;
+                    }
                     continue;
                 }
 
@@ -620,11 +669,7 @@ impl SymbolGraph {
 
         let target_idx = match self.resolve(coord) {
             Resolution::Unique(idx) => idx,
-            Resolution::NotFound => bail!(
-                "Symbol '{}' not found in workspace.\nTry: mimori find '{}'",
-                coord,
-                coord
-            ),
+            Resolution::NotFound => bail!("{}", self.format_not_found_error(coord)),
             Resolution::Ambiguous(indices) => {
                 let mut matches: Vec<&Symbol> = indices.iter().map(|&i| &self.symbols[i]).collect();
                 matches.sort_by(|a, b| {
@@ -703,6 +748,76 @@ impl SymbolGraph {
             imports,
         })
     }
+
+    pub fn format_not_found_error(&self, coord: &Coordinate) -> String {
+        let bare = coord.name().unwrap_or("");
+        let mut msg = format!("Symbol '{}' not found in workspace.", coord);
+        if let Some(target_file) = coord.file() {
+            let mut file_syms: Vec<&Symbol> = Vec::new();
+            for tier in [
+                |a: &Path, b: &Path| a == b,
+                component_suffix_match,
+                basename_match,
+            ] {
+                let hits: Vec<&Symbol> = self
+                    .symbols
+                    .iter()
+                    .filter(|s| tier(Path::new(&s.file), target_file))
+                    .collect();
+                if !hits.is_empty() {
+                    file_syms = hits;
+                    break;
+                }
+            }
+            if !file_syms.is_empty() {
+                let q = bare.to_lowercase();
+                file_syms.sort_by(|a, b| {
+                    let a_sub = a.name.to_lowercase().contains(&q)
+                        || q.contains(&a.name.to_lowercase());
+                    let b_sub = b.name.to_lowercase().contains(&q)
+                        || q.contains(&b.name.to_lowercase());
+                    b_sub.cmp(&a_sub).then_with(|| a.start_line.cmp(&b.start_line))
+                });
+                let matched_file = &file_syms[0].file;
+                msg.push_str(&format!("\nSymbols defined in '{}':", matched_file));
+                for s in file_syms.iter().take(10) {
+                    msg.push_str(&format!(
+                        "\n  - {} ({}, L{}-L{})",
+                        s.coordinate(),
+                        s.kind.as_str(),
+                        s.start_line,
+                        s.end_line
+                    ));
+                }
+            }
+        }
+        let find_arg = if bare.is_empty() {
+            coord.to_string()
+        } else {
+            bare.to_string()
+        };
+        msg.push_str(&format!("\nTry: mimori find '{}'", find_arg));
+        msg
+    }
+}
+
+fn module_hint_matches(sym_file: &str, hint: &str) -> bool {
+    let hint_clean = hint
+        .trim_start_matches("./")
+        .trim_start_matches("../")
+        .trim_matches('/');
+    if hint_clean.is_empty() {
+        return false;
+    }
+    let sym_no_ext = Path::new(sym_file).with_extension("");
+    let sym_stem_str = sym_no_ext.to_string_lossy();
+    let sym_trimmed = sym_stem_str
+        .strip_suffix("/index")
+        .or_else(|| sym_stem_str.strip_suffix("/mod"))
+        .unwrap_or(&sym_stem_str);
+    sym_trimmed == hint_clean
+        || component_suffix_match(Path::new(sym_trimmed), Path::new(hint_clean))
+        || component_suffix_match(Path::new(sym_file), Path::new(hint_clean))
 }
 
 /// How a coordinate resolved against the index.

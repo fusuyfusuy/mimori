@@ -24,6 +24,8 @@ pub fn parse_typescript(
     let mut symbols = Vec::new();
     let root = tree.root_node();
     walk_ts_node(root, content, file, None, &mut symbols, 0);
+    let import_aliases = collect_local_import_aliases(root, content, aliases);
+    super::apply_import_aliases(&mut symbols, &import_aliases);
     // File-level facts stamp every symbol identically; threading them
     // through the walker would churn a dozen call sites for no gain.
     let external_imports = collect_external_imports(root, content, aliases);
@@ -239,11 +241,27 @@ fn extract_ctor_param_fields(
     }
 }
 
+fn is_exported_ts_node(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "export_statement"
+        || (parent.kind() == "lexical_declaration"
+            && parent
+                .parent()
+                .is_some_and(|gp| gp.kind() == "export_statement"))
+}
+
 fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: SymbolKind) -> Symbol {
     let start_pos = node.start_position();
     let end_pos = node.end_position();
     let body = node_text(node, content).to_string();
-    let signature = extract_signature(&body, &kind);
+    let raw_sig = extract_signature(&body, &kind);
+    let signature = if is_exported_ts_node(node) && !raw_sig.starts_with("export ") {
+        format!("export {raw_sig}")
+    } else {
+        raw_sig
+    };
 
     let mut calls = Vec::new();
     let mut mentions = Vec::new();
@@ -511,6 +529,60 @@ fn collect_external_imports(root: Node, content: &str, aliases: &AliasSet) -> Ve
         }
     }
     out
+}
+
+fn collect_local_import_aliases(
+    root: Node,
+    content: &str,
+    aliases: &AliasSet,
+) -> std::collections::HashMap<String, (String, String)> {
+    let mut out = std::collections::HashMap::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "import_statement" {
+            continue;
+        }
+        let Some(source) = child.child_by_field_name("source") else {
+            continue;
+        };
+        let spec = node_text(source, content).trim_matches(['\'', '"', ' ']);
+        let is_local = spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec);
+        if !is_local {
+            continue;
+        }
+        let hint = super::spec_to_module_hint(spec);
+        collect_aliased_specifiers(child, content, &hint, &mut out, 0);
+    }
+    out
+}
+
+fn collect_aliased_specifiers(
+    node: Node,
+    content: &str,
+    hint: &str,
+    out: &mut std::collections::HashMap<String, (String, String)>,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
+    if node.kind() == "import_specifier" {
+        if let (Some(orig_node), Some(alias_node)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("alias"),
+        ) {
+            let orig = node_text(orig_node, content).trim();
+            let alias = node_text(alias_node, content).trim();
+            if !orig.is_empty() && !alias.is_empty() && orig != alias {
+                out.insert(alias.to_string(), (hint.to_string(), orig.to_string()));
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        collect_aliased_specifiers(c, content, hint, out, depth + 1);
+    }
 }
 
 fn collect_import_binding(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {

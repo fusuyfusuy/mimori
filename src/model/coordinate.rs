@@ -61,14 +61,15 @@ impl Coordinate {
 
         if let Some(idx) = split_idx {
             let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
+            if !head.contains('#') && looks_like_path(head) {
+                return parse_path_tail(raw, head, tail);
+            }
+        }
+
+        if let Some(idx) = raw.find('#') {
+            let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
             if looks_like_path(head) {
-                if tail.is_empty() {
-                    bail!("Coordinate '{}' names a file but no symbol.", raw);
-                }
-                return Ok(Coordinate::Symbol {
-                    file: PathBuf::from(head),
-                    name: tail.to_string(),
-                });
+                return parse_path_tail(raw, head, tail);
             }
         }
 
@@ -129,12 +130,37 @@ impl fmt::Display for Coordinate {
     }
 }
 
+fn parse_path_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
+    if tail.is_empty() {
+        bail!("Coordinate '{}' names a file but no symbol.", raw);
+    }
+    if let Some(rest) = tail.strip_prefix('L') {
+        if rest.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            if let Ok((start, end)) = parse_line_range(rest) {
+                return Ok(Coordinate::Lines {
+                    file: PathBuf::from(head),
+                    start,
+                    end,
+                });
+            }
+        }
+    }
+    Ok(Coordinate::Symbol {
+        file: PathBuf::from(head),
+        name: tail.to_string(),
+    })
+}
+
 fn parse_line_range(range: &str) -> Result<(usize, usize)> {
     match range.split_once('-') {
-        Some((s, e)) => Ok((
-            s.trim().parse().context("Invalid start line")?,
-            e.trim().parse().context("Invalid end line")?,
-        )),
+        Some((s, e)) => {
+            let e = e.trim();
+            let e = e.strip_prefix(['L', 'l']).unwrap_or(e);
+            Ok((
+                s.trim().parse().context("Invalid start line")?,
+                e.trim().parse().context("Invalid end line")?,
+            ))
+        }
         None => {
             let n: usize = range.trim().parse().context("Invalid line number")?;
             Ok((n, n))

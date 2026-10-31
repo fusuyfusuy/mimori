@@ -25,6 +25,8 @@ pub struct BlastNode {
     /// further, never an entry point.
     #[serde(default)]
     pub is_value_use: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_lines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,8 @@ pub struct BlastResult {
     /// `affected` is excluded here.
     #[serde(default)]
     pub value_uses: Vec<BlastNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub literal_test_mentions: Vec<String>,
 }
 
 fn default_blast_direction() -> String {
@@ -108,9 +112,16 @@ impl BlastResult {
                 } else {
                     ""
                 };
+                let call_at = if node.call_lines.is_empty() {
+                    String::new()
+                } else {
+                    let formatted: Vec<String> =
+                        node.call_lines.iter().map(|l| format!("L{l}")).collect();
+                    format!(" [calls @ {}]", formatted.join(", "))
+                };
                 out.push_str(&format!(
-                    "{}- (d={}) **`{}`** ({}) → `{}`{}\n",
-                    indent, node.depth, node.name, node.kind, node.coordinate, tag
+                    "{}- (d={}) **`{}`** ({}) → `{}`{}{}\n",
+                    indent, node.depth, node.name, node.kind, node.coordinate, call_at, tag
                 ));
             }
         }
@@ -123,6 +134,14 @@ impl BlastResult {
                     "- **`{}`** ({}) → `{}` [Value Use]\n",
                     node.name, node.kind, node.coordinate
                 ));
+            }
+            out.push('\n');
+        }
+
+        if !self.literal_test_mentions.is_empty() {
+            out.push_str("### 🔍 Literal / Source-Inspection Test Mentions\n");
+            for m in &self.literal_test_mentions {
+                out.push_str(&format!("- 🔍 `{}`\n", m));
             }
             out.push('\n');
         }
@@ -172,8 +191,16 @@ fn traverse(
         Traversal::Downstream => graph.resolve_all(coord),
     };
     if indices.is_empty() {
-        bail!("Target symbol '{}' not found in workspace.", coord);
+        bail!("Target {}", graph.format_not_found_error(coord));
     }
+
+    let seed_short_names: Vec<&str> = indices
+        .iter()
+        .map(|&i| {
+            let name = graph.symbols[i].name.as_str();
+            name.rsplit([':', '.']).next().unwrap_or(name)
+        })
+        .collect();
 
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
@@ -217,6 +244,12 @@ fn traverse(
                         test_suites.push(sym.file.clone());
                     }
 
+                    let call_lines = if direction == Traversal::Upstream && next_depth == 1 {
+                        find_call_site_lines(sym, &seed_short_names)
+                    } else {
+                        Vec::new()
+                    };
+
                     affected.push(BlastNode {
                         name: sym.name.clone(),
                         kind: sym.kind.as_str().to_string(),
@@ -227,6 +260,7 @@ fn traverse(
                         is_test,
                         is_sink,
                         is_value_use: false,
+                        call_lines,
                     });
 
                     queue.push_back((next_idx, next_depth));
@@ -239,6 +273,7 @@ fn traverse(
     // Never traversed, never entry points; anything the call closure
     // already reached stays a call row (call wins).
     let mut value_uses = Vec::new();
+    let mut literal_test_mentions = Vec::new();
     if direction == Traversal::Upstream {
         for &seed in &indices {
             for m_idx in graph.mentioner_indices(seed) {
@@ -263,9 +298,12 @@ fn traverse(
                     is_test: is_test_symbol(sym),
                     is_sink: false,
                     is_value_use: true,
+                    call_lines: Vec::new(),
                 });
             }
         }
+        literal_test_mentions =
+            collect_literal_test_mentions(graph, &visited, &seed_short_names);
     }
 
     Ok(BlastResult {
@@ -279,7 +317,98 @@ fn traverse(
             Traversal::Downstream => "down".to_string(),
         },
         value_uses,
+        literal_test_mentions,
     })
+}
+
+fn find_call_site_lines(caller: &Symbol, target_names: &[&str]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = caller.body.lines().collect();
+    let skip_first = usize::from(lines.len() > 1);
+    for (idx, line) in lines.iter().enumerate().skip(skip_first) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("/*")
+        {
+            continue;
+        }
+        if target_names.iter().any(|&t| has_call_token(trimmed, t)) {
+            out.push(caller.start_line + idx);
+        }
+    }
+    out
+}
+
+fn has_call_token(line: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(ident) {
+        let abs = start + pos;
+        let end = abs + ident.len();
+        let prev_ok = abs == 0
+            || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
+        let rest = line[end..].trim_start();
+        let next_ok = rest.starts_with('(')
+            || rest.starts_with('!')
+            || rest.starts_with("::<")
+            || rest.starts_with('<');
+        if prev_ok && next_ok {
+            return true;
+        }
+        start = abs + ident.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn has_ident_token(line: &str, ident: &str) -> bool {
+    if ident.len() < 3 {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(ident) {
+        let abs = start + pos;
+        let end = abs + ident.len();
+        let prev_ok = abs == 0
+            || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
+        let next_ok = end == bytes.len()
+            || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+        if prev_ok && next_ok {
+            return true;
+        }
+        start = abs + ident.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn collect_literal_test_mentions(
+    graph: &SymbolGraph,
+    visited: &HashSet<usize>,
+    seed_names: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, sym) in graph.symbols.iter().enumerate() {
+        if visited.contains(&idx) || !is_test_symbol(sym) {
+            continue;
+        }
+        for (line_idx, line) in sym.body.lines().enumerate() {
+            if seed_names.iter().any(|&t| has_ident_token(line, t)) {
+                let hit = format!("{}:#L{}", sym.file, sym.start_line + line_idx);
+                if !out.contains(&hit) {
+                    out.push(hit);
+                    if out.len() >= 20 {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// An entry point is a symbol nothing else calls -- which is what the graph
@@ -291,6 +420,9 @@ fn traverse(
 pub(crate) fn is_entry_point(graph: &SymbolGraph, idx: usize, sym: &Symbol) -> bool {
     if is_program_entry(sym) {
         return true;
+    }
+    if is_test_symbol(sym) {
+        return false;
     }
     let has_no_callers = graph
         .callers_map

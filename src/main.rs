@@ -95,6 +95,7 @@ fn main() -> ExitCode {
                 &args.pattern,
                 args.symbols_only,
                 args.files_only,
+                args.scope.as_deref(),
                 args.limit,
             ) {
                 Ok(r) => r,
@@ -331,6 +332,48 @@ fn main() -> ExitCode {
                 }
             } else {
                 print!("{}", map_result.to_markdown());
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Diff(args) => {
+            let root = find_workspace_root(None, &current_dir);
+            if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
+                eprintln!(
+                    "Error: Cannot access home or system directory '{}' as workspace",
+                    root.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            let graph = match get_or_sync_graph(&root) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("Error syncing workspace: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let report = match mimori::graph::diff::calculate_diff_blast(
+                &root,
+                &graph,
+                args.staged,
+                args.base.as_deref(),
+                args.depth,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if cli.json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(json) => println!("{}", json),
+                    Err(e) => {
+                        eprintln!("Error serializing JSON: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                print!("{}", report.to_markdown());
             }
             ExitCode::SUCCESS
         }

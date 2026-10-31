@@ -226,10 +226,13 @@ impl MemoryLedger {
     }
 
     pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         fs::write(&tmp_path, content)
             .with_context(|| format!("write temporary memory file {}", tmp_path.display()))?;
         fs::rename(&tmp_path, path)

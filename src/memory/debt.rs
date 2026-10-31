@@ -382,6 +382,12 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         }
     }
 
+    let total_before_ceiling = combined_lines.len();
+    let ceiling_breached = total_before_ceiling > MAX_DEBT_CEILING;
+    if ceiling_breached {
+        combined_lines.truncate(MAX_DEBT_CEILING);
+    }
+
     let pruned: Vec<String> = ledger
         .debt_items
         .iter()
@@ -389,12 +395,6 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         .map(|d| format!("- {} <- {} -> {}", d.what, d.why, d.trigger))
         .filter(|l| !combined_lines.contains(l))
         .collect();
-
-    let total_before_ceiling = combined_lines.len();
-    let ceiling_breached = total_before_ceiling > MAX_DEBT_CEILING;
-    if ceiling_breached {
-        combined_lines.truncate(MAX_DEBT_CEILING);
-    }
 
     let raw = fs::read_to_string(MemoryLedger::memory_path(root))?;
     let updated_raw = replace_debt_section(&raw, &combined_lines);

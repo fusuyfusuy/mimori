@@ -225,6 +225,10 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                         "type": "boolean",
                         "description": "Restrict search strictly to file paths"
                     },
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional directory or file path prefix filter"
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of matches to return (default: 50)"
@@ -344,6 +348,31 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                 "required": ["action"]
             }
         }),
+        json!({
+            "name": "mimori_diff",
+            "description": "Inspect git diff hunk spans intersected with AST symbols: mutated symbols, combined upstream blast cone, affected test suites, and debt/memory gate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "staged": {
+                        "type": "boolean",
+                        "description": "Inspect staged changes (--staged) instead of working tree"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional base git revision to diff against (e.g. HEAD~1 or main)"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Maximum traversal depth for upstream callers (default 3)"
+                    },
+                    "workspace_dir": {
+                        "type": "string",
+                        "description": "Optional workspace directory relative to session root"
+                    }
+                }
+            }
+        }),
     ]
 }
 
@@ -394,7 +423,21 @@ struct FindToolArgs {
     #[serde(default)]
     files_only: Option<bool>,
     #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    workspace_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DiffToolArgs {
+    #[serde(default)]
+    staged: Option<bool>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    depth: Option<usize>,
     #[serde(default)]
     workspace_dir: Option<String>,
 }
@@ -553,10 +596,29 @@ pub fn call_tool(
                 &args.pattern,
                 args.symbols_only.unwrap_or(false),
                 args.files_only.unwrap_or(false),
+                args.scope.as_deref(),
                 limit,
             )
             .map_err(|e| ToolError::Execution(e.to_string()))?;
             Ok(res.to_markdown())
+        }
+        "mimori_diff" => {
+            let args: DiffToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("Invalid arguments for 'mimori_diff': {}", e))
+            })?;
+            let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let graph = cache
+                .get_graph(&scope_dir)
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            let report = crate::graph::diff::calculate_diff_blast(
+                &scope_dir,
+                &graph,
+                args.staged.unwrap_or(false),
+                args.base.as_deref(),
+                args.depth.unwrap_or(3),
+            )
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+            Ok(report.to_markdown())
         }
         "mimori_blast" => {
             let args: BlastToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {

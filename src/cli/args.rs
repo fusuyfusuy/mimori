@@ -42,6 +42,9 @@ pub enum Commands {
     #[command(about = "Evaluate transitive blast radius of a symbol across entry points")]
     Blast(BlastArgs),
 
+    #[command(about = "Compute mutated symbols, combined blast radius, and test impact for git diff")]
+    Diff(DiffArgs),
+
     #[command(about = "Generate hierarchical, centrality-ranked architectural map")]
     Map(MapArgs),
 
@@ -105,8 +108,28 @@ pub struct FindArgs {
     #[arg(short = 'f', long, visible_alias = "files", help = "Files only")]
     pub files_only: bool,
 
+    #[arg(long, help = "Restrict search to files within this directory or file prefix")]
+    pub scope: Option<String>,
+
     #[arg(short, long, help = "Maximum number of results to display")]
     pub limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub struct DiffArgs {
+    #[arg(long, help = "Inspect staged changes (--staged) instead of working tree")]
+    pub staged: bool,
+
+    #[arg(long, help = "Optional base git revision to diff against (e.g. HEAD~1 or main)")]
+    pub base: Option<String>,
+
+    #[arg(
+        short,
+        long,
+        default_value_t = 3,
+        help = "Maximum traversal depth for upstream callers"
+    )]
+    pub depth: usize,
 }
 
 #[derive(Args, Debug)]

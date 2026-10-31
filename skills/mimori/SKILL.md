@@ -12,7 +12,7 @@ description: >
 KERNEL:
   TARGET: Autonomous Agent Execution & Code Intelligence Substrate
   BINARY: ~/.cargo/bin/mimori (CLI) | mimori mcp (JSON-RPC stdio)
-  VERSION: 2.4.9
+  VERSION: 3.0.0
   INVARIANTS:
     1_HASH:       Content-Hash Governed (FNV-1a) — mtime purely untrusted
     2_PURITY:     Deterministic & Non-Interactive — zero background daemons
@@ -26,12 +26,13 @@ KERNEL:
 mimori init    [--force]
 mimori map     [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
 mimori slice   <coordinate> [-f|--follow-local] [-i|--with-imports] [-n|--numbered] [--budget <N>] [--json]
-mimori find    <pattern> [-s|--symbols-only] [-f|--files-only] [--limit <N>] [--json]
+mimori find    <pattern> [-s|--symbols-only] [-f|--files-only] [--scope <dir>] [--limit <N>] [--json]
 mimori up      <target> [--json]
 mimori down    <target> [--json]
 mimori uses    <target> [--json]
 mimori missing <pattern> [--scope <dir>] [--defines <lit>] [--json]
 mimori blast   <target> [-d|--depth <N>] [--down] [--with-sinks <a,b,c>] [--json]
+mimori diff    [--staged] [--base <rev>] [-d|--depth <N>] [--json]
 mimori doctor  [--limit <N>] [--json]
 mimori memory  [show|lint|resolve] [--section <sec>] [--budget <N>] [--json]
 mimori debt    [list|check|sync] [--scope <dir>] [--json]
@@ -93,10 +94,10 @@ mimori slice <coordinate> [-f] [-i] [-n] [--budget <N>] [--json]
 
 ### `find` — Hybrid Symbol/File Search
 ```shell
-mimori find <pattern> [-s] [-f] [--limit <N>] [--json]
+mimori find <pattern> [-s] [-f] [--scope <dir>] [--limit <N>] [--json]
 ```
 - Orders matches by exact match and in-degree PageRank.
-- `-s`: Symbols only; `-f`: Files only.
+- `-s`: Symbols only; `-f`: Files only; `--scope <dir>`: Filter to directory or file prefix.
 - Fallback: Scans indexed file content when zero symbols/files match (count equals `rg -c`).
 
 ### `up` / `down` / `uses` — Graph Traversal
@@ -118,9 +119,15 @@ mimori missing <pattern> [--scope <dir>] [--defines <marker>] [--json]
 ```shell
 mimori blast <target> [-d <N>] [--down] [--with-sinks <sinks>] [--json]
 ```
-- Upstream reachability closure up to depth N.
+- Upstream reachability closure up to depth N (includes `d=1` call-site line numbers `[calls @ L...]` and literal test mentions).
 - `--down`: Downstream dependency cone (delete-safety check).
 - `--with-sinks <a,b,c>`: Appends parallel literal hits for unindexed sinks (e.g. `console.,logPath`).
+
+### `diff` — Git Diff Blast & Test Impact
+```shell
+mimori diff [--staged] [--base <rev>] [-d <N>] [--json]
+```
+- Intersects `git diff -U0` hunk spans with indexed symbol spans, reporting mutated symbols, combined upstream blast cone, affected test suites, and memory/debt gate status.
 
 ### `doctor` — Repository Health
 ```shell
@@ -164,9 +171,9 @@ mimori clean [--all]    # Purge .mimori/index.db cache (Safe: .agents/ never tou
 
 ```text
 COORDINATES:
-  path/to/file.rs:symbol           # Specific symbol in file
+  path/to/file.rs:symbol           # Specific symbol in file (also accepts path/to/file.rs#symbol)
   path/to/file.ts:Class::method    # Member method in class
-  path/to/file.rs:#L20-45          # Line range (zero-index disk read)
+  path/to/file.rs:#L20-45          # Line range (also accepts #L20-L45 or :L20-45)
   symbol                           # Bare name (global workspace resolution)
 
 RESOLUTION_ORDER:
@@ -190,8 +197,9 @@ Run stdio daemon: `mimori mcp [--workspace <dir>]`
 | `mimori_dump` | `mimori dump` | `budget`, `focus`, `workspace_dir` |
 | `mimori_slice` | `mimori slice` | `coordinate`, `follow_local`, `with_imports`, `numbered`, `budget` |
 | `mimori_map` | `mimori map` | `scope`, `focus`, `seed`, `limit` |
-| `mimori_find` | `mimori find` | `pattern`, `symbols_only`, `files_only`, `limit` |
+| `mimori_find` | `mimori find` | `pattern`, `scope`, `symbols_only`, `files_only`, `limit` |
 | `mimori_blast` | `mimori blast` | `target`, `depth`, `down`, `with_sinks` |
+| `mimori_diff` | `mimori diff` | `staged`, `base`, `depth`, `workspace_dir` |
 | `mimori_graph` | `mimori up/down/uses` | `target`, `direction` (`"up"`, `"down"`, `"uses"`) |
 | `mimori_memory`| `mimori memory` | `action` (`"show"`, `"lint"`, `"resolve"`), `section`, `target`, `budget` |
 | `mimori_debt` | `mimori debt` | `action` (`"list"`, `"check"`, `"sync"`), `scope` |

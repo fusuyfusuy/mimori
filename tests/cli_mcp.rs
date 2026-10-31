@@ -102,7 +102,7 @@ fn test_mcp_tools_list() {
     let resp = client.recv();
     assert_eq!(resp["id"], 1);
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -116,6 +116,7 @@ fn test_mcp_tools_list() {
             "mimori_graph",
             "mimori_memory",
             "mimori_debt",
+            "mimori_diff",
         ]
     );
 

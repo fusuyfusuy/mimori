@@ -14,6 +14,9 @@ pub fn parse_python(file: &str, content: &str) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
     let root = tree.root_node();
     walk_python_node(root, content, file, None, &mut symbols, None, 0);
+    let mut import_aliases = std::collections::HashMap::new();
+    collect_py_local_aliases(root, content, &mut import_aliases, 0);
+    super::apply_import_aliases(&mut symbols, &import_aliases);
     let external_imports = collect_file_external_imports(root, content);
     for s in &mut symbols {
         s.external_imports = external_imports.clone();
@@ -308,6 +311,44 @@ fn collect_file_external_imports(root: Node, content: &str) -> Vec<String> {
     let mut out = Vec::new();
     collect_py_imports(root, content, &mut out, 0);
     out
+}
+
+fn collect_py_local_aliases(
+    node: Node,
+    content: &str,
+    out: &mut std::collections::HashMap<String, (String, String)>,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
+    if node.kind() == "import_from_statement" {
+        let text = node_text(node, content);
+        let after_from = text.strip_prefix("from").unwrap_or(text).trim();
+        if let Some((module, names)) = after_from.split_once(" import ") {
+            let module = module.trim();
+            let top_segment = module.trim_start_matches('.').split('.').next().unwrap_or("").trim();
+            let is_local = module.starts_with('.') || !PYTHON_STDLIB.contains(&top_segment);
+            if is_local {
+                let hint = module.trim_start_matches('.').replace('.', "/");
+                for part in names.split(',') {
+                    let part = part.trim().trim_matches(['(', ')', ' ']);
+                    if let Some((orig, alias)) = part.split_once(" as ") {
+                        let orig = orig.trim();
+                        let alias = alias.trim();
+                        if !orig.is_empty() && !alias.is_empty() && orig != alias {
+                            out.insert(alias.to_string(), (hint.clone(), orig.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        collect_py_local_aliases(c, content, out, depth + 1);
+    }
 }
 
 const PYTHON_STDLIB: &[&str] = &[
