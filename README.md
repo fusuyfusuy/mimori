@@ -3,7 +3,7 @@
 > **Fast, local AST code intelligence, blast-radius analysis, and project memory in Rust.**
 
 [![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)]()
-[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **Status**: `mimori` is an experimental tool in active daily use across our repositories and agent harnesses. It evolves directly from real-world usage—when an agent hits a blind spot or a rough edge in production, we fix the parser or graph engine and ship it.

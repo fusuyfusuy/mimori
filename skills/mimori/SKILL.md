@@ -12,7 +12,7 @@ description: >
 KERNEL:
   TARGET: Autonomous Agent Execution & Code Intelligence Substrate
   BINARY: ~/.cargo/bin/mimori (CLI) | mimori mcp (JSON-RPC stdio)
-  VERSION: 3.0.0
+  VERSION: 3.1.0
   INVARIANTS:
     1_HASH:       Content-Hash Governed (FNV-1a) — mtime purely untrusted
     2_PURITY:     Deterministic & Non-Interactive — zero background daemons
