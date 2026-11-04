@@ -19,75 +19,56 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Slice(args) => {
-            let coord = match Coordinate::parse(&args.target) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    return ExitCode::FAILURE;
-                }
-            };
+            let mut cached_graph: Option<(std::path::PathBuf, SymbolGraph)> = None;
+            let mut slices = Vec::with_capacity(args.targets.len());
 
-            // A line range is read straight off disk; it needs no index.
-            let built = if let Coordinate::Lines { file, start, end } = &coord {
-                let root = find_workspace_root(coord.absolute_parent().as_deref(), &current_dir);
-                if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
-                    eprintln!(
-                        "Error: Cannot access home or system directory '{}' as workspace",
-                        root.display()
-                    );
-                    return ExitCode::FAILURE;
-                }
-                let full = if file.is_absolute() {
-                    file.to_path_buf()
-                } else {
-                    current_dir.join(file)
-                };
-                let target_path =
-                    match mimori::workspace::walker::confine_to_workspace(&root, &full) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            return ExitCode::FAILURE;
-                        }
-                    };
-                slice_line_coordinate(&target_path, *start, *end, args.with_imports)
-            } else {
-                match prepare(coord, &current_dir) {
-                    Ok((graph, coord)) => {
-                        graph.build_slice(&coord, args.follow_local, args.with_imports)
-                    }
+            for raw_target in &args.targets {
+                match build_cli_slice(
+                    raw_target,
+                    &current_dir,
+                    args.follow_local,
+                    args.with_imports,
+                    &mut cached_graph,
+                ) {
+                    Ok(s) => slices.push(s),
                     Err(e) => {
-                        eprintln!("Error syncing workspace: {}", e);
+                        eprintln!("Error: {}", e);
                         return ExitCode::FAILURE;
                     }
                 }
-            };
-
-            match built {
-                Ok(slice) => {
-                    if cli.json {
-                        if args.budget.is_some() {
-                            eprintln!("Warning: --budget only affects markdown output; ignoring for --json.");
-                        }
-                        match serde_json::to_string_pretty(&slice) {
-                            Ok(json) => println!("{}", json),
-                            Err(e) => {
-                                eprintln!("Error serializing JSON: {}", e);
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    } else if let Some(budget) = args.budget {
-                        print!("{}", slice.render_markdown_budgeted(budget, args.numbered));
-                    } else {
-                        print!("{}", slice.render_markdown(args.numbered));
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    ExitCode::FAILURE
-                }
             }
+
+            if cli.json {
+                if args.budget.is_some() {
+                    eprintln!(
+                        "Warning: --budget only affects markdown output; ignoring for --json."
+                    );
+                }
+                let out = if slices.len() == 1 {
+                    serde_json::to_string_pretty(&slices[0])
+                } else {
+                    serde_json::to_string_pretty(&slices)
+                };
+                match out {
+                    Ok(json) => println!("{}", json),
+                    Err(e) => {
+                        eprintln!("Error serializing JSON: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                let n = slices.len().max(1);
+                let per_budget = args.budget.map(|b| b / n);
+                let rendered: Vec<String> = slices
+                    .iter()
+                    .map(|s| match per_budget {
+                        Some(b) => s.render_markdown_budgeted(b, args.numbered),
+                        None => s.render_markdown(args.numbered),
+                    })
+                    .collect();
+                print!("{}", rendered.join("\n---\n"));
+            }
+            ExitCode::SUCCESS
         }
         Commands::Find(args) => {
             let res = match mimori::workspace::execute_find(
@@ -378,77 +359,80 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Blast(args) => {
-            let (graph, coord) = match parse_and_prepare(&args.target, &current_dir) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    return ExitCode::FAILURE;
-                }
-            };
+            let mut cached_graph: Option<(std::path::PathBuf, SymbolGraph)> = None;
+            let sinks = parse_sink_list(args.with_sinks.as_deref());
+            let mut json_items = Vec::with_capacity(args.targets.len());
+            let mut md_blocks = Vec::with_capacity(args.targets.len());
 
-            let blast_res = if args.down {
-                mimori::graph::blast::calculate_downstream_blast(&graph, &coord, args.depth)
-            } else {
-                mimori::graph::blast::calculate_blast_radius(&graph, &coord, args.depth)
-            };
-            match blast_res {
-                Ok(blast_res) => {
-                    let sinks = parse_sink_list(args.with_sinks.as_deref());
-                    // P3: literal sweep runs against the same indexed files so
-                    // one call covers both graph reachability and literal sinks.
-                    let sink_hits: Vec<String> = if sinks.is_empty() {
-                        Vec::new()
-                    } else {
-                        let root =
-                            find_workspace_root(coord.absolute_parent().as_deref(), &current_dir);
-                        sweep_literal_sinks(&root, &graph, &sinks)
+            for raw_target in &args.targets {
+                let (root, graph, coord) =
+                    match prepare_cached(raw_target, &current_dir, &mut cached_graph) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            return ExitCode::FAILURE;
+                        }
                     };
-                    if cli.json {
-                        match serde_json::to_value(&blast_res) {
-                            Ok(mut v) => {
-                                if !sinks.is_empty() {
-                                    v["sinks"] = json!(sinks);
-                                    v["sink_hits"] = json!(sink_hits);
-                                }
-                                match serde_json::to_string_pretty(&v) {
-                                    Ok(json) => println!("{}", json),
-                                    Err(e) => {
-                                        eprintln!("Error serializing JSON: {}", e);
-                                        return ExitCode::FAILURE;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error serializing JSON: {}", e);
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    } else {
-                        print!("{}", blast_res.to_markdown());
-                        if blast_res.affected.is_empty()
-                            && blast_res.value_uses.is_empty()
-                            && !args.down
-                        {
-                            // P2: same zero-caller detour as `up`.
-                            if let Some(hint) = zero_caller_hint(&graph, &coord) {
-                                println!("{}", hint);
-                            }
-                        }
-                        if !sinks.is_empty() {
-                            print_sink_hits(&sinks, &sink_hits);
-                        } else {
-                            // P3 recipe: keep the graph-vs-literals boundary but
-                            // always leave the next command pastable.
-                            println!("\nTip: blast follows call edges plus labeled value-use rows — raw literals (console.*, logPath, send*Notifications, getDetailedMessage) need a sweep: `mimori blast <target> --with-sinks console.,logPath,sendNotification,getDetailedMessage` or `rg -n \"console\\.|logPath|send.*Notif|getDetailedMessage\"`.");
-                        }
+                let blast_res = if args.down {
+                    mimori::graph::blast::calculate_downstream_blast(graph, &coord, args.depth)
+                } else {
+                    mimori::graph::blast::calculate_blast_radius(graph, &coord, args.depth)
+                };
+                let blast_res = match blast_res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return ExitCode::FAILURE;
                     }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    ExitCode::FAILURE
+                };
+                let sink_hits: Vec<String> = if sinks.is_empty() {
+                    Vec::new()
+                } else {
+                    sweep_literal_sinks(&root, graph, &sinks)
+                };
+
+                if cli.json {
+                    let mut v = match serde_json::to_value(&blast_res) {
+                        Ok(val) => val,
+                        Err(e) => {
+                            eprintln!("Error serializing JSON: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !sinks.is_empty() {
+                        v["sinks"] = json!(sinks);
+                        v["sink_hits"] = json!(sink_hits);
+                    }
+                    json_items.push(v);
+                } else {
+                    md_blocks.push(render_cli_blast_markdown(
+                        &blast_res,
+                        graph,
+                        &coord,
+                        args.down,
+                        &sinks,
+                        &sink_hits,
+                    ));
                 }
             }
+
+            if cli.json {
+                let out = if json_items.len() == 1 {
+                    serde_json::to_string_pretty(&json_items[0])
+                } else {
+                    serde_json::to_string_pretty(&json_items)
+                };
+                match out {
+                    Ok(j) => println!("{}", j),
+                    Err(e) => {
+                        eprintln!("Error serializing JSON: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                print!("{}", md_blocks.join("\n---\n"));
+            }
+            ExitCode::SUCCESS
         }
         Commands::Doctor(args) => {
             let root = find_workspace_root(None, &current_dir);
@@ -852,7 +836,7 @@ fn parse_and_prepare(raw: &str, cwd: &Path) -> Result<(SymbolGraph, Coordinate)>
     prepare(Coordinate::parse(raw)?, cwd)
 }
 
-fn prepare(coord: Coordinate, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
+fn validate_coord_workspace(coord: &Coordinate, cwd: &Path) -> Result<std::path::PathBuf> {
     let root = find_workspace_root(coord.absolute_parent().as_deref(), cwd);
     if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
         bail!(
@@ -871,8 +855,81 @@ fn prepare(coord: Coordinate, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
             mimori::workspace::walker::confine_to_workspace(&root, &full)?;
         }
     }
+    Ok(root)
+}
+
+fn prepare(coord: Coordinate, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
+    let root = validate_coord_workspace(&coord, cwd)?;
     let graph = get_or_sync_graph(&root)?;
     Ok((graph, coord.normalize_against(&root)))
+}
+
+fn prepare_cached<'a>(
+    raw: &str,
+    cwd: &Path,
+    cache: &'a mut Option<(std::path::PathBuf, SymbolGraph)>,
+) -> Result<(std::path::PathBuf, &'a SymbolGraph, Coordinate)> {
+    let coord = Coordinate::parse(raw)?;
+    let root = validate_coord_workspace(&coord, cwd)?;
+    let need_load = cache.as_ref().map(|(r, _)| r != &root).unwrap_or(true);
+    if need_load {
+        let graph =
+            get_or_sync_graph(&root).map_err(|e| anyhow::anyhow!("syncing workspace: {}", e))?;
+        *cache = Some((root.clone(), graph));
+    }
+    let (_, ref graph) = cache.as_ref().expect("graph initialized");
+    Ok((root.clone(), graph, coord.normalize_against(&root)))
+}
+
+fn build_cli_slice(
+    raw: &str,
+    cwd: &Path,
+    follow_local: bool,
+    with_imports: bool,
+    cache: &mut Option<(std::path::PathBuf, SymbolGraph)>,
+) -> Result<mimori::model::SliceResult> {
+    let coord = Coordinate::parse(raw)?;
+    if let Coordinate::Lines { file, start, end } = &coord {
+        let root = find_workspace_root(coord.absolute_parent().as_deref(), cwd);
+        if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
+            bail!(
+                "Cannot access home or system directory '{}' as workspace",
+                root.display()
+            );
+        }
+        let full = if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            cwd.join(file)
+        };
+        let target_path = mimori::workspace::walker::confine_to_workspace(&root, &full)?;
+        return slice_line_coordinate(&target_path, *start, *end, with_imports);
+    }
+    let (_, graph, norm_coord) = prepare_cached(raw, cwd, cache)?;
+    graph.build_slice(&norm_coord, follow_local, with_imports)
+}
+
+fn render_cli_blast_markdown(
+    blast_res: &mimori::graph::blast::BlastResult,
+    graph: &SymbolGraph,
+    coord: &Coordinate,
+    down: bool,
+    sinks: &[String],
+    sink_hits: &[String],
+) -> String {
+    let mut out = blast_res.to_markdown();
+    if blast_res.affected.is_empty() && blast_res.value_uses.is_empty() && !down {
+        if let Some(hint) = zero_caller_hint(graph, coord) {
+            out.push_str(&hint);
+            out.push('\n');
+        }
+    }
+    if !sinks.is_empty() {
+        out.push_str(&format_sink_hits(sinks, sink_hits));
+    } else {
+        out.push_str("\nTip: blast follows call edges plus labeled value-use rows — raw literals (console.*, logPath, send*Notifications, getDetailedMessage) need a sweep: `mimori blast <target> --with-sinks console.,logPath,sendNotification,getDetailedMessage` or `rg -n \"console\\.|logPath|send.*Notif|getDetailedMessage\"`.\n");
+    }
+    out
 }
 
 /// P2: when `up`/`blast` on a class-like returns zero, point at the
@@ -944,18 +1001,19 @@ fn sweep_literal_sinks(root: &Path, graph: &SymbolGraph, sinks: &[String]) -> Ve
     hits
 }
 
-fn print_sink_hits(sinks: &[String], hits: &[String]) {
-    println!(
-        "\n### 🔍 Literal sink hits (`--with-sinks {}`)\n",
+fn format_sink_hits(sinks: &[String], hits: &[String]) -> String {
+    let mut out = format!(
+        "\n### 🔍 Literal sink hits (`--with-sinks {}`)\n\n",
         sinks.join(",")
     );
     if hits.is_empty() {
-        println!("No literal sink hits.");
+        out.push_str("No literal sink hits.\n");
     } else {
         for h in hits {
-            println!("- `{}`", h);
+            out.push_str(&format!("- `{}`\n", h));
         }
     }
+    out
 }
 
 fn print_budgeted(text: &str, budget: Option<usize>) {

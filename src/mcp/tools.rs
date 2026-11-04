@@ -377,8 +377,49 @@ pub fn list_tools() -> Vec<serde_json::Value> {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrVec {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+fn split_target_tokens(raw: &str) -> Vec<String> {
+    let items: Vec<String> = raw
+        .split([',', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        vec![raw.to_string()]
+    } else {
+        items
+    }
+}
+
+fn deserialize_targets<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Single(s) => Ok(split_target_tokens(&s)),
+        StringOrVec::Multiple(list) => {
+            if list.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "target list must not be empty",
+                ));
+            }
+            Ok(list
+                .into_iter()
+                .flat_map(|s| split_target_tokens(&s))
+                .collect())
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct SliceToolArgs {
-    coordinate: String,
+    #[serde(alias = "coordinates", deserialize_with = "deserialize_targets")]
+    coordinate: Vec<String>,
     #[serde(default)]
     budget: Option<usize>,
     #[serde(default)]
@@ -444,7 +485,8 @@ struct DiffToolArgs {
 
 #[derive(Deserialize)]
 struct BlastToolArgs {
-    target: String,
+    #[serde(alias = "targets", deserialize_with = "deserialize_targets")]
+    target: Vec<String>,
     #[serde(default)]
     depth: Option<usize>,
     #[serde(default)]
@@ -526,42 +568,45 @@ pub fn call_tool(
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_slice': {}", e))
             })?;
             let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-            let coord = Coordinate::parse(&args.coordinate).map_err(|e| {
-                ToolError::InvalidParams(format!("Invalid coordinate '{}': {}", args.coordinate, e))
-            })?;
-
             let with_imports = args.with_imports.unwrap_or(false);
             let follow_local = args.follow_local.unwrap_or(false);
             let numbered = args.numbered.unwrap_or(false);
+            let per_budget = args
+                .budget
+                .map(|b| b / args.coordinate.len().max(1));
 
-            if let Coordinate::Lines { file, start, end } = &coord {
-                let full = if file.is_absolute() {
-                    file.clone()
+            let mut rendered = Vec::with_capacity(args.coordinate.len());
+            for raw_coord in &args.coordinate {
+                let coord = Coordinate::parse(raw_coord).map_err(|e| {
+                    ToolError::InvalidParams(format!("Invalid coordinate '{}': {}", raw_coord, e))
+                })?;
+
+                let slice = if let Coordinate::Lines { file, start, end } = &coord {
+                    let full = if file.is_absolute() {
+                        file.clone()
+                    } else {
+                        scope_dir.join(file)
+                    };
+                    let confined = confine(&scope_dir, &full)?;
+                    slice_line_coordinate(&confined, *start, *end, with_imports)
+                        .map_err(|e| ToolError::Execution(e.to_string()))?
                 } else {
-                    scope_dir.join(file)
+                    let graph = cache
+                        .get_graph(&scope_dir)
+                        .map_err(|e| ToolError::Execution(e.to_string()))?;
+                    let norm_coord = coord.normalize_against(&scope_dir);
+                    graph
+                        .build_slice(&norm_coord, follow_local, with_imports)
+                        .map_err(|e| ToolError::Execution(e.to_string()))?
                 };
-                let confined = confine(&scope_dir, &full)?;
-                let slice = slice_line_coordinate(&confined, *start, *end, with_imports)
-                    .map_err(|e| ToolError::Execution(e.to_string()))?;
-                if let Some(b) = args.budget {
-                    Ok(slice.render_markdown_budgeted(b, numbered))
+
+                if let Some(b) = per_budget {
+                    rendered.push(slice.render_markdown_budgeted(b, numbered));
                 } else {
-                    Ok(slice.render_markdown(numbered))
-                }
-            } else {
-                let graph = cache
-                    .get_graph(&scope_dir)
-                    .map_err(|e| ToolError::Execution(e.to_string()))?;
-                let norm_coord = coord.normalize_against(&scope_dir);
-                let slice = graph
-                    .build_slice(&norm_coord, follow_local, with_imports)
-                    .map_err(|e| ToolError::Execution(e.to_string()))?;
-                if let Some(b) = args.budget {
-                    Ok(slice.render_markdown_budgeted(b, numbered))
-                } else {
-                    Ok(slice.render_markdown(numbered))
+                    rendered.push(slice.render_markdown(numbered));
                 }
             }
+            Ok(rendered.join("\n---\n"))
         }
         "mimori_map" => {
             let args: MapToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
@@ -628,21 +673,9 @@ pub fn call_tool(
             let graph = cache
                 .get_graph(&scope_dir)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
-            let coord = Coordinate::parse(&args.target)
-                .map_err(|e| ToolError::InvalidParams(e.to_string()))?
-                .normalize_against(&scope_dir);
 
             let depth = args.depth.unwrap_or(3);
             let down = args.down.unwrap_or(false);
-
-            let blast_res = if down {
-                calculate_downstream_blast(&graph, &coord, depth)
-                    .map_err(|e| ToolError::Execution(e.to_string()))?
-            } else {
-                calculate_blast_radius(&graph, &coord, depth)
-                    .map_err(|e| ToolError::Execution(e.to_string()))?
-            };
-
             let sinks = parse_sink_list(args.with_sinks.as_deref());
             let sink_hits = if sinks.is_empty() {
                 Vec::new()
@@ -650,22 +683,38 @@ pub fn call_tool(
                 sweep_literal_sinks(&scope_dir, &graph, &sinks)
             };
 
-            let mut md = blast_res.to_markdown();
-            if blast_res.affected.is_empty() && blast_res.value_uses.is_empty() && !down {
-                if let Some(hint) = zero_caller_hint(&graph, &coord) {
-                    md.push('\n');
-                    md.push_str(&hint);
-                    md.push('\n');
+            let mut blocks = Vec::with_capacity(args.target.len());
+            for raw_target in &args.target {
+                let coord = Coordinate::parse(raw_target)
+                    .map_err(|e| ToolError::InvalidParams(e.to_string()))?
+                    .normalize_against(&scope_dir);
+
+                let blast_res = if down {
+                    calculate_downstream_blast(&graph, &coord, depth)
+                        .map_err(|e| ToolError::Execution(e.to_string()))?
+                } else {
+                    calculate_blast_radius(&graph, &coord, depth)
+                        .map_err(|e| ToolError::Execution(e.to_string()))?
+                };
+
+                let mut md = blast_res.to_markdown();
+                if blast_res.affected.is_empty() && blast_res.value_uses.is_empty() && !down {
+                    if let Some(hint) = zero_caller_hint(&graph, &coord) {
+                        md.push('\n');
+                        md.push_str(&hint);
+                        md.push('\n');
+                    }
                 }
+
+                if !sinks.is_empty() {
+                    md.push_str(&format_sink_hits(&sinks, &sink_hits));
+                } else {
+                    md.push_str("\nTip: blast follows call edges plus labeled value-use rows — raw literals (console.*, logPath, send*Notifications, getDetailedMessage) need a sweep: pass with_sinks or use rg.\n");
+                }
+                blocks.push(md);
             }
 
-            if !sinks.is_empty() {
-                md.push_str(&format_sink_hits(&sinks, &sink_hits));
-            } else {
-                md.push_str("\nTip: blast follows call edges plus labeled value-use rows — raw literals (console.*, logPath, send*Notifications, getDetailedMessage) need a sweep: pass with_sinks or use rg.\n");
-            }
-
-            Ok(md)
+            Ok(blocks.join("\n---\n"))
         }
         "mimori_graph" => {
             let args: GraphToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {

@@ -69,8 +69,13 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct SliceArgs {
-    #[arg(help = "Target coordinate (e.g. 'path/file.rs:symbol' or 'path/file.rs:#L10-50')")]
-    pub target: String,
+    #[arg(
+        required = true,
+        num_args = 1..,
+        value_name = "TARGET",
+        help = "Target coordinate(s) (e.g. 'path/file.rs:symbol' or 'path/file.rs:#L10-50')"
+    )]
+    pub targets: Vec<String>,
 
     #[arg(short = 'f', long, help = "Inline private local callee bodies")]
     pub follow_local: bool,
@@ -140,8 +145,13 @@ pub struct TargetArgs {
 
 #[derive(Args, Debug)]
 pub struct BlastArgs {
-    #[arg(help = "Target symbol or coordinate")]
-    pub target: String,
+    #[arg(
+        required = true,
+        num_args = 1..,
+        value_name = "TARGET",
+        help = "Target symbol(s) or coordinate(s)"
+    )]
+    pub targets: Vec<String>,
 
     #[arg(
         short = 'd',
