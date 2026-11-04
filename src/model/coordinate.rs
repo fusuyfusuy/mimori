@@ -28,7 +28,12 @@ pub enum Coordinate {
 
 impl Coordinate {
     pub fn parse(raw: &str) -> Result<Self> {
-        let raw = raw.trim();
+        let mut raw = raw.trim();
+        if let Some(idx) = raw.rfind(" (L") {
+            if raw.ends_with(')') {
+                raw = raw[..idx].trim();
+            }
+        }
         if raw.is_empty() {
             bail!("Empty coordinate.");
         }

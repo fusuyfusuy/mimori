@@ -200,7 +200,14 @@ fn collect_references(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "call_expression" {
+        let kind = child.kind();
+        if matches!(
+            kind,
+            "function_item" | "struct_item" | "enum_item" | "trait_item" | "impl_item"
+        ) {
+            continue;
+        }
+        if kind == "call_expression" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 let text = node_text(func_node, content);
                 // A `field_expression` function (`self.save`, `x.build()`)

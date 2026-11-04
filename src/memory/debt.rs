@@ -174,7 +174,6 @@ pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> 
         return Vec::new();
     }
     let scan_root = match scope {
-
         Some(s) => {
             let joined = root.join(s);
             let Ok(canon_root) = root.canonicalize() else {

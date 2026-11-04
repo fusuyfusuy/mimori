@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use mimori::cli::{Cli, Commands, DebtCommand, MemoryCommand};
 use mimori::graph::map::generate_map;
-use mimori::graph::{slice_line_coordinate, SymbolGraph, COUNT_LEGEND};
+use mimori::graph::{slice_line_coordinate, SymbolGraph};
 use mimori::memory::{check_debt, generate_dump, list_debt, sync_debt, MemoryLedger};
 use mimori::model::Coordinate;
 use mimori::storage::{clean_cache, get_or_sync_graph};
@@ -118,40 +118,10 @@ fn main() -> ExitCode {
                     json!({ "target": coord.to_string(), "callers": json_callers, "value_uses": json_uses })
                 );
             } else {
-                println!(
-                    "### Upstream Callers: `{}` ({} callers)\n",
-                    coord,
-                    callers.len()
+                print!(
+                    "{}",
+                    mimori::graph::format_upstream(&graph, &coord, &callers, &value_uses)
                 );
-                println!("{}\n", COUNT_LEGEND);
-                if callers.is_empty() && value_uses.is_empty() {
-                    println!("No upstream callers found.");
-                    // P2: zero-caller UX hint. A class with no callers almost
-                    // always means "look at construction sites instead".
-                    if let Some(hint) = zero_caller_hint(&graph, &coord) {
-                        println!("{}", hint);
-                    }
-                } else {
-                    for c in callers {
-                        println!(
-                            "- 🔺 **`{}`** ({}) → `{}`",
-                            c.name,
-                            c.kind.as_str(),
-                            c.coordinate()
-                        );
-                    }
-                    if !value_uses.is_empty() {
-                        println!("\n### 📎 Value Uses (mentions — weakest tier, not call edges)\n");
-                        for m in value_uses {
-                            println!(
-                                "- 📎 **`{}`** ({}) → `{}` [Value Use]",
-                                m.name,
-                                m.kind.as_str(),
-                                m.coordinate()
-                            );
-                        }
-                    }
-                }
             }
             ExitCode::SUCCESS
         }
@@ -173,24 +143,10 @@ fn main() -> ExitCode {
                     json!({ "target": coord.to_string(), "callees": json_callees })
                 );
             } else {
-                println!(
-                    "### Downstream Callees: `{}` ({} callees)\n",
-                    coord,
-                    callees.len()
+                print!(
+                    "{}",
+                    mimori::graph::format_downstream(&graph, &coord, &callees)
                 );
-                println!("{}\n", COUNT_LEGEND);
-                if callees.is_empty() {
-                    println!("No downstream callees found.");
-                } else {
-                    for c in callees {
-                        println!(
-                            "- 🔻 **`{}`** ({}) → `{}`",
-                            c.name,
-                            c.kind.as_str(),
-                            c.coordinate()
-                        );
-                    }
-                }
             }
             ExitCode::SUCCESS
         }
@@ -212,24 +168,10 @@ fn main() -> ExitCode {
                     json!({ "target": coord.to_string(), "mentioners": json_mentioners })
                 );
             } else {
-                println!(
-                    "### Mentioners: `{}` ({} mentioners, non-call uses)\n",
-                    coord,
-                    mentioners.len()
+                print!(
+                    "{}",
+                    mimori::graph::format_uses(&graph, &coord, &mentioners)
                 );
-                println!("{}\n", COUNT_LEGEND);
-                if mentioners.is_empty() {
-                    println!("No mentioners found.");
-                } else {
-                    for m in mentioners {
-                        println!(
-                            "- 📎 **`{}`** ({}) → `{}`",
-                            m.name,
-                            m.kind.as_str(),
-                            m.coordinate()
-                        );
-                    }
-                }
             }
             ExitCode::SUCCESS
         }
@@ -415,12 +357,7 @@ fn main() -> ExitCode {
                     json_items.push(v);
                 } else {
                     md_blocks.push(render_cli_blast_markdown(
-                        &blast_res,
-                        graph,
-                        &coord,
-                        args.down,
-                        &sinks,
-                        sink_hits,
+                        &blast_res, graph, &coord, args.down, &sinks, sink_hits,
                     ));
                 }
             }

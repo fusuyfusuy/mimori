@@ -191,6 +191,17 @@ fn collect_references(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let kind = child.kind();
+        if node.kind() != "decorated_definition"
+            && matches!(
+                kind,
+                "function_definition"
+                    | "async_function_definition"
+                    | "class_definition"
+                    | "decorated_definition"
+            )
+        {
+            continue;
+        }
         if kind == "call" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 // `x.build()` (attribute function) is a member call:
@@ -327,7 +338,12 @@ fn collect_py_local_aliases(
         let after_from = text.strip_prefix("from").unwrap_or(text).trim();
         if let Some((module, names)) = after_from.split_once(" import ") {
             let module = module.trim();
-            let top_segment = module.trim_start_matches('.').split('.').next().unwrap_or("").trim();
+            let top_segment = module
+                .trim_start_matches('.')
+                .split('.')
+                .next()
+                .unwrap_or("")
+                .trim();
             let is_local = module.starts_with('.') || !PYTHON_STDLIB.contains(&top_segment);
             if is_local {
                 let hint = module.trim_start_matches('.').replace('.', "/");

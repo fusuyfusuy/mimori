@@ -82,7 +82,10 @@ impl MemoryLedger {
 
     pub fn scaffold(workspace_root: &Path, force: bool) -> Result<(bool, bool)> {
         if crate::workspace::walker::is_disallowed_workspace_root(workspace_root) {
-            anyhow::bail!("Refusing to scaffold memory in home or system directory '{}'", workspace_root.display());
+            anyhow::bail!(
+                "Refusing to scaffold memory in home or system directory '{}'",
+                workspace_root.display()
+            );
         }
         let agents_dir = workspace_root.join(".agents");
         fs::create_dir_all(&agents_dir)
@@ -132,7 +135,10 @@ impl MemoryLedger {
 
     pub fn load(workspace_root: &Path) -> Result<Self> {
         if crate::workspace::walker::is_disallowed_workspace_root(workspace_root) {
-            anyhow::bail!("Refusing to load memory in home or system directory '{}'", workspace_root.display());
+            anyhow::bail!(
+                "Refusing to load memory in home or system directory '{}'",
+                workspace_root.display()
+            );
         }
         let path = Self::memory_path(workspace_root);
         let content = fs::read_to_string(&path)

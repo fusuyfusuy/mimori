@@ -302,8 +302,7 @@ fn traverse(
                 });
             }
         }
-        literal_test_mentions =
-            collect_literal_test_mentions(graph, &visited, &seed_short_names);
+        literal_test_mentions = collect_literal_test_mentions(graph, &visited, &seed_short_names);
     }
 
     Ok(BlastResult {
@@ -350,8 +349,8 @@ fn has_call_token(line: &str, ident: &str) -> bool {
     while let Some(pos) = line[start..].find(ident) {
         let abs = start + pos;
         let end = abs + ident.len();
-        let prev_ok = abs == 0
-            || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
+        let prev_ok =
+            abs == 0 || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
         let rest = line[end..].trim_start();
         let next_ok = rest.starts_with('(')
             || rest.starts_with('!')
@@ -374,10 +373,10 @@ fn has_ident_token(line: &str, ident: &str) -> bool {
     while let Some(pos) = line[start..].find(ident) {
         let abs = start + pos;
         let end = abs + ident.len();
-        let prev_ok = abs == 0
-            || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
-        let next_ok = end == bytes.len()
-            || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+        let prev_ok =
+            abs == 0 || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
+        let next_ok =
+            end == bytes.len() || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
         if prev_ok && next_ok {
             return true;
         }

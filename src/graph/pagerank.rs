@@ -53,7 +53,13 @@ pub fn compute_weighted_pagerank(
     let default_prior = || -> Vec<f64> {
         let mut p: Vec<f64> = is_test
             .iter()
-            .map(|&t| if t { crate::graph::TEST_EDGE_WEIGHT } else { 1.0 })
+            .map(|&t| {
+                if t {
+                    crate::graph::TEST_EDGE_WEIGHT
+                } else {
+                    1.0
+                }
+            })
             .collect();
         let sum: f64 = p.iter().sum();
         if sum > 0.0 {

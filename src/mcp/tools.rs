@@ -131,7 +131,7 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                 "properties": {
                     "coordinate": {
                         "type": "string",
-                        "description": "Target symbol or coordinate (e.g. 'path/file.ts:symbol', 'path/file.ts:#L20-45', or bare 'symbol')"
+                        "description": "Target symbol(s) or coordinate(s). Supports comma-separated batching in a single call (e.g. 'a.ts:foo, b.ts:bar, c.ts:#L20-45' or bare 'symbol')"
                     },
                     "budget": {
                         "type": "integer",
@@ -215,7 +215,7 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Symbol name or path search term"
+                        "description": "Symbol name, path search term, or literal fallback string. Supports pipe/comma-separated multi-query batching in one call (e.g. 'foo|bar|baz')"
                     },
                     "symbols_only": {
                         "type": "boolean",
@@ -279,7 +279,7 @@ pub fn list_tools() -> Vec<serde_json::Value> {
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Target coordinate or symbol"
+                        "description": "Target coordinate(s) or symbol(s). Supports comma-separated batching (e.g. 'a.ts:foo, b.ts:bar')"
                     },
                     "direction": {
                         "type": "string",
@@ -409,9 +409,7 @@ where
                 .filter(|s| !s.is_empty())
                 .collect();
             if cleaned.is_empty() {
-                return Err(serde::de::Error::custom(
-                    "target list must not be empty",
-                ));
+                return Err(serde::de::Error::custom("target list must not be empty"));
             }
             Ok(cleaned)
         }
@@ -501,7 +499,8 @@ struct BlastToolArgs {
 
 #[derive(Deserialize)]
 struct GraphToolArgs {
-    target: String,
+    #[serde(alias = "targets", deserialize_with = "deserialize_targets")]
+    target: Vec<String>,
     direction: String,
     #[serde(default)]
     workspace_dir: Option<String>,
@@ -537,13 +536,25 @@ fn resolve_workspace_scope(
         Some(ws) => {
             let path = Path::new(ws);
             if path.is_absolute() {
-                return Err(ToolError::InvalidParams(format!(
-                    "workspace_dir must be relative to the session root, got absolute path: {}",
-                    ws
-                )));
+                let canon_root = session_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| session_root.to_path_buf());
+                if let Ok(rel) = path
+                    .strip_prefix(session_root)
+                    .or_else(|_| path.strip_prefix(&canon_root))
+                {
+                    let target = session_root.join(rel);
+                    confine(session_root, &target)?
+                } else {
+                    return Err(ToolError::InvalidParams(format!(
+                        "workspace_dir must be relative to the session root, got absolute path: {}",
+                        ws
+                    )));
+                }
+            } else {
+                let target = session_root.join(path);
+                confine(session_root, &target)?
             }
-            let target = session_root.join(path);
-            confine(session_root, &target)?
         }
         None => session_root.to_path_buf(),
     };
@@ -573,9 +584,7 @@ pub fn call_tool(
             let with_imports = args.with_imports.unwrap_or(false);
             let follow_local = args.follow_local.unwrap_or(false);
             let numbered = args.numbered.unwrap_or(false);
-            let per_budget = args
-                .budget
-                .map(|b| b / args.coordinate.len().max(1));
+            let per_budget = args.budget.map(|b| b / args.coordinate.len().max(1));
 
             let mut cached_graph: Option<Arc<SymbolGraph>> = None;
             let mut rendered = Vec::with_capacity(args.coordinate.len());
@@ -734,28 +743,36 @@ pub fn call_tool(
             let graph = cache
                 .get_graph(&scope_dir)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
-            let coord = Coordinate::parse(&args.target)
-                .map_err(|e| ToolError::InvalidParams(e.to_string()))?
-                .normalize_against(&scope_dir);
 
-            match args.direction.as_str() {
-                "up" => {
-                    let (callers, value_uses) = graph.upstream(&coord);
-                    Ok(format_upstream(&graph, &coord, &callers, &value_uses))
-                }
-                "down" => {
-                    let callees = graph.callees(&coord);
-                    Ok(format_downstream(&graph, &coord, &callees))
-                }
-                "uses" => {
-                    let mentioners = graph.mentioners(&coord);
-                    Ok(format_uses(&graph, &coord, &mentioners))
-                }
-                other => Err(ToolError::InvalidParams(format!(
-                    "Invalid direction '{}': expected 'up', 'down', or 'uses'",
-                    other
-                ))),
+            let mut blocks = Vec::with_capacity(args.target.len());
+            for raw_target in &args.target {
+                let coord = Coordinate::parse(raw_target)
+                    .map_err(|e| ToolError::InvalidParams(e.to_string()))?
+                    .normalize_against(&scope_dir);
+
+                let block = match args.direction.as_str() {
+                    "up" => {
+                        let (callers, value_uses) = graph.upstream(&coord);
+                        format_upstream(&graph, &coord, &callers, &value_uses)
+                    }
+                    "down" => {
+                        let callees = graph.callees(&coord);
+                        format_downstream(&graph, &coord, &callees)
+                    }
+                    "uses" => {
+                        let mentioners = graph.mentioners(&coord);
+                        format_uses(&graph, &coord, &mentioners)
+                    }
+                    other => {
+                        return Err(ToolError::InvalidParams(format!(
+                            "Invalid direction '{}': expected 'up', 'down', or 'uses'",
+                            other
+                        )));
+                    }
+                };
+                blocks.push(block);
             }
+            Ok(blocks.join("\n---\n"))
         }
         "mimori_memory" => {
             let args: MemoryToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {

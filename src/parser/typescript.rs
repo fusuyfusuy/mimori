@@ -144,23 +144,41 @@ fn walk_ts_node(
                         create_symbol(node, content, file, name.to_string(), SymbolKind::Function);
                     symbols.push(symbol);
                 } else if val_kind == "call_expression" {
-                    let symbol =
+                    let mut symbol =
                         create_symbol(node, content, file, name.to_string(), SymbolKind::Variable);
-                    symbols.push(symbol);
+                    let mut members = Vec::new();
 
                     if let Some(args_node) = value_node.child_by_field_name("arguments") {
                         let mut arg_cursor = args_node.walk();
                         for arg in args_node.children(&mut arg_cursor) {
                             if arg.kind() == "object" {
-                                extract_object_literal_members(arg, content, file, name, symbols);
+                                extract_object_literal_members(
+                                    arg,
+                                    content,
+                                    file,
+                                    name,
+                                    &mut members,
+                                );
                             }
                         }
+                        if !members.is_empty() {
+                            for m in &members {
+                                symbol.calls.retain(|c| !m.calls.contains(c));
+                                symbol.mentions.retain(|men| !m.mentions.contains(men));
+                                for c in &m.calls {
+                                    symbol.call_counts.remove(c);
+                                }
+                            }
+                        }
+                        symbols.push(symbol);
+                        symbols.extend(members);
                         // Return as the class_declaration arm does. Falling
                         // through let the generic recursion revisit the same
                         // method_definition nodes with parent_class = None,
                         // emitting every shorthand method a second time.
                         return;
                     }
+                    symbols.push(symbol);
                 } else if val_kind == "template_string" {
                     // P1b: `const commandWithLog = `(${cmd}) >> ...`` is a
                     // coarse dataflow node: its template mentions flow into
@@ -308,7 +326,15 @@ fn collect_references(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "call_expression" {
+        let kind = child.kind();
+        if matches!(
+            kind,
+            "method_definition" | "class_declaration" | "function_declaration"
+        ) || kind.ends_with("field_definition")
+        {
+            continue;
+        }
+        if kind == "call_expression" {
             if let Some(func_node) = child.child_by_field_name("function") {
                 // `X.foo()` is a member call: weakest evidence, file-local
                 // only. Bare `foo()` may resolve workspace-wide.

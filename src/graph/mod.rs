@@ -706,11 +706,14 @@ impl SymbolGraph {
         let callers: Vec<String> = self
             .callers(coord)
             .into_iter()
-            .map(|s| s.coordinate())
+            .map(|s| format!("{} (L{}-L{})", s.coordinate(), s.start_line, s.end_line))
             .collect();
 
         let callee_syms = self.callees(coord);
-        let callees: Vec<String> = callee_syms.iter().map(|s| s.coordinate()).collect();
+        let callees: Vec<String> = callee_syms
+            .iter()
+            .map(|s| format!("{} (L{}-L{})", s.coordinate(), s.start_line, s.end_line))
+            .collect();
 
         let mut body = truncate_body(&sym.body, sym.end_line - sym.start_line);
 
@@ -772,11 +775,13 @@ impl SymbolGraph {
             if !file_syms.is_empty() {
                 let q = bare.to_lowercase();
                 file_syms.sort_by(|a, b| {
-                    let a_sub = a.name.to_lowercase().contains(&q)
-                        || q.contains(&a.name.to_lowercase());
-                    let b_sub = b.name.to_lowercase().contains(&q)
-                        || q.contains(&b.name.to_lowercase());
-                    b_sub.cmp(&a_sub).then_with(|| a.start_line.cmp(&b.start_line))
+                    let a_sub =
+                        a.name.to_lowercase().contains(&q) || q.contains(&a.name.to_lowercase());
+                    let b_sub =
+                        b.name.to_lowercase().contains(&q) || q.contains(&b.name.to_lowercase());
+                    b_sub
+                        .cmp(&a_sub)
+                        .then_with(|| a.start_line.cmp(&b.start_line))
                 });
                 let matched_file = &file_syms[0].file;
                 msg.push_str(&format!("\nSymbols defined in '{}':", matched_file));
@@ -1106,20 +1111,24 @@ pub fn format_upstream(
     } else {
         for c in callers {
             out.push_str(&format!(
-                "- 🔺 **`{}`** ({}) → `{}`\n",
+                "- 🔺 **`{}`** ({}) → `{}` (L{}-L{})\n",
                 c.name,
                 c.kind.as_str(),
-                c.coordinate()
+                c.coordinate(),
+                c.start_line,
+                c.end_line
             ));
         }
         if !value_uses.is_empty() {
             out.push_str("\n### 📎 Value Uses (mentions — weakest tier, not call edges)\n\n");
             for m in value_uses {
                 out.push_str(&format!(
-                    "- 📎 **`{}`** ({}) → `{}` [Value Use]\n",
+                    "- 📎 **`{}`** ({}) → `{}` (L{}-L{}) [Value Use]\n",
                     m.name,
                     m.kind.as_str(),
-                    m.coordinate()
+                    m.coordinate(),
+                    m.start_line,
+                    m.end_line
                 ));
             }
         }
@@ -1139,10 +1148,12 @@ pub fn format_downstream(_graph: &SymbolGraph, coord: &Coordinate, callees: &[&S
     } else {
         for c in callees {
             out.push_str(&format!(
-                "- 🔻 **`{}`** ({}) → `{}`\n",
+                "- 🔻 **`{}`** ({}) → `{}` (L{}-L{})\n",
                 c.name,
                 c.kind.as_str(),
-                c.coordinate()
+                c.coordinate(),
+                c.start_line,
+                c.end_line
             ));
         }
     }
@@ -1161,10 +1172,12 @@ pub fn format_uses(_graph: &SymbolGraph, coord: &Coordinate, mentioners: &[&Symb
     } else {
         for m in mentioners {
             out.push_str(&format!(
-                "- 📎 **`{}`** ({}) → `{}`\n",
+                "- 📎 **`{}`** ({}) → `{}` (L{}-L{})\n",
                 m.name,
                 m.kind.as_str(),
-                m.coordinate()
+                m.coordinate(),
+                m.start_line,
+                m.end_line
             ));
         }
     }

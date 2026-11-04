@@ -328,7 +328,6 @@ pub fn is_disallowed_workspace_root(path: &Path) -> bool {
         || same_dir_or_canon(path, &std::env::temp_dir())
 }
 
-
 pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
     let canon_root = workspace_root
         .canonicalize()
@@ -470,4 +469,3 @@ mod tests {
         }
     }
 }
-

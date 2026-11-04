@@ -42,7 +42,9 @@ pub enum Commands {
     #[command(about = "Evaluate transitive blast radius of a symbol across entry points")]
     Blast(BlastArgs),
 
-    #[command(about = "Compute mutated symbols, combined blast radius, and test impact for git diff")]
+    #[command(
+        about = "Compute mutated symbols, combined blast radius, and test impact for git diff"
+    )]
     Diff(DiffArgs),
 
     #[command(about = "Generate hierarchical, centrality-ranked architectural map")]
@@ -99,7 +101,9 @@ pub struct SliceArgs {
 
 #[derive(Args, Debug)]
 pub struct FindArgs {
-    #[arg(help = "Search pattern")]
+    #[arg(
+        help = "Search pattern (supports '|' or ',' multi-query batching, with per-term enclosing-symbol literal fallback)"
+    )]
     pub pattern: String,
 
     #[arg(
@@ -113,7 +117,10 @@ pub struct FindArgs {
     #[arg(short = 'f', long, visible_alias = "files", help = "Files only")]
     pub files_only: bool,
 
-    #[arg(long, help = "Restrict search to files within this directory or file prefix")]
+    #[arg(
+        long,
+        help = "Restrict search to files within this directory or file prefix"
+    )]
     pub scope: Option<String>,
 
     #[arg(short, long, help = "Maximum number of results to display")]
@@ -122,10 +129,16 @@ pub struct FindArgs {
 
 #[derive(Args, Debug)]
 pub struct DiffArgs {
-    #[arg(long, help = "Inspect staged changes (--staged) instead of working tree")]
+    #[arg(
+        long,
+        help = "Inspect staged changes (--staged) instead of working tree"
+    )]
     pub staged: bool,
 
-    #[arg(long, help = "Optional base git revision to diff against (e.g. HEAD~1 or main)")]
+    #[arg(
+        long,
+        help = "Optional base git revision to diff against (e.g. HEAD~1 or main)"
+    )]
     pub base: Option<String>,
 
     #[arg(

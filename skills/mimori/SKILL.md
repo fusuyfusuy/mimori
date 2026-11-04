@@ -83,22 +83,24 @@ mimori map [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--j
 
 ### `slice` — Token-Dense Context Slicing
 ```shell
-mimori slice <coordinate> [-f] [-i] [-n] [--budget <N>] [--json]
+mimori slice <coordinate>... [-f] [-i] [-n] [--budget <N>] [--json]
 ```
-- Extract symbol or line range without reading entire file.
+- Extract one or more symbols or line ranges in a single call without reading entire files (MCP `coordinate` accepts comma-separated batch coordinates or `string[]`).
+- 1-hop callers and callees include inline `(L{start}-L{end})` declaration bounds, with enclosing container callers (`X` vs `X::Y`) automatically deduplicated.
 - Bodies exceeding 250 lines are head/tail truncated to protect token budgets.
 - `-f`, `--follow-local`: Inline private local callee bodies from same file.
 - `-i`, `--with-imports`: Include top-of-file imports for immediate dependency context.
 - `-n`, `--numbered`: Prefix lines with 1-based coordinates (`L{n}: ...`).
 - `--budget <N>`: Bounds markdown output; core slice preserved, droppable context sheds: inlined locals $\to$ callees $\to$ callers $\to$ imports.
 
-### `find` — Hybrid Symbol/File Search
+### `find` — Hybrid Symbol/File/Literal Search
 ```shell
 mimori find <pattern> [-s] [-f] [--scope <dir>] [--limit <N>] [--json]
 ```
-- Orders matches by exact match and in-degree PageRank.
+- Supports `|` or `,` multi-pattern batching in a single call (e.g. `mimori find "rebuildPreviewApplication|Cloning Repo|getContainerLogs"`).
+- Orders matches by exact match and in-degree PageRank; compacts multi-line signatures and omits tail signatures past rank `#15` to prevent tool-output truncation.
 - `-s`: Symbols only; `-f`: Files only; `--scope <dir>`: Filter to directory or file prefix.
-- Fallback: Scans indexed file content when zero symbols/files match (count equals `rg -c`).
+- Per-term Enclosing-Symbol Fallback: Any query term in `<pattern>` with zero symbol/file matches scans indexed file content (count equals `rg -c`) and resolves each literal hit to its innermost enclosing AST symbol (`[in file:symbol (Lstart-Lend)]`).
 
 ### `up` / `down` / `uses` — Graph Traversal
 ```shell
@@ -106,6 +108,8 @@ mimori up <target> [--json]    # Upstream callers & constructors (folds new X())
 mimori down <target> [--json]  # Downstream callees invoked by target
 mimori uses <target> [--json]  # Mentioners (property reads, type refs, args, templates)
 ```
+- Emits `(L{start}-L{end})` declaration bounds on every caller, callee, and value-use row; deduplicates parent container symbols (`X`) when a member (`X::Y`) in the same file is present.
+- MCP `mimori_graph` accepts comma-separated batch `target`s (`string | string[]`) in a single call.
 - `up` folds constructor callers into class symbols; reports zero callers hint if unconstructed.
 - `uses` tracks coarse dataflow without cluttering call graph centrality.
 
@@ -228,7 +232,7 @@ declare namespace mimori {
   type FindJson = { query: string; matches: SymbolEntry[] };
   // CLI: mimori map [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] --json | MCP: mimori_map({ scope?, focus?, seed?, limit? }) -> string
   type MapJson = MapResult;
-  // CLI: mimori up|down|uses <target> --json | MCP: mimori_graph({ target, direction: "up" | "down" | "uses" }) -> string
+  // CLI: mimori up|down|uses <target> --json | MCP: mimori_graph({ target: string | string[], direction: "up" | "down" | "uses" }) -> string
   type GraphJson = { target: string; callers?: string[]; callees?: string[]; mentioners?: string[]; value_uses?: string[] };
   // CLI: mimori blast <target>... [-d <N>] [--down] [--with-sinks <a,b>] --json | MCP: mimori_blast({ target: string | string[], depth?, down?, with_sinks? }) -> string
   // Note: CLI --json emits BlastJson for 1 target, or BlastJson[] for >1 targets
