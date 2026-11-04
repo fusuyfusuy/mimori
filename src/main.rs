@@ -360,6 +360,7 @@ fn main() -> ExitCode {
         }
         Commands::Blast(args) => {
             let mut cached_graph: Option<(std::path::PathBuf, SymbolGraph)> = None;
+            let mut cached_sinks: Option<(std::path::PathBuf, Vec<String>)> = None;
             let sinks = parse_sink_list(args.with_sinks.as_deref());
             let mut json_items = Vec::with_capacity(args.targets.len());
             let mut md_blocks = Vec::with_capacity(args.targets.len());
@@ -385,10 +386,18 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                let sink_hits: Vec<String> = if sinks.is_empty() {
-                    Vec::new()
+                let sink_hits: &[String] = if sinks.is_empty() {
+                    &[]
                 } else {
-                    sweep_literal_sinks(&root, graph, &sinks)
+                    let need_sweep = cached_sinks
+                        .as_ref()
+                        .map(|(r, _)| r != &root)
+                        .unwrap_or(true);
+                    if need_sweep {
+                        let hits = sweep_literal_sinks(&root, graph, &sinks);
+                        cached_sinks = Some((root.clone(), hits));
+                    }
+                    &cached_sinks.as_ref().expect("sinks initialized").1
                 };
 
                 if cli.json {
@@ -411,7 +420,7 @@ fn main() -> ExitCode {
                         &coord,
                         args.down,
                         &sinks,
-                        &sink_hits,
+                        sink_hits,
                     ));
                 }
             }

@@ -403,15 +403,17 @@ where
     match StringOrVec::deserialize(deserializer)? {
         StringOrVec::Single(s) => Ok(split_target_tokens(&s)),
         StringOrVec::Multiple(list) => {
-            if list.is_empty() {
+            let cleaned: Vec<String> = list
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if cleaned.is_empty() {
                 return Err(serde::de::Error::custom(
                     "target list must not be empty",
                 ));
             }
-            Ok(list
-                .into_iter()
-                .flat_map(|s| split_target_tokens(&s))
-                .collect())
+            Ok(cleaned)
         }
     }
 }
@@ -575,6 +577,7 @@ pub fn call_tool(
                 .budget
                 .map(|b| b / args.coordinate.len().max(1));
 
+            let mut cached_graph: Option<Arc<SymbolGraph>> = None;
             let mut rendered = Vec::with_capacity(args.coordinate.len());
             for raw_coord in &args.coordinate {
                 let coord = Coordinate::parse(raw_coord).map_err(|e| {
@@ -591,9 +594,16 @@ pub fn call_tool(
                     slice_line_coordinate(&confined, *start, *end, with_imports)
                         .map_err(|e| ToolError::Execution(e.to_string()))?
                 } else {
-                    let graph = cache
-                        .get_graph(&scope_dir)
-                        .map_err(|e| ToolError::Execution(e.to_string()))?;
+                    let graph = match &cached_graph {
+                        Some(g) => Arc::clone(g),
+                        None => {
+                            let g = cache
+                                .get_graph(&scope_dir)
+                                .map_err(|e| ToolError::Execution(e.to_string()))?;
+                            cached_graph = Some(Arc::clone(&g));
+                            g
+                        }
+                    };
                     let norm_coord = coord.normalize_against(&scope_dir);
                     graph
                         .build_slice(&norm_coord, follow_local, with_imports)

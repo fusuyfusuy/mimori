@@ -191,13 +191,17 @@ AMBIGUITY_INVARIANT:
 ## MCP SERVER, CLI DUALITY & `--json` OUTPUT CONTRACTS (`.d.ts`)
 
 Run stdio daemon: `mimori mcp [--workspace <dir>]`
-When chaining multiple queries or filtering in a single turn (`AGENTS(7)` §6 Code Mode), invoke `mimori <cmd> --json | jq ...` against these exact stdout schemas:
+Note: MCP tools (`mimori_*`) return formatted Markdown text; CLI `--json` returns the exact JSON schemas below for single-turn `jq`/script pipelines (`AGENTS(7)` §6 Code Mode):
 
 ```ts
 declare namespace mimori {
   interface SymbolEntry {
     name: string; kind: string; file: string; coordinate: string;
     start_line: number; end_line: number; signature: string; centrality: number;
+  }
+  interface BlastNode {
+    name: string; kind: string; file: string; coordinate: string; depth: number;
+    call_lines: number[]; is_entry_point: boolean; is_sink: boolean; is_test: boolean; is_value_use: boolean;
   }
   interface MapResult {
     scope: string | null; focus: string | null;
@@ -208,36 +212,37 @@ declare namespace mimori {
     indexed_files: number; crawled_files: number; unindexed_exts: string[];
   }
 
-  // CLI: mimori dump [--budget <N>] [--focus <target>] --json | MCP: mimori_dump({ budget?, focus?, workspace_dir? })
+  // CLI: mimori dump [--budget <N>] [--focus <target>] --json | MCP: mimori_dump({ budget?, focus?, workspace_dir? }) -> string
   type DumpJson = {
     budget: number; estimated_tokens: number; epics: string; vocab_gotchas: string;
     active_debt: string[]; debt_count: number; map: MapResult; markdown: string;
   };
-  // CLI: mimori slice <coord>... [-f] [-i] [-n] [--budget <N>] --json | MCP: mimori_slice({ coordinate: string | string[], follow_local?, with_imports?, numbered?, budget? })
-  // Note: 1 target -> SliceJson; >1 targets -> SliceJson[]
+  // CLI: mimori slice <coord>... [-f] [-i] [-n] [--budget <N>] --json | MCP: mimori_slice({ coordinate: string | string[], follow_local?, with_imports?, numbered?, budget? }) -> string
+  // Note: CLI --json emits SliceJson for 1 target, or SliceJson[] for >1 targets
   type SliceJson = {
     coordinate: string; file: string; line_range: [number, number]; content: string;
     callers: string[]; callees: string[]; total_lines: number;
     symbol?: SymbolEntry & { body: string; calls: string[]; mentions: string[]; call_counts: Record<string, number>; member_calls: string[]; external_imports: string[] };
   };
-  // CLI: mimori find <pattern> [-s] [-f] [--scope <dir>] [--limit <N>] --json | MCP: mimori_find({ pattern, scope?, symbols_only?, files_only?, limit? })
+  // CLI: mimori find <pattern> [-s] [-f] [--scope <dir>] [--limit <N>] --json | MCP: mimori_find({ pattern, scope?, symbols_only?, files_only?, limit? }) -> string
   type FindJson = { query: string; matches: SymbolEntry[] };
-  // CLI: mimori map [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] --json | MCP: mimori_map({ scope?, focus?, seed?, limit? })
+  // CLI: mimori map [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] --json | MCP: mimori_map({ scope?, focus?, seed?, limit? }) -> string
   type MapJson = MapResult;
-  // CLI: mimori up|down|uses <target> --json | MCP: mimori_graph({ target, direction: "up" | "down" | "uses" })
-  type GraphJson = { target: string; callers?: string[]; callees?: string[]; value_uses?: string[] };
-  // CLI: mimori blast <target>... [-d <N>] [--down] [--with-sinks <a,b>] --json | MCP: mimori_blast({ target: string | string[], depth?, down?, with_sinks? })
-  // Note: 1 target -> BlastJson; >1 targets -> BlastJson[]
+  // CLI: mimori up|down|uses <target> --json | MCP: mimori_graph({ target, direction: "up" | "down" | "uses" }) -> string
+  type GraphJson = { target: string; callers?: string[]; callees?: string[]; mentioners?: string[]; value_uses?: string[] };
+  // CLI: mimori blast <target>... [-d <N>] [--down] [--with-sinks <a,b>] --json | MCP: mimori_blast({ target: string | string[], depth?, down?, with_sinks? }) -> string
+  // Note: CLI --json emits BlastJson for 1 target, or BlastJson[] for >1 targets
   type BlastJson = {
     target: string; direction: string; depth_limit: number;
-    affected: Array<{ name: string; kind: string; file: string; coordinate: string; depth: number; call_lines: number[]; is_entry_point: boolean; is_sink: boolean; is_test: boolean; is_value_use: boolean }>;
-    entry_points: string[]; test_suites: string[]; value_uses: string[];
+    affected: BlastNode[]; entry_points: string[]; test_suites: string[];
+    value_uses: BlastNode[]; sinks?: string[]; sink_hits?: string[];
   };
-  // CLI: mimori diff [--staged] [--base <rev>] [-d <N>] --json | MCP: mimori_diff({ staged?, base?, depth?, workspace_dir? })
+  // CLI: mimori diff [--staged] [--base <rev>] [-d <N>] --json | MCP: mimori_diff({ staged?, base?, depth?, workspace_dir? }) -> string
   type DiffJson = {
-    touched_files: string[]; mutated_symbols: string[]; affected: BlastJson["affected"];
-    entry_points: string[]; test_suites: string[]; literal_test_mentions: string[];
-    debt_status: string; memory_status: string;
+    touched_files: string[];
+    mutated_symbols: Array<{ name: string; kind: string; file: string; coordinate: string; start_line: number; end_line: number }>;
+    affected: BlastNode[]; entry_points: string[]; test_suites: string[];
+    literal_test_mentions: string[]; debt_status: string; memory_status: string;
   };
   // CLI: mimori memory [show|lint|resolve] [--section <sec>] --json | MCP: mimori_memory({ action: "show" | "lint" | "resolve", section?, target?, budget? })
   type MemoryShowJson = {
