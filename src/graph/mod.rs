@@ -1765,5 +1765,16 @@ mod tests {
             .unwrap();
         assert!((wp - 1.0).abs() < 1e-9, "product weight {wp}");
         assert!((wt - TEST_EDGE_WEIGHT).abs() < 1e-9, "test weight {wt}");
+        let rank_t = g.symbols[idx("tests/t.rs", "t")].centrality;
+        let rank_p = g.symbols[idx("src/p.rs", "p")].centrality;
+        let rank_hub = g.symbols[hub].centrality;
+        assert!(
+            rank_p > rank_t,
+            "product caller centrality ({rank_p}) must exceed test caller ({rank_t})"
+        );
+        assert!(
+            rank_hub > rank_t,
+            "hub centrality ({rank_hub}) must exceed test caller ({rank_t})"
+        );
     }
 }

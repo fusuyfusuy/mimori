@@ -45,19 +45,39 @@ pub fn compute_weighted_pagerank(
     }
 
     let damping = 0.85;
+    let is_test: Vec<bool> = symbols
+        .iter()
+        .map(crate::graph::blast::is_test_symbol)
+        .collect();
+
+    let default_prior = || -> Vec<f64> {
+        let mut p: Vec<f64> = is_test
+            .iter()
+            .map(|&t| if t { crate::graph::TEST_EDGE_WEIGHT } else { 1.0 })
+            .collect();
+        let sum: f64 = p.iter().sum();
+        if sum > 0.0 {
+            for v in &mut p {
+                *v /= sum;
+            }
+        }
+        p
+    };
 
     let mut scores = vec![1.0 / n as f64; n];
     let mut next_scores = vec![0.0; n];
 
     // Personalization vector
+    let mut has_focus = false;
     let personalization: Vec<f64> = match focus_indices {
         Some(indices) if !indices.is_empty() => {
             let mut valid: Vec<usize> = indices.iter().copied().filter(|&i| i < n).collect();
             valid.sort_unstable();
             valid.dedup();
             if valid.is_empty() {
-                vec![1.0 / n as f64; n]
+                default_prior()
             } else {
+                has_focus = true;
                 let mut p = vec![0.0; n];
                 let mass = 1.0 / valid.len() as f64;
                 for idx in valid {
@@ -66,7 +86,7 @@ pub fn compute_weighted_pagerank(
                 p
             }
         }
-        _ => vec![1.0 / n as f64; n],
+        _ => default_prior(),
     };
 
     let edge_w = |u: usize, v: usize| -> f64 { edge_weights.get(&(u, v)).copied().unwrap_or(1.0) };
@@ -134,7 +154,21 @@ pub fn compute_weighted_pagerank(
         }
     }
 
-    // Normalize and assign to symbols
+    // Demote test symbols in unseeded global ranking and normalize to unit mass.
+    if !has_focus {
+        for (score, &test_sym) in scores.iter_mut().zip(is_test.iter()) {
+            if test_sym {
+                *score *= crate::graph::TEST_EDGE_WEIGHT;
+            }
+        }
+        let total: f64 = scores.iter().sum();
+        if total > 0.0 {
+            for score in &mut scores {
+                *score /= total;
+            }
+        }
+    }
+
     for (i, sym) in symbols.iter_mut().enumerate() {
         sym.centrality = scores[i];
     }
