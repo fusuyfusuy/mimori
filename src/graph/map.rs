@@ -130,21 +130,42 @@ pub fn generate_map(
     focus: Option<&str>,
     limit: Option<usize>,
 ) -> MapResult {
-    let clean_scope = scope.map(|s| s.trim_start_matches("./"));
+    generate_map_with_scores(graph, None, scope, focus, limit)
+}
 
-    let mut selected: Vec<&crate::model::Symbol> = graph
+pub fn generate_map_with_scores(
+    graph: &SymbolGraph,
+    personalized: Option<(&[f64], &crate::graph::pagerank::PagerankStats)>,
+    scope: Option<&str>,
+    focus: Option<&str>,
+    limit: Option<usize>,
+) -> MapResult {
+    let clean_scope = scope
+        .map(|s| s.trim_start_matches("./").trim_end_matches('/'))
+        .filter(|s| !s.is_empty() && *s != ".");
+
+    let score_of = |idx: usize| -> f64 {
+        personalized
+            .and_then(|(scores, _)| scores.get(idx).copied())
+            .unwrap_or(graph.symbols[idx].centrality)
+    };
+
+    let mut selected: Vec<(usize, &crate::model::Symbol, f64)> = graph
         .symbols
         .iter()
-        .filter(|s| match clean_scope {
+        .enumerate()
+        .filter(|(_, s)| match clean_scope {
             None => true,
             Some(sc) => in_scope(&s.file, sc),
         })
+        .map(|(idx, s)| (idx, s, score_of(idx)))
         .collect();
 
-    selected.sort_by(|a, b| {
-        b.centrality
-            .partial_cmp(&a.centrality)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    selected.sort_by(|(_, a, sa), (_, b, sb)| {
+        sb.total_cmp(sa)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.name.cmp(&b.name))
     });
 
     let total_symbols = selected.len();
@@ -157,7 +178,7 @@ pub fn generate_map(
     };
 
     let mut file_groups: BTreeMap<String, Vec<MapSymbol>> = BTreeMap::new();
-    for s in &selected {
+    for &(_, s, centrality) in &selected {
         file_groups
             .entry(s.file.clone())
             .or_default()
@@ -168,7 +189,7 @@ pub fn generate_map(
                 start_line: s.start_line,
                 end_line: s.end_line,
                 signature: s.signature.clone(),
-                centrality: s.centrality,
+                centrality,
             });
     }
 
@@ -177,21 +198,25 @@ pub fn generate_map(
         .map(|(file, mut symbols)| {
             symbols.sort_by(|a, b| {
                 b.centrality
-                    .partial_cmp(&a.centrality)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&a.centrality)
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+                    .then_with(|| a.name.cmp(&b.name))
             });
             ModuleMap { file, symbols }
         })
         .collect();
 
-    // Rank modules by their strongest symbol.
+    // Rank modules by their strongest symbol with deterministic file tie-break.
     modules.sort_by(|a, b| {
         let max_a = a.symbols.first().map(|s| s.centrality).unwrap_or(0.0);
         let max_b = b.symbols.first().map(|s| s.centrality).unwrap_or(0.0);
-        max_b
-            .partial_cmp(&max_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        max_b.total_cmp(&max_a).then_with(|| a.file.cmp(&b.file))
     });
+
+    let (pagerank_iters, pagerank_converged) = match personalized {
+        Some((_, stats)) => (stats.iters, stats.converged),
+        None => (graph.pagerank_iters, graph.pagerank_converged),
+    };
 
     MapResult {
         scope: scope.map(|s| s.to_string()),
@@ -203,8 +228,8 @@ pub fn generate_map(
         ambiguous_dropped: graph.resolve_stats.ambiguous_dropped,
         unresolved: graph.resolve_stats.unresolved,
         external: graph.resolve_stats.external,
-        pagerank_iters: graph.pagerank_iters,
-        pagerank_converged: graph.pagerank_converged,
+        pagerank_iters,
+        pagerank_converged,
         indexed_files: graph.coverage.as_ref().map(|c| c.indexed_files),
         crawled_files: graph.coverage.as_ref().map(|c| c.crawled_files),
         unindexed_exts: graph.coverage.as_ref().map(|c| c.unindexed_exts.clone()),
@@ -214,9 +239,52 @@ pub fn generate_map(
 /// Scope matches on path components, so `--scope src` does not also select
 /// `foo/src2/`.
 fn in_scope(file: &str, scope: &str) -> bool {
-    let file = file.trim_start_matches("./");
     let scope = scope.trim_start_matches("./").trim_end_matches('/');
-    file == scope || file.starts_with(&format!("{scope}/")) || file.split('/').any(|c| c == scope)
+    if scope.is_empty() || scope == "." {
+        return true;
+    }
+    let file = file.trim_start_matches("./");
+    file == scope
+        || (file.starts_with(scope) && file.as_bytes().get(scope.len()) == Some(&b'/'))
+        || file.split('/').any(|c| c == scope)
+}
+
+/// Compute personalized PageRank scores without cloning or mutating `SymbolGraph`.
+/// Fails closed if `focus` is specified and resolves to zero symbols.
+pub fn compute_personalized_scores(
+    graph: &SymbolGraph,
+    focus: Option<&str>,
+    seed: Option<&str>,
+    cwd: &Path,
+) -> Result<Option<(Vec<f64>, crate::graph::pagerank::PagerankStats)>> {
+    let mut indices = Vec::new();
+
+    if let Some(target) = focus {
+        let coord = Coordinate::parse(target)?.normalize_against(cwd);
+        let resolved = graph.resolve_all(&coord);
+        if resolved.is_empty() {
+            anyhow::bail!("{}", graph.format_not_found_error(&coord));
+        }
+        indices.extend(resolved);
+    }
+    if let Some(term) = seed {
+        indices.extend(graph.seed_indices(term));
+    }
+
+    indices.sort_unstable();
+    indices.dedup();
+
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::graph::pagerank::compute_pagerank_scores(
+        &graph.symbols,
+        &graph.callers_map,
+        &graph.callees_map,
+        &graph.edge_weights,
+        Some(&indices),
+    )))
 }
 
 /// Apply `--focus` (personalized PageRank around a symbol) and/or `--seed`
@@ -227,21 +295,12 @@ pub fn personalize_map(
     seed: Option<&str>,
     cwd: &Path,
 ) -> Result<()> {
-    let mut indices = Vec::new();
-
-    if let Some(target) = focus {
-        let coord = Coordinate::parse(target)?.normalize_against(cwd);
-        indices.extend(graph.resolve_all(&coord));
-    }
-    if let Some(term) = seed {
-        indices.extend(graph.seed_indices(term));
-    }
-
-    indices.sort_unstable();
-    indices.dedup();
-
-    if !indices.is_empty() {
-        graph.apply_personalization(&indices);
+    if let Some((scores, stats)) = compute_personalized_scores(graph, focus, seed, cwd)? {
+        for (sym, score) in graph.symbols.iter_mut().zip(scores) {
+            sym.centrality = score;
+        }
+        graph.pagerank_iters = stats.iters;
+        graph.pagerank_converged = stats.converged;
     }
     Ok(())
 }
@@ -268,7 +327,7 @@ mod tests {
             mentions: vec![],
             call_counts: Default::default(),
             member_calls: vec![],
-            external_imports: vec![],
+            external_imports: crate::model::symbol::empty_external_imports(),
         }]);
         g.coverage = Some(crate::graph::CoverageStats {
             indexed_files: 1,

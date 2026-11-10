@@ -15,7 +15,7 @@ impl Language {
     pub fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("rs") => Language::Rust,
-            Some("ts") => Language::TypeScript,
+            Some("ts") | Some("mts") | Some("cts") => Language::TypeScript,
             Some("tsx") => Language::TSX,
             Some("js") | Some("mjs") | Some("cjs") => Language::JavaScript,
             Some("jsx") => Language::TSX,

@@ -5,11 +5,11 @@ pub mod map;
 pub mod missing;
 pub mod pagerank;
 
-use crate::model::{Coordinate, SliceResult, Symbol, FOLLOW_LOCAL_MARKER};
+use crate::model::{Coordinate, SliceResult, Symbol, SymbolKind, FOLLOW_LOCAL_MARKER};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Edge-resolution accounting. Silence was the bug: multi-candidate
 /// non-callable names used to vanish without a trace.
@@ -60,51 +60,67 @@ pub struct SymbolGraph {
     pub symbols: Vec<Symbol>,
     pub callers_map: HashMap<usize, Vec<usize>>,
     pub callees_map: HashMap<usize, Vec<usize>>,
-    /// Exact-name → symbol indices, including unqualified short names so
-    /// `resolve` is O(candidates) instead of O(symbols). Built once in `new`.
+    /// Exact-name and qualified-suffix → symbol indices so `resolve` is
+    /// O(candidates) instead of O(symbols). Built once in `new`.
     pub name_to_indices: HashMap<String, Vec<usize>>,
-    /// Full `file:name` coordinate → symbol index. Last writer wins on
-    /// collision; kept for diagnostics and future fast paths, never used
-    /// alone for resolution so duplicate coordinates still report Ambiguous.
-    pub coord_to_index: HashMap<String, usize>,
+    /// Reverse index: mentioned identifier → symbol indices whose `mentions`
+    /// contain it. Eliminates O(V * M) scans in `uses` and `blast`.
+    pub mention_to_indices: HashMap<String, Vec<usize>>,
     pub resolve_stats: ResolveStats,
     pub pagerank_iters: usize,
     pub pagerank_converged: bool,
     pub edge_weights: HashMap<(usize, usize), f64>,
-    pub out_weights: Vec<f64>,
     pub coverage: Option<CoverageStats>,
+    /// Confined workspace root when loaded from disk (`get_or_sync_graph`),
+    /// used to resolve lazy symbol bodies, `--with-imports`, and line slices.
+    pub root: Option<PathBuf>,
+    /// Sorted workspace-relative paths of all indexed files (avoids a second
+    /// SQLite open during `find`).
+    pub indexed_files: Vec<String>,
 }
 
 impl SymbolGraph {
     pub fn new(mut symbols: Vec<Symbol>) -> Self {
         let _p = crate::Phase::start("  name index");
+        // Canonical deterministic ordering independent of SQLite file_id or OS readdir order.
+        symbols.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.end_line.cmp(&b.end_line))
+                .then(a.name.cmp(&b.name))
+                .then(a.kind.as_str().cmp(b.kind.as_str()))
+        });
+
         let mut name_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut coord_to_index: HashMap<String, usize> = HashMap::new();
+        let mut mention_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
+
+        let push_name_idx = |map: &mut HashMap<String, Vec<usize>>, key: &str, idx: usize| {
+            if key.is_empty() {
+                return;
+            }
+            let list = map.entry(key.to_string()).or_default();
+            if list.last() != Some(&idx) {
+                list.push(idx);
+            }
+        };
 
         for (idx, sym) in symbols.iter().enumerate() {
-            name_to_indices
-                .entry(sym.name.clone())
-                .or_default()
-                .push(idx);
-            coord_to_index.insert(sym.coordinate(), idx);
+            push_name_idx(&mut name_to_indices, &sym.name, idx);
 
-            // Also index unqualified names for both `::` and `.` qualified
-            // symbols (e.g. Type::method -> method, Class.method -> method),
-            // matching `name_matches` so indexed resolve stays complete.
-            if let Some(short_name) = sym.name.rsplit("::").next() {
-                if short_name != sym.name {
-                    name_to_indices
-                        .entry(short_name.to_string())
-                        .or_default()
-                        .push(idx);
-                }
+            // Index all `::` and `.` suffix segments (e.g. `Outer::Type::method`
+            // -> `Type::method` and `method`) so every suffix query resolves in O(1).
+            for (pos, _) in sym.name.match_indices("::") {
+                push_name_idx(&mut name_to_indices, &sym.name[pos + 2..], idx);
             }
-            if let Some(short_dot) = sym.name.rsplit('.').next() {
-                if short_dot != sym.name && !short_dot.contains("::") {
-                    name_to_indices
-                        .entry(short_dot.to_string())
-                        .or_default()
-                        .push(idx);
+            for (pos, _) in sym.name.match_indices('.') {
+                push_name_idx(&mut name_to_indices, &sym.name[pos + 1..], idx);
+            }
+
+            for m in &sym.mentions {
+                let list = mention_to_indices.entry(m.clone()).or_default();
+                if list.last() != Some(&idx) {
+                    list.push(idx);
                 }
             }
         }
@@ -136,10 +152,6 @@ impl SymbolGraph {
             })
             .collect();
 
-        // Order each candidate list by file so the same-file probe is a binary
-        // search rather than a scan. Without this, a name defined once per file
-        // costs O(files) per reference, which is quadratic in workspace size --
-        // and names like `new`, `build` or `Config` are defined in most files.
         let mut by_name: HashMap<&str, Vec<(u32, usize)>> =
             HashMap::with_capacity(name_to_indices.len());
         for (name, indices) in &name_to_indices {
@@ -148,32 +160,37 @@ impl SymbolGraph {
             by_name.insert(name.as_str(), v);
         }
 
-        // Calls only. Mentions (properties, types, arg identifiers) never
-        // become call edges — that fan-out put non-callables atop centrality.
+        // Cache external_set per file since symbols are canonically grouped by file.
+        let mut cached_ext_file: Option<u32> = None;
+        let mut external_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
         for u_idx in 0..symbols.len() {
+            if symbols[u_idx].calls.is_empty() {
+                continue;
+            }
             let u_file = sym_file_id[u_idx];
-            let calls = symbols[u_idx].calls.clone();
+            if cached_ext_file != Some(u_file)
+                || symbols[u_idx].external_imports.len() != external_set.len()
+            {
+                external_set.clear();
+                external_set.extend(symbols[u_idx].external_imports.iter().map(|s| s.as_str()));
+                cached_ext_file = Some(u_file);
+            }
             let member_set: std::collections::HashSet<&str> = symbols[u_idx]
                 .member_calls
                 .iter()
                 .map(|s| s.as_str())
                 .collect();
-            let external_set: std::collections::HashSet<&str> = symbols[u_idx]
-                .external_imports
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            // Test-file callers keep their edges (recall) at quarter weight
-            // (precision): test-only call density must not outrank the app.
             let test_penalty = if blast::is_test_symbol(&symbols[u_idx]) {
                 TEST_EDGE_WEIGHT
             } else {
                 1.0
             };
-            for ref_name in &calls {
-                // External first: imported from a non-relative module, never
-                // resolved locally — counted, not silent.
-                if external_set.contains(ref_name.as_str()) {
+            for ref_name in &symbols[u_idx].calls {
+                // External first (unless explicitly invoked via a local receiver `this.parse()`).
+                if !member_set.contains(ref_name.as_str())
+                    && external_set.contains(ref_name.as_str())
+                {
                     stats.external += 1;
                     continue;
                 }
@@ -247,13 +264,26 @@ impl SymbolGraph {
                     continue;
                 }
 
+                let is_unqualified = !lookup_name.contains("::") && !lookup_name.contains('.');
+                let is_member = member_set.contains(ref_name.as_str());
+
                 // Tier 1: same-file. Multiple same-file candidates is
                 // ambiguous — drop and count, never pick index order.
+                // Bare non-member calls (`foo()`) cannot target a qualified
+                // `SymbolKind::Method` (`Type::foo` / `Class.foo`), preventing
+                // `String::from` / `usize::from` tails from linking to local `impl From`.
                 let pos = callable.partition_point(|&(f, _)| f < u_file);
                 let mut same_file: Vec<usize> = Vec::new();
                 let mut i = pos;
                 while i < callable.len() && callable[i].0 == u_file {
-                    same_file.push(callable[i].1);
+                    let v = callable[i].1;
+                    if !is_unqualified
+                        || is_member
+                        || symbols[v].kind != SymbolKind::Method
+                        || symbols[v].name == lookup_name
+                    {
+                        same_file.push(v);
+                    }
                     i += 1;
                 }
                 let has_self = same_file.contains(&u_idx);
@@ -276,8 +306,9 @@ impl SymbolGraph {
                 } else if same_file.len() > 1 {
                     stats.ambiguous_dropped += 1;
                     continue;
-                } else if has_self {
-                    // Self-recursive call: resolved locally, do not fall through to foreign symbols.
+                } else if has_self && is_member {
+                    // Self-recursive member call (`self.foo()`): resolved locally,
+                    // do not fall through to foreign symbols.
                     stats.resolved += 1;
                     continue;
                 }
@@ -285,8 +316,24 @@ impl SymbolGraph {
                 // receiver is the weakest evidence in the graph — same-file
                 // or drop, never a fuzzy tier. Short-name unique-global on
                 // a member call is how 576 false callers happened.
-                if member_set.contains(ref_name.as_str()) {
+                if is_member {
                     stats.ambiguous_dropped += 1;
+                    continue;
+                }
+                // Cross-file unqualified calls never match qualified `SymbolKind::Method`
+                // (`Type::method` / `Class.method`): associated methods require a type
+                // qualifier or receiver, so bare `from` must never resolve to `Wrapper::from`.
+                let cross_callable: Vec<(u32, usize)> = callable
+                    .iter()
+                    .copied()
+                    .filter(|&(_, v)| {
+                        !is_unqualified
+                            || symbols[v].kind != SymbolKind::Method
+                            || symbols[v].name == lookup_name
+                    })
+                    .collect();
+                if cross_callable.is_empty() {
+                    stats.unresolved += 1;
                     continue;
                 }
                 // Tier 2: same-directory (P2). Sits between same-file and
@@ -299,7 +346,7 @@ impl SymbolGraph {
                 let fuzzy_ok = ref_name != "new" && ref_name != "default";
                 let u_dir = &sym_dir[u_idx];
                 let mut same_dir: Vec<usize> = if fuzzy_ok {
-                    callable
+                    cross_callable
                         .iter()
                         .filter(|&&(_, v)| v != u_idx && &sym_dir[v] == u_dir)
                         .map(|&(_, v)| v)
@@ -332,8 +379,8 @@ impl SymbolGraph {
                 // Tier 3: unique-global (bare identifiers only — member
                 // calls never reach here). Anything multi-candidate
                 // (`new`, `build`, `Config`) drops — counted, not silent.
-                if callable.len() == 1 {
-                    let v_idx = callable[0].1;
+                if cross_callable.len() == 1 {
+                    let v_idx = cross_callable[0].1;
                     if u_idx != v_idx {
                         add_weighted_edge(
                             u_idx,
@@ -347,7 +394,7 @@ impl SymbolGraph {
                     }
                 } else {
                     // Self never breaks a tie: resolve among the others.
-                    let non_self: Vec<usize> = callable
+                    let non_self: Vec<usize> = cross_callable
                         .iter()
                         .filter(|&&(_, v)| v != u_idx)
                         .map(|&(_, v)| v)
@@ -380,27 +427,19 @@ impl SymbolGraph {
         );
 
         drop(_p);
-        let out_weights: Vec<f64> = (0..symbols.len())
-            .map(|u| match callees_map.get(&u) {
-                Some(callees) => callees
-                    .iter()
-                    .map(|&v| edge_weights.get(&(u, v)).copied().unwrap_or(1.0))
-                    .sum(),
-                None => 0.0,
-            })
-            .collect();
         SymbolGraph {
             symbols,
             callers_map,
             callees_map,
             name_to_indices,
-            coord_to_index,
+            mention_to_indices,
             resolve_stats: stats,
             pagerank_iters: pr.iters,
             pagerank_converged: pr.converged,
             edge_weights,
-            out_weights,
             coverage: None,
+            root: None,
+            indexed_files: Vec::new(),
         }
     }
 
@@ -450,73 +489,89 @@ impl SymbolGraph {
     /// backs the `uses` verb so mention data stays queryable.
     pub fn mentioners(&self, coord: &Coordinate) -> Vec<&Symbol> {
         let resolved = self.resolve_all(coord);
-        let mut out: Vec<&Symbol> = if !resolved.is_empty() {
-            let mut indices: Vec<usize> = resolved
-                .into_iter()
-                .flat_map(|idx| self.mentioner_indices(idx))
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            indices.sort_unstable();
-            indices.into_iter().map(|idx| &self.symbols[idx]).collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut indices = Vec::new();
+        if !resolved.is_empty() {
+            for idx in resolved {
+                for m_idx in self.mentioner_indices(idx) {
+                    if seen.insert(m_idx) {
+                        indices.push(m_idx);
+                    }
+                }
+            }
         } else {
-            // Unresolvable target (e.g. a local): fall back to the raw name so
-            // `uses` still answers instead of going silent.
             let Some(name) = coord.name() else {
                 return Vec::new();
             };
             let short = name.rsplit([':', '.']).next().unwrap_or(name);
-            let mut out = Vec::new();
-            for sym in &self.symbols {
-                if sym.mentions.iter().any(|m| m == name || m == short)
-                    && !out
-                        .iter()
-                        .any(|s: &&Symbol| s.coordinate() == sym.coordinate())
-                {
-                    out.push(sym);
+            for key in [name, short] {
+                if let Some(list) = self.mention_to_indices.get(key) {
+                    for &m_idx in list {
+                        if seen.insert(m_idx) {
+                            indices.push(m_idx);
+                        }
+                    }
                 }
             }
-            out
-        };
-        out.sort_by(|a, b| {
-            a.file
-                .cmp(&b.file)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.name.cmp(&b.name))
-        });
-        out
+        }
+        indices.sort_unstable();
+        indices.into_iter().map(|idx| &self.symbols[idx]).collect()
     }
 
-    /// Index-level mentioner lookup: indices whose `mentions` name the
-    /// target symbol (full name or unqualified short name).
+    /// Index-level mentioner lookup via O(1) `mention_to_indices`.
     pub fn mentioner_indices(&self, target_idx: usize) -> Vec<usize> {
         let name = self.symbols[target_idx].name.as_str();
         let short = name.rsplit([':', '.']).next().unwrap_or(name);
-        self.symbols
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| *i != target_idx && s.mentions.iter().any(|m| m == name || m == short))
-            .map(|(i, _)| i)
-            .collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for key in [name, short] {
+            if let Some(list) = self.mention_to_indices.get(key) {
+                for &i in list {
+                    if i != target_idx && seen.insert(i) {
+                        out.push(i);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Upstream rows for `up`: strong callers plus weak value-use
     /// mentioners. A symbol that both calls and mentions appears once, as
     /// a caller — the call edge wins.
     pub fn upstream(&self, coord: &Coordinate) -> (Vec<&Symbol>, Vec<&Symbol>) {
-        let callers = self.callers(coord);
-        let weak: Vec<&Symbol> = self
-            .mentioners(coord)
-            .into_iter()
-            .filter(|m| !callers.iter().any(|c| c.coordinate() == m.coordinate()))
-            .collect();
+        let caller_indices = self.caller_index_set(coord);
+        let callers: Vec<&Symbol> = caller_indices.iter().map(|&i| &self.symbols[i]).collect();
+        let seen_set: std::collections::HashSet<usize> = caller_indices.into_iter().collect();
+        let resolved = self.resolve_all(coord);
+        let mut weak_indices = Vec::new();
+        let mut weak_seen = std::collections::HashSet::new();
+        if !resolved.is_empty() {
+            for idx in resolved {
+                for m_idx in self.mentioner_indices(idx) {
+                    if !seen_set.contains(&m_idx) && weak_seen.insert(m_idx) {
+                        weak_indices.push(m_idx);
+                    }
+                }
+            }
+        } else if let Some(name) = coord.name() {
+            let short = name.rsplit([':', '.']).next().unwrap_or(name);
+            for key in [name, short] {
+                if let Some(list) = self.mention_to_indices.get(key) {
+                    for &m_idx in list {
+                        if !seen_set.contains(&m_idx) && weak_seen.insert(m_idx) {
+                            weak_indices.push(m_idx);
+                        }
+                    }
+                }
+            }
+        }
+        weak_indices.sort_unstable();
+        let weak = weak_indices.into_iter().map(|i| &self.symbols[i]).collect();
         (callers, weak)
     }
 
-    /// Resolve a coordinate to every symbol in the winning match tier.
-    ///
-    /// Used by up/down/blast/focus, which legitimately want all matches for a
-    /// bare name.
     pub fn resolve_all(&self, coord: &Coordinate) -> Vec<usize> {
         match self.resolve(coord) {
             Resolution::Unique(idx) => vec![idx],
@@ -525,58 +580,49 @@ impl SymbolGraph {
         }
     }
 
-    /// Resolve a coordinate, distinguishing "one match" from "several".
-    ///
-    /// Matching is tiered and the first tier that produces candidates is the
-    /// answer -- but more than one candidate in a tier is Ambiguous, never a
-    /// silent pick. Previously an exact coordinate could match another file by
-    /// basename and `build_slice` would take `indices[0]`, returning a
-    /// different file's source under the requested path.
     pub fn resolve(&self, coord: &Coordinate) -> Resolution {
         let Some(name) = coord.name() else {
             return Resolution::NotFound;
         };
 
-        // O(candidates) via the persisted index built in `new`, not O(symbols).
-        // The index holds exact names plus `::`/`.` short names, covering
-        // every `name_matches` case except a multi-segment suffix query like
-        // `Type::method` against a stored `Module::Type::method`.
-        let mut by_name: Vec<usize> = self.name_to_indices.get(name).cloned().unwrap_or_default();
-
-        if by_name.is_empty() && (name.contains("::") || name.contains('.')) {
-            by_name = self
-                .symbols
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| name_matches(&s.name, name))
-                .map(|(idx, _)| idx)
-                .collect();
-        }
-
+        let Some(by_name) = self.name_to_indices.get(name) else {
+            return Resolution::NotFound;
+        };
         if by_name.is_empty() {
             return Resolution::NotFound;
         }
 
         let Some(target_file) = coord.file() else {
-            return Resolution::from(by_name);
+            return Resolution::from(by_name.clone());
         };
 
-        // Tier 1: the exact workspace-relative path.
-        // Tier 2: a path suffix on a component boundary.
-        // Tier 3: the basename alone.
-        for tier in [
-            |a: &Path, b: &Path| a == b,
-            component_suffix_match,
-            basename_match,
-        ] {
-            let hits: Vec<usize> = by_name
-                .iter()
-                .copied()
-                .filter(|&idx| tier(Path::new(&self.symbols[idx].file), target_file))
-                .collect();
-            if !hits.is_empty() {
-                return Resolution::from(hits);
-            }
+        let clean_target_str = crate::workspace::walker::normalize_rel_str(target_file);
+        let clean_target = Path::new(
+            clean_target_str
+                .strip_prefix("./")
+                .unwrap_or(&clean_target_str),
+        );
+
+        // Tier 1: exact workspace-relative path.
+        let exact_hits: Vec<usize> = by_name
+            .iter()
+            .copied()
+            .filter(|&idx| Path::new(&self.symbols[idx].file) == clean_target)
+            .collect();
+        if !exact_hits.is_empty() {
+            return Resolution::from(exact_hits);
+        }
+
+        // Tier 2 (Option B): strict component-boundary suffix (`Path::ends_with`
+        // handles both multi-segment `alpha/mod.rs` and 1-segment `mod.rs`
+        // basenames without matching contradictory directory prefixes).
+        let suffix_hits: Vec<usize> = by_name
+            .iter()
+            .copied()
+            .filter(|&idx| Path::new(&self.symbols[idx].file).ends_with(clean_target))
+            .collect();
+        if !suffix_hits.is_empty() {
+            return Resolution::from(suffix_hits);
         }
 
         Resolution::NotFound
@@ -615,46 +661,73 @@ impl SymbolGraph {
         indices
     }
 
-    pub fn callers(&self, coord: &Coordinate) -> Vec<&Symbol> {
+    fn caller_index_set(&self, coord: &Coordinate) -> Vec<usize> {
         let indices = self.resolve_upstream_targets(coord);
-        let mut caller_symbols = Vec::new();
-
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
         for target_idx in indices {
             if let Some(callers) = self.callers_map.get(&target_idx) {
                 for &caller_idx in callers {
-                    let sym = &self.symbols[caller_idx];
-                    if !caller_symbols
-                        .iter()
-                        .any(|s: &&Symbol| s.coordinate() == sym.coordinate())
-                    {
-                        caller_symbols.push(sym);
+                    if seen.insert(caller_idx) {
+                        out.push(caller_idx);
                     }
                 }
             }
         }
+        out.sort_unstable();
+        out
+    }
 
-        caller_symbols
+    pub fn callers(&self, coord: &Coordinate) -> Vec<&Symbol> {
+        self.caller_index_set(coord)
+            .into_iter()
+            .map(|i| &self.symbols[i])
+            .collect()
     }
 
     pub fn callees(&self, coord: &Coordinate) -> Vec<&Symbol> {
         let indices = self.resolve_all(coord);
-        let mut callee_symbols = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
 
         for target_idx in indices {
             if let Some(callees) = self.callees_map.get(&target_idx) {
                 for &callee_idx in callees {
-                    let sym = &self.symbols[callee_idx];
-                    if !callee_symbols
-                        .iter()
-                        .any(|s: &&Symbol| s.coordinate() == sym.coordinate())
-                    {
-                        callee_symbols.push(sym);
+                    if seen.insert(callee_idx) {
+                        out.push(callee_idx);
                     }
                 }
             }
         }
+        out.sort_unstable();
+        out.into_iter().map(|i| &self.symbols[i]).collect()
+    }
 
-        callee_symbols
+    /// Read a symbol's source lines lazily from its confined workspace file,
+    /// falling back to `sym.body` for pure in-memory unit-test graphs.
+    pub fn read_symbol_body(&self, sym: &Symbol) -> Result<String> {
+        if !sym.body.is_empty() {
+            return Ok(sym.body.clone());
+        }
+        let full_path = match &self.root {
+            Some(root) => {
+                crate::workspace::walker::confine_to_workspace(root, Path::new(&sym.file))?
+            }
+            None => PathBuf::from(&sym.file),
+        };
+        let bytes = fs::read(&full_path)
+            .with_context(|| format!("Failed to read source file '{}'", sym.file))?;
+        let content = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() || sym.start_line == 0 || sym.start_line > lines.len() {
+            return Ok(String::new());
+        }
+        let start_idx = sym.start_line - 1;
+        let end_idx = sym.end_line.min(lines.len());
+        if start_idx >= end_idx {
+            return Ok(String::new());
+        }
+        Ok(lines[start_idx..end_idx].join("\n"))
     }
 
     pub fn build_slice(
@@ -664,7 +737,11 @@ impl SymbolGraph {
         with_imports: bool,
     ) -> Result<SliceResult> {
         if let Coordinate::Lines { file, start, end } = coord {
-            return slice_line_coordinate(file, *start, *end, with_imports);
+            let resolved = match &self.root {
+                Some(root) => crate::workspace::walker::confine_to_workspace(root, file)?,
+                None => file.clone(),
+            };
+            return slice_line_coordinate(&resolved, *start, *end, with_imports);
         }
 
         let target_idx = match self.resolve(coord) {
@@ -674,8 +751,9 @@ impl SymbolGraph {
                 let mut matches: Vec<&Symbol> = indices.iter().map(|&i| &self.symbols[i]).collect();
                 matches.sort_by(|a, b| {
                     b.centrality
-                        .partial_cmp(&a.centrality)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .total_cmp(&a.centrality)
+                        .then_with(|| a.file.cmp(&b.file))
+                        .then_with(|| a.start_line.cmp(&b.start_line))
                 });
                 let coords: Vec<String> = matches
                     .iter()
@@ -715,7 +793,9 @@ impl SymbolGraph {
             .map(|s| format!("{} (L{}-L{})", s.coordinate(), s.start_line, s.end_line))
             .collect();
 
-        let mut body = truncate_body(&sym.body, sym.end_line - sym.start_line);
+        let raw_sym_body = self.read_symbol_body(sym)?;
+        let span = sym.end_line.saturating_sub(sym.start_line);
+        let mut body = truncate_body(&raw_sym_body, span);
 
         if follow_local {
             let local_callees: Vec<&&Symbol> =
@@ -724,30 +804,43 @@ impl SymbolGraph {
             if !local_callees.is_empty() {
                 body.push_str(FOLLOW_LOCAL_MARKER);
                 for lc in local_callees {
+                    let lc_body = self.read_symbol_body(lc).unwrap_or_default();
                     body.push_str(&format!(
                         "\n// Symbol: `{}` (L{}-L{})\n{}\n",
-                        lc.name, lc.start_line, lc.end_line, lc.body
+                        lc.name, lc.start_line, lc.end_line, lc_body
                     ));
                 }
             }
         }
 
         let imports = if with_imports {
-            let imps = extract_file_imports(Path::new(&sym.file));
+            let import_path = match &self.root {
+                Some(root) => {
+                    crate::workspace::walker::confine_to_workspace(root, Path::new(&sym.file)).ok()
+                }
+                None => Some(PathBuf::from(&sym.file)),
+            };
+            let imps = import_path
+                .as_deref()
+                .map(extract_file_imports)
+                .unwrap_or_default();
             (!imps.is_empty()).then_some(imps)
         } else {
             None
         };
 
+        let mut sym_meta = sym.clone();
+        sym_meta.body.clear();
+
         Ok(SliceResult {
             coordinate: sym.coordinate(),
             file: sym.file.clone(),
-            symbol: Some(sym.clone()),
+            symbol: Some(sym_meta),
             line_range: Some((sym.start_line, sym.end_line)),
             content: body,
             callers,
             callees,
-            total_lines: sym.end_line - sym.start_line + 1,
+            total_lines: span + 1,
             imports,
         })
     }
@@ -756,21 +849,23 @@ impl SymbolGraph {
         let bare = coord.name().unwrap_or("");
         let mut msg = format!("Symbol '{}' not found in workspace.", coord);
         if let Some(target_file) = coord.file() {
-            let mut file_syms: Vec<&Symbol> = Vec::new();
-            for tier in [
-                |a: &Path, b: &Path| a == b,
-                component_suffix_match,
-                basename_match,
-            ] {
-                let hits: Vec<&Symbol> = self
+            let clean_target_str = crate::workspace::walker::normalize_rel_str(target_file);
+            let clean_target = Path::new(
+                clean_target_str
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_target_str),
+            );
+            let mut file_syms: Vec<&Symbol> = self
+                .symbols
+                .iter()
+                .filter(|s| Path::new(&s.file) == clean_target)
+                .collect();
+            if file_syms.is_empty() {
+                file_syms = self
                     .symbols
                     .iter()
-                    .filter(|s| tier(Path::new(&s.file), target_file))
+                    .filter(|s| Path::new(&s.file).ends_with(clean_target))
                     .collect();
-                if !hits.is_empty() {
-                    file_syms = hits;
-                    break;
-                }
             }
             if !file_syms.is_empty() {
                 let q = bare.to_lowercase();
@@ -843,25 +938,12 @@ impl From<Vec<usize>> for Resolution {
     }
 }
 
-fn name_matches(symbol_name: &str, target: &str) -> bool {
-    symbol_name == target
-        || symbol_name.ends_with(&format!("::{}", target))
-        || symbol_name.ends_with(&format!(".{}", target))
-}
-
 /// True when one path is a suffix of the other on a component boundary.
 fn component_suffix_match(a: &Path, b: &Path) -> bool {
     let av: Vec<_> = a.components().collect();
     let bv: Vec<_> = b.components().collect();
     let n = av.len().min(bv.len());
     n > 0 && av[av.len() - n..] == bv[bv.len() - n..]
-}
-
-fn basename_match(a: &Path, b: &Path) -> bool {
-    match (a.file_name(), b.file_name()) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
-    }
 }
 
 /// Cap very large bodies, keeping the head and tail.
@@ -969,12 +1051,12 @@ fn add_edge(
     callees_map: &mut HashMap<usize, Vec<usize>>,
 ) {
     let callers = callers_map.entry(callee_idx).or_default();
-    if !callers.contains(&caller_idx) {
+    if callers.last() != Some(&caller_idx) && !callers.contains(&caller_idx) {
         callers.push(caller_idx);
     }
 
     let callees = callees_map.entry(caller_idx).or_default();
-    if !callees.contains(&callee_idx) {
+    if callees.last() != Some(&callee_idx) && !callees.contains(&callee_idx) {
         callees.push(callee_idx);
     }
 }
@@ -988,8 +1070,12 @@ fn add_weighted_edge(
     edge_weights: &mut HashMap<(usize, usize), f64>,
 ) {
     add_edge(caller_idx, callee_idx, callers_map, callees_map);
-    // Multiple call names resolving to one callee sum: combined evidence.
-    *edge_weights.entry((caller_idx, callee_idx)).or_insert(0.0) += weight;
+    // Keep max multiplicity weight when dual-emitted forms (e.g. `self.foo()`
+    // emitting both `foo` and `Type::foo`) resolve to the same callee.
+    edge_weights
+        .entry((caller_idx, callee_idx))
+        .and_modify(|e| *e = e.max(weight))
+        .or_insert(weight);
 }
 
 /// Slice a line range straight off disk. Needs no index.
@@ -1204,7 +1290,7 @@ mod tests {
             mentions: vec![],
             call_counts: Default::default(),
             member_calls: vec![],
-            external_imports: vec![],
+            external_imports: crate::model::symbol::empty_external_imports(),
         }
     }
 
@@ -1267,13 +1353,9 @@ mod tests {
         ));
 
         // "ha/mod.rs" is a string suffix of "alpha/mod.rs" but not a component
-        // suffix, so the suffix tier must not resolve it. It falls through to
-        // the basename tier, which sees both files and reports ambiguity rather
-        // than guessing.
-        assert!(matches!(
-            at(&g, "ha/mod.rs:handler"),
-            Resolution::Ambiguous(_)
-        ));
+        // suffix; under Option B strict component-suffix matching it returns
+        // NotFound instead of falling through to unrelated files sharing `mod.rs`.
+        assert!(matches!(at(&g, "ha/mod.rs:handler"), Resolution::NotFound));
     }
 
     #[test]
@@ -1319,7 +1401,11 @@ mod tests {
     ) -> Symbol {
         let mut s = sym_with_refs(file, name, calls);
         s.member_calls = member.iter().map(|r| r.to_string()).collect();
-        s.external_imports = external.iter().map(|r| r.to_string()).collect();
+        s.external_imports = external
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .into();
         s
     }
 
@@ -1395,7 +1481,7 @@ mod tests {
                 mentions: vec![],
                 call_counts: Default::default(),
                 member_calls: vec![],
-                external_imports: vec![],
+                external_imports: crate::model::symbol::empty_external_imports(),
             }
         }
         let mut syms = vec![field("a.rs"), field("b.rs"), field("c.rs")];
@@ -1460,7 +1546,7 @@ mod tests {
                 mentions: vec![],
                 call_counts: Default::default(),
                 member_calls: vec![],
-                external_imports: vec![],
+                external_imports: crate::model::symbol::empty_external_imports(),
             },
         ];
         for i in 0..10 {
@@ -1528,7 +1614,7 @@ mod tests {
                 mentions: vec![],
                 call_counts: Default::default(),
                 member_calls: vec![],
-                external_imports: vec![],
+                external_imports: crate::model::symbol::empty_external_imports(),
             },
         ]);
         let callees = g.callees(&Coordinate::parse("a.rs:caller").unwrap());

@@ -178,6 +178,67 @@ enum Traversal {
     Downstream,
 }
 
+const GENERIC_LEAF_NAMES: &[&str] = &[
+    "new", "from", "default", "into", "try_from", "try_into", "with", "drop", "next", "read",
+    "write", "open", "close", "load", "save", "init", "build", "parse", "run", "get", "set", "len",
+    "is_empty", "clone", "fmt", "eq", "cmp", "hash", "deref", "index", "add", "sub",
+];
+
+fn is_generic_leaf_ident(leaf: &str, full_name: &str) -> bool {
+    let is_qualified = full_name.contains("::") || full_name.contains('.');
+    is_qualified && (leaf.len() < 4 || GENERIC_LEAF_NAMES.contains(&leaf))
+}
+
+struct FileLineCache<'a> {
+    root: Option<&'a Path>,
+    files: std::collections::HashMap<&'a str, Vec<String>>,
+}
+
+impl<'a> FileLineCache<'a> {
+    fn new(root: Option<&'a Path>) -> Self {
+        Self {
+            root,
+            files: std::collections::HashMap::new(),
+        }
+    }
+
+    fn with_symbol_lines<F>(&mut self, sym: &'a Symbol, mut f: F)
+    where
+        F: FnMut(usize, &str),
+    {
+        if !sym.body.is_empty() {
+            for (idx, line) in sym.body.lines().enumerate() {
+                f(idx, line);
+            }
+            return;
+        }
+        let Some(root) = self.root else {
+            return;
+        };
+        let lines = self.files.entry(sym.file.as_str()).or_insert_with(|| {
+            let Ok(path) =
+                crate::workspace::walker::confine_to_workspace(root, Path::new(&sym.file))
+            else {
+                return Vec::new();
+            };
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        });
+        if lines.is_empty() {
+            return;
+        }
+        let start_idx = sym.start_line.saturating_sub(1);
+        if start_idx >= lines.len() {
+            return;
+        }
+        let end_idx = sym.end_line.max(sym.start_line).min(lines.len());
+        for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
+            f(idx, line);
+        }
+    }
+}
+
 fn traverse(
     graph: &SymbolGraph,
     coord: &Coordinate,
@@ -194,11 +255,27 @@ fn traverse(
         bail!("Target {}", graph.format_not_found_error(coord));
     }
 
-    let seed_short_names: Vec<&str> = indices
+    let mut file_cache = FileLineCache::new(graph.root.as_deref());
+
+    let call_target_names: Vec<&str> = indices
         .iter()
         .map(|&i| {
             let name = graph.symbols[i].name.as_str();
             name.rsplit([':', '.']).next().unwrap_or(name)
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let literal_seed_names: Vec<&str> = indices
+        .iter()
+        .filter_map(|&i| {
+            let full = graph.symbols[i].name.as_str();
+            let leaf = full.rsplit([':', '.']).next().unwrap_or(full);
+            if is_generic_leaf_ident(leaf, full) {
+                None
+            } else {
+                Some(leaf)
+            }
         })
         .collect();
 
@@ -212,7 +289,9 @@ fn traverse(
 
     let mut affected = Vec::new();
     let mut entry_points = Vec::new();
+    let mut seen_entry_indices = HashSet::new();
     let mut test_suites = Vec::new();
+    let mut seen_test_suites = HashSet::new();
 
     while let Some((curr_idx, curr_depth)) = queue.pop_front() {
         if curr_depth >= depth_limit {
@@ -231,21 +310,21 @@ fn traverse(
                     let sym = &graph.symbols[next_idx];
                     let next_depth = curr_depth + 1;
 
-                    let (is_entry_point, is_sink) = match direction {
+                    let (is_ep, is_sk) = match direction {
                         Traversal::Upstream => (is_entry_point(graph, next_idx, sym), false),
                         Traversal::Downstream => (false, is_sink(graph, next_idx)),
                     };
                     let is_test = is_test_symbol(sym);
 
-                    if (is_entry_point || is_sink) && !entry_points.contains(&sym.coordinate()) {
+                    if (is_ep || is_sk) && seen_entry_indices.insert(next_idx) {
                         entry_points.push(sym.coordinate());
                     }
-                    if is_test && !test_suites.contains(&sym.file) {
+                    if is_test && seen_test_suites.insert(sym.file.clone()) {
                         test_suites.push(sym.file.clone());
                     }
 
                     let call_lines = if direction == Traversal::Upstream && next_depth == 1 {
-                        find_call_site_lines(sym, &seed_short_names)
+                        find_call_site_lines(&mut file_cache, sym, &call_target_names)
                     } else {
                         Vec::new()
                     };
@@ -256,9 +335,9 @@ fn traverse(
                         file: sym.file.clone(),
                         coordinate: sym.coordinate(),
                         depth: next_depth,
-                        is_entry_point,
+                        is_entry_point: is_ep,
                         is_test,
-                        is_sink,
+                        is_sink: is_sk,
                         is_value_use: false,
                         call_lines,
                     });
@@ -272,22 +351,16 @@ fn traverse(
     // Weakest tier (upstream only): direct mentioners of the seed targets.
     // Never traversed, never entry points; anything the call closure
     // already reached stays a call row (call wins).
+    const MAX_VALUE_USES: usize = 100;
     let mut value_uses = Vec::new();
     let mut literal_test_mentions = Vec::new();
     if direction == Traversal::Upstream {
-        for &seed in &indices {
+        'seeds: for &seed in &indices {
             for m_idx in graph.mentioner_indices(seed) {
-                if visited.contains(&m_idx) {
+                if !visited.insert(m_idx) {
                     continue;
                 }
-                visited.insert(m_idx);
                 let sym = &graph.symbols[m_idx];
-                if value_uses
-                    .iter()
-                    .any(|n: &BlastNode| n.coordinate == sym.coordinate())
-                {
-                    continue;
-                }
                 value_uses.push(BlastNode {
                     name: sym.name.clone(),
                     kind: sym.kind.as_str().to_string(),
@@ -300,9 +373,13 @@ fn traverse(
                     is_value_use: true,
                     call_lines: Vec::new(),
                 });
+                if value_uses.len() >= MAX_VALUE_USES {
+                    break 'seeds;
+                }
             }
         }
-        literal_test_mentions = collect_literal_test_mentions(graph, &visited, &seed_short_names);
+        literal_test_mentions =
+            collect_literal_test_mentions(graph, &mut file_cache, &visited, &literal_seed_names);
     }
 
     Ok(BlastResult {
@@ -320,37 +397,209 @@ fn traverse(
     })
 }
 
-fn find_call_site_lines(caller: &Symbol, target_names: &[&str]) -> Vec<usize> {
+/// Multi-source upstream BFS for `mimori diff`: computes the combined upstream
+/// blast cone for `mutated_indices` in a single `O(V + E)` pass instead of
+/// running `|M|` full graph traversals.
+pub(crate) fn traverse_multi_upstream(
+    graph: &SymbolGraph,
+    mutated_indices: &[usize],
+    depth_limit: usize,
+) -> (Vec<BlastNode>, Vec<String>, Vec<String>, Vec<String>) {
+    if mutated_indices.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+
+    let mut file_cache = FileLineCache::new(graph.root.as_deref());
+    let mutated_set: HashSet<usize> = mutated_indices.iter().copied().collect();
+
+    // Expand class/struct seeds to include constructor callers (`new X(...)`),
+    // matching `resolve_upstream_targets`.
+    let mut seed_indices: Vec<usize> = Vec::new();
+    let mut seen_seeds: HashSet<usize> = HashSet::new();
+    for &idx in mutated_indices {
+        if seen_seeds.insert(idx) {
+            seed_indices.push(idx);
+        }
+        let sym = &graph.symbols[idx];
+        if matches!(
+            sym.kind,
+            crate::model::SymbolKind::Class | crate::model::SymbolKind::Struct
+        ) {
+            for sep in [".", "::"] {
+                let ctor = format!("{}{sep}constructor", sym.name);
+                if let Some(c_idxs) = graph.name_to_indices.get(&ctor) {
+                    for &c_idx in c_idxs {
+                        if graph.symbols[c_idx].file == sym.file && seen_seeds.insert(c_idx) {
+                            seed_indices.push(c_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut call_target_names: Vec<&str> = seed_indices
+        .iter()
+        .map(|&i| {
+            let name = graph.symbols[i].name.as_str();
+            name.rsplit([':', '.']).next().unwrap_or(name)
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    call_target_names.sort_unstable();
+    call_target_names.dedup();
+
+    let mut literal_seed_names: Vec<&str> = seed_indices
+        .iter()
+        .filter_map(|&i| {
+            let full = graph.symbols[i].name.as_str();
+            let leaf = full.rsplit([':', '.']).next().unwrap_or(full);
+            if is_generic_leaf_ident(leaf, full) {
+                None
+            } else {
+                Some(leaf)
+            }
+        })
+        .collect();
+    literal_seed_names.sort_unstable();
+    literal_seed_names.dedup();
+
+    let mut queue = VecDeque::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+    for &idx in &seed_indices {
+        visited.insert(idx);
+        queue.push_back((idx, 0usize));
+    }
+
+    let mut affected = Vec::new();
+    let mut entry_points = Vec::new();
+    let mut seen_entry_indices = HashSet::new();
+    let mut test_suites = Vec::new();
+    let mut seen_test_suites = HashSet::new();
+
+    while let Some((curr_idx, curr_depth)) = queue.pop_front() {
+        if curr_depth >= depth_limit {
+            continue;
+        }
+        let Some(callers) = graph.callers_map.get(&curr_idx) else {
+            continue;
+        };
+        for &next_idx in callers {
+            let sym = &graph.symbols[next_idx];
+            let is_ep = is_entry_point(graph, next_idx, sym);
+            let is_test = is_test_symbol(sym);
+
+            // If one mutated symbol calls another mutated symbol, record any
+            // entry-point / test-suite status just like per-symbol blast did,
+            // while keeping mutated symbols out of `affected`.
+            if mutated_set.contains(&next_idx) {
+                if next_idx != curr_idx {
+                    if is_ep && seen_entry_indices.insert(next_idx) {
+                        entry_points.push(sym.coordinate());
+                    }
+                    if is_test && seen_test_suites.insert(sym.file.clone()) {
+                        test_suites.push(sym.file.clone());
+                    }
+                }
+                continue;
+            }
+
+            if !visited.insert(next_idx) {
+                continue;
+            }
+            let next_depth = curr_depth + 1;
+            if is_ep && seen_entry_indices.insert(next_idx) {
+                entry_points.push(sym.coordinate());
+            }
+            if is_test && seen_test_suites.insert(sym.file.clone()) {
+                test_suites.push(sym.file.clone());
+            }
+            let call_lines = if next_depth == 1 {
+                find_call_site_lines(&mut file_cache, sym, &call_target_names)
+            } else {
+                Vec::new()
+            };
+            affected.push(BlastNode {
+                name: sym.name.clone(),
+                kind: sym.kind.as_str().to_string(),
+                file: sym.file.clone(),
+                coordinate: sym.coordinate(),
+                depth: next_depth,
+                is_entry_point: is_ep,
+                is_test,
+                is_sink: false,
+                is_value_use: false,
+                call_lines,
+            });
+            queue.push_back((next_idx, next_depth));
+        }
+    }
+
+    affected.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| a.coordinate.cmp(&b.coordinate))
+    });
+
+    // Mark mentioners as visited before scanning literal test mentions,
+    // matching `traverse`.
+    for &seed in &seed_indices {
+        for m_idx in graph.mentioner_indices(seed) {
+            visited.insert(m_idx);
+        }
+    }
+    let literal_test_mentions =
+        collect_literal_test_mentions(graph, &mut file_cache, &visited, &literal_seed_names);
+
+    (affected, entry_points, test_suites, literal_test_mentions)
+}
+
+fn find_call_site_lines<'a>(
+    file_cache: &mut FileLineCache<'a>,
+    caller: &'a Symbol,
+    target_names: &[&str],
+) -> Vec<usize> {
+    if target_names.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    let lines: Vec<&str> = caller.body.lines().collect();
-    let skip_first = usize::from(lines.len() > 1);
-    for (idx, line) in lines.iter().enumerate().skip(skip_first) {
+    let multi_line = caller.end_line > caller.start_line
+        || (!caller.body.is_empty() && caller.body.contains('\n'));
+    file_cache.with_symbol_lines(caller, |idx, line| {
+        if multi_line && idx == 0 {
+            return;
+        }
         let trimmed = line.trim();
         if trimmed.starts_with("//")
             || trimmed.starts_with('#')
             || trimmed.starts_with('*')
             || trimmed.starts_with("/*")
         {
-            continue;
+            return;
         }
         if target_names.iter().any(|&t| has_call_token(trimmed, t)) {
             out.push(caller.start_line + idx);
         }
-    }
+    });
     out
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 fn has_call_token(line: &str, ident: &str) -> bool {
     if ident.is_empty() {
         return false;
     }
-    let bytes = line.as_bytes();
     let mut start = 0;
     while let Some(pos) = line[start..].find(ident) {
         let abs = start + pos;
         let end = abs + ident.len();
-        let prev_ok =
-            abs == 0 || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
+        let prev_ok = line[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
         let rest = line[end..].trim_start();
         let next_ok = rest.starts_with('(')
             || rest.starts_with('!')
@@ -368,15 +617,15 @@ fn has_ident_token(line: &str, ident: &str) -> bool {
     if ident.len() < 3 {
         return false;
     }
-    let bytes = line.as_bytes();
     let mut start = 0;
     while let Some(pos) = line[start..].find(ident) {
         let abs = start + pos;
         let end = abs + ident.len();
-        let prev_ok =
-            abs == 0 || (!bytes[abs - 1].is_ascii_alphanumeric() && bytes[abs - 1] != b'_');
-        let next_ok =
-            end == bytes.len() || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+        let prev_ok = line[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let next_ok = line[end..].chars().next().is_none_or(|c| !is_ident_char(c));
         if prev_ok && next_ok {
             return true;
         }
@@ -385,26 +634,34 @@ fn has_ident_token(line: &str, ident: &str) -> bool {
     false
 }
 
-fn collect_literal_test_mentions(
-    graph: &SymbolGraph,
+fn collect_literal_test_mentions<'a>(
+    graph: &'a SymbolGraph,
+    file_cache: &mut FileLineCache<'a>,
     visited: &HashSet<usize>,
     seed_names: &[&str],
 ) -> Vec<String> {
+    if seed_names.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for (idx, sym) in graph.symbols.iter().enumerate() {
         if visited.contains(&idx) || !is_test_symbol(sym) {
             continue;
         }
-        for (line_idx, line) in sym.body.lines().enumerate() {
+        file_cache.with_symbol_lines(sym, |line_idx, line| {
+            if out.len() >= 20 {
+                return;
+            }
             if seed_names.iter().any(|&t| has_ident_token(line, t)) {
                 let hit = format!("{}:#L{}", sym.file, sym.start_line + line_idx);
-                if !out.contains(&hit) {
+                if seen.insert(hit.clone()) {
                     out.push(hit);
-                    if out.len() >= 20 {
-                        return out;
-                    }
                 }
             }
+        });
+        if out.len() >= 20 {
+            break;
         }
     }
     out
@@ -512,13 +769,25 @@ pub fn parse_sink_list(raw: Option<&str>) -> Vec<String> {
 /// Case-sensitive substring sweep over indexed files, one hit per matching
 /// line, capped so a noisy sink (e.g. `console.`) can't flood the context.
 pub fn sweep_literal_sinks(root: &Path, graph: &SymbolGraph, sinks: &[String]) -> Vec<String> {
+    if sinks.is_empty() {
+        return Vec::new();
+    }
     const CAP: usize = 100;
-    let mut files: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
-    files.sort_unstable();
-    files.dedup();
+    let files: Vec<&str> = if !graph.indexed_files.is_empty() {
+        graph.indexed_files.iter().map(String::as_str).collect()
+    } else {
+        let mut f: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
+        f.sort_unstable();
+        f.dedup();
+        f
+    };
     let mut hits = Vec::new();
     'files: for rel in files {
-        let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
+        let Ok(confined) = crate::workspace::walker::confine_to_workspace(root, Path::new(rel))
+        else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(confined) else {
             continue;
         };
         for (idx, line) in content.lines().enumerate() {
@@ -571,7 +840,7 @@ mod tests {
             mentions: vec![],
             call_counts: Default::default(),
             member_calls: vec![],
-            external_imports: vec![],
+            external_imports: crate::model::symbol::empty_external_imports(),
         }
     }
 

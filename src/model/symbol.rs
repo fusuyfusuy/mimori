@@ -1,4 +1,22 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+mod arc_strs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(val: &Arc<[String]>, s: S) -> Result<S::Ok, S::Error> {
+        val.as_ref().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<[String]>, D::Error> {
+        Vec::<String>::deserialize(d).map(Arc::from)
+    }
+}
+
+pub fn empty_external_imports() -> Arc<[String]> {
+    Arc::from([])
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
@@ -43,6 +61,7 @@ pub struct Symbol {
     pub start_line: usize,
     pub end_line: usize,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body: String,
     #[serde(default)]
     pub centrality: f64,
@@ -63,8 +82,8 @@ pub struct Symbol {
     pub member_calls: Vec<String>,
     /// Local names bound by this file to external (non-relative) modules.
     /// Calls matching one are external — never resolved locally.
-    #[serde(default)]
-    pub external_imports: Vec<String>,
+    #[serde(default = "empty_external_imports", with = "arc_strs")]
+    pub external_imports: Arc<[String]>,
 }
 
 impl Symbol {

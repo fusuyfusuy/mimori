@@ -48,45 +48,65 @@ pub fn find_missing(
     pattern: &str,
     defines: Option<&str>,
 ) -> Result<Vec<String>> {
-    let scope = scope
-        .map(|s| s.trim_start_matches("./").trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty() && s != ".");
-    let mut builder = WalkBuilder::new(root);
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let clean_scope = scope
+        .map(|s| s.trim_start_matches("./").trim_end_matches('/'))
+        .filter(|s| !s.is_empty() && *s != ".");
+
+    let scan_root = match clean_scope {
+        Some(sc) => crate::workspace::walker::confine_to_workspace(&canon_root, Path::new(sc))?,
+        None => canon_root.clone(),
+    };
+
+    if !scan_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let alts = split_alternatives(pattern);
+    let mut builder = WalkBuilder::new(&scan_root);
     builder
+        .follow_links(false)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .add_custom_ignore_filename(".mimoriignore");
+    if scan_root != canon_root {
+        let root_ignore = canon_root.join(".mimoriignore");
+        if root_ignore.is_file() {
+            let _ = builder.add_ignore(root_ignore);
+        }
+    }
 
-    let mut files = Vec::new();
+    let mut out = Vec::new();
     for entry in builder.build().flatten() {
-        let path = entry.path();
-        if !path.is_file() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
-        if crate::workspace::walker::is_ignored_rel(path.strip_prefix(root).unwrap_or(path)) {
+        let path = entry.path();
+        let Ok(rel_path) = path.strip_prefix(&canon_root) else {
+            continue;
+        };
+        if crate::workspace::walker::is_ignored_rel(rel_path) {
             continue;
         }
         if !crate::workspace::walker::has_supported_extension(path) {
             continue;
         }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if let Some(scope) = &scope {
-            if !(rel == *scope || rel.starts_with(&format!("{scope}/"))) {
-                continue;
-            }
-        }
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        files.push((rel, content));
+        if let Some(d) = defines {
+            if !content.contains(d) {
+                continue;
+            }
+        }
+        if !contains_any(&content, &alts) {
+            out.push(rel_path.to_string_lossy().replace('\\', "/"));
+        }
     }
-    Ok(missing_in_files(&files, pattern, defines))
+    out.sort();
+    Ok(out)
 }
 
 #[cfg(test)]

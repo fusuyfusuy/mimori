@@ -1,5 +1,6 @@
-use crate::graph::map::{generate_map, personalize_map, MapResult};
-use crate::memory::ledger::MemoryLedger;
+use crate::graph::map::{compute_personalized_scores, generate_map_with_scores, MapResult};
+use crate::graph::SymbolGraph;
+use crate::memory::ledger::{confine_agents_path, MemoryLedger};
 use crate::storage::get_or_sync_graph;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -23,10 +24,25 @@ pub fn generate_dump(
     budget: usize,
     focus: Option<&str>,
 ) -> Result<DumpResult> {
-    let char_budget = budget * 4;
+    let graph = get_or_sync_graph(workspace_root).ok();
+    generate_dump_with_graph(workspace_root, graph.as_ref(), budget, focus)
+}
 
-    // 1. Read memory ledger if exists
-    let ledger = MemoryLedger::load(workspace_root).ok();
+pub fn generate_dump_with_graph(
+    workspace_root: &Path,
+    graph: Option<&SymbolGraph>,
+    budget: usize,
+    focus: Option<&str>,
+) -> Result<DumpResult> {
+    let char_budget = budget.saturating_mul(4);
+
+    // 1. Read memory ledger if exists (fail closed if .agents escapes workspace)
+    let mem_path = confine_agents_path(workspace_root, ".agents/memory.md")?;
+    let ledger = if mem_path.exists() {
+        Some(MemoryLedger::load(workspace_root)?)
+    } else {
+        None
+    };
 
     let mut epics = None;
     let mut vocab_gotchas = None;
@@ -71,18 +87,21 @@ pub fn generate_dump(
     }
 
     // Reserve 150 chars for top header
-    let header_reserved = 150;
-    let max_map_chars = char_budget.saturating_sub(vocab_debt_md.len() + header_reserved);
+    let header_reserved = 150usize;
+    let max_map_chars = char_budget
+        .saturating_sub(vocab_debt_md.chars().count())
+        .saturating_sub(header_reserved);
 
-    // 2. Generate architectural map if graph is available
-    let (map_result, map_md) = if let Ok(mut graph) = get_or_sync_graph(workspace_root) {
-        if let Some(f) = focus {
-            let _ = personalize_map(&mut graph, Some(f), None, workspace_root);
-        }
+    // 2. Generate architectural map if graph is available (zero SymbolGraph clones)
+    let (map_result, map_md) = if let Some(g) = graph {
+        let personalized = compute_personalized_scores(g, focus, None, workspace_root)?;
+        let scores_ref = personalized
+            .as_ref()
+            .map(|(scores, stats)| (scores.as_slice(), stats));
 
         // Approx 100 chars per symbol in map
         let symbol_limit = (max_map_chars / 100).clamp(3, 40);
-        let res = generate_map(&graph, None, focus, Some(symbol_limit));
+        let res = generate_map_with_scores(g, scores_ref, None, focus, Some(symbol_limit));
         let md = format_map_section(&res);
         (Some(res), md)
     } else {
@@ -99,21 +118,31 @@ pub fn generate_dump(
     }
 
     // Truncate body line by line if exceeding budget
-    if body.len() + header_reserved > char_budget {
-        let lines: Vec<&str> = body.lines().collect();
+    let mut body_chars = body.chars().count();
+    if body_chars.saturating_add(header_reserved) > char_budget {
         let mut truncated = String::new();
-        for line in lines {
-            if truncated.len() + line.len() + 1 + header_reserved > char_budget {
-                truncated.push_str("… [truncated to fit token budget]\n");
+        let mut trunc_chars = 0usize;
+        for line in body.lines() {
+            let line_chars = line.chars().count() + 1;
+            if trunc_chars
+                .saturating_add(line_chars)
+                .saturating_add(header_reserved)
+                > char_budget
+            {
+                let suffix = "… [truncated to fit token budget]\n";
+                truncated.push_str(suffix);
+                trunc_chars = trunc_chars.saturating_add(suffix.chars().count());
                 break;
             }
             truncated.push_str(line);
             truncated.push('\n');
+            trunc_chars = trunc_chars.saturating_add(line_chars);
         }
         body = truncated;
+        body_chars = trunc_chars;
     }
 
-    let estimated_tokens = (body.len() + header_reserved).div_ceil(4);
+    let estimated_tokens = body_chars.saturating_add(header_reserved).div_ceil(4);
     let final_markdown = format!(
         "# MIMORI TURN-0 CONTEXT (tokens: ~{} / budget: {})\n\n{}",
         estimated_tokens, budget, body

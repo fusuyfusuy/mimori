@@ -4,7 +4,9 @@ use std::path::{Component, Path, PathBuf};
 
 /// File extensions that make a `:`-prefix recognizable as a path rather than
 /// the first segment of a qualified symbol name.
-const SOURCE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go",
+];
 
 /// A parsed target coordinate.
 ///
@@ -67,14 +69,14 @@ impl Coordinate {
         if let Some(idx) = split_idx {
             let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
             if !head.contains('#') && looks_like_path(head) {
-                return parse_path_tail(raw, head, tail);
+                return parse_colon_tail(raw, head, tail);
             }
         }
 
         if let Some(idx) = raw.find('#') {
             let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
             if looks_like_path(head) {
-                return parse_path_tail(raw, head, tail);
+                return parse_hash_tail(raw, head, tail);
             }
         }
 
@@ -135,24 +137,42 @@ impl fmt::Display for Coordinate {
     }
 }
 
-fn parse_path_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
+fn parse_colon_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
     if tail.is_empty() {
         bail!("Coordinate '{}' names a file but no symbol.", raw);
     }
+    if let Some(hash_tail) = tail.strip_prefix('#') {
+        return parse_hash_tail(raw, head, hash_tail);
+    }
     if let Some(rest) = tail.strip_prefix('L') {
-        if rest.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-            if let Ok((start, end)) = parse_line_range(rest) {
-                return Ok(Coordinate::Lines {
-                    file: PathBuf::from(head),
-                    start,
-                    end,
-                });
-            }
+        if rest.contains('-') && rest.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            let (start, end) = parse_line_range(rest)?;
+            return Ok(Coordinate::Lines {
+                file: PathBuf::from(head),
+                start,
+                end,
+            });
         }
     }
     Ok(Coordinate::Symbol {
         file: PathBuf::from(head),
         name: tail.to_string(),
+    })
+}
+
+fn parse_hash_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
+    if head.is_empty() {
+        bail!("Line coordinate '{}' has no file part.", raw);
+    }
+    let rest = tail.strip_prefix(['L', 'l']).unwrap_or(tail);
+    if rest.is_empty() {
+        bail!("Line coordinate '{}' has an empty line range.", raw);
+    }
+    let (start, end) = parse_line_range(rest)?;
+    Ok(Coordinate::Lines {
+        file: PathBuf::from(head),
+        start,
+        end,
     })
 }
 
@@ -188,10 +208,21 @@ fn looks_like_path(head: &str) -> bool {
 /// by suffix or basename.
 fn relativize(file: &Path, root: &Path) -> PathBuf {
     let stripped = file.strip_prefix(root).unwrap_or(file);
-    let cleaned: PathBuf = stripped
-        .components()
-        .filter(|c| !matches!(c, Component::CurDir))
-        .collect();
+    let mut parts: Vec<Component<'_>> = Vec::new();
+    for comp in stripped.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(Component::Normal(_))) {
+                    parts.pop();
+                } else {
+                    parts.push(comp);
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let cleaned: PathBuf = parts.into_iter().collect();
     if cleaned.as_os_str().is_empty() {
         stripped.to_path_buf()
     } else {

@@ -145,6 +145,7 @@ fn split_query_terms(query: &str) -> Vec<String> {
 
 fn collect_literal_fallback(
     root: &Path,
+    indexed_files: &[String],
     symbols: &[Symbol],
     norm_scope: Option<&str>,
     unmatched_terms: &[&String],
@@ -155,14 +156,30 @@ fn collect_literal_fallback(
         syms_by_file.entry(s.file.as_str()).or_default().push(s);
     }
 
-    let scans = crate::workspace::walker::scan_workspace(root);
-    for scan in scans {
-        let rel = scan.rel.to_string_lossy();
-        if !matches_scope(&rel, norm_scope) {
+    let fallback_files: Vec<String> = if indexed_files.is_empty() {
+        crate::workspace::walker::discover_workspace(root)
+            .supported
+            .into_iter()
+            .map(|(rel, _, _)| rel)
+            .collect()
+    } else {
+        indexed_files.to_vec()
+    };
+
+    for rel in &fallback_files {
+        if !matches_scope(rel, norm_scope) {
             continue;
         }
-        let file_syms = syms_by_file.get(rel.as_ref());
-        for (idx, line) in scan.content.lines().enumerate() {
+        let Ok(confined) = crate::workspace::walker::confine_to_workspace(root, Path::new(rel))
+        else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(&confined) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        let file_syms = syms_by_file.get(rel.as_str());
+        for (idx, line) in content.lines().enumerate() {
             let line_lower = line.to_lowercase();
             if !unmatched_terms
                 .iter()
@@ -189,7 +206,7 @@ fn collect_literal_fallback(
             matches.push(FindMatch {
                 name: format!("{} (literal match)", rel),
                 kind: "literal".to_string(),
-                file: rel.to_string(),
+                file: rel.clone(),
                 coordinate,
                 start_line: line_no,
                 end_line: line_no,
@@ -236,43 +253,44 @@ pub fn execute_find(
     limit: Option<usize>,
 ) -> Result<FindResult> {
     let graph = get_or_sync_graph(root)?;
+    execute_find_with_graph(root, &graph, query, symbols_only, files_only, scope, limit)
+}
+
+pub fn execute_find_with_graph(
+    root: &Path,
+    graph: &crate::graph::SymbolGraph,
+    query: &str,
+    symbols_only: bool,
+    files_only: bool,
+    scope: Option<&str>,
+    limit: Option<usize>,
+) -> Result<FindResult> {
     let q_terms = split_query_terms(query);
     let norm_scope = normalize_scope(scope);
     let mut matches = Vec::new();
 
     if !symbols_only {
-        let mut seen_files = HashSet::new();
-        let db_path = root.join(".mimori").join("index.db");
-        let mut files_to_check = Vec::new();
+        let mut seen_files: HashSet<&str> = HashSet::new();
+        let iter_indexed = graph.indexed_files.iter().map(|s| s.as_str());
+        let iter_syms = graph.symbols.iter().map(|s| s.file.as_str());
 
-        if db_path.exists() {
-            if let Ok(db) = crate::storage::db::Database::open_or_create(&db_path) {
-                if let Ok(records) = db.get_file_records() {
-                    files_to_check.extend(records.into_keys());
-                }
+        for path in iter_indexed.chain(iter_syms) {
+            if !seen_files.insert(path) {
+                continue;
             }
-        }
-
-        for s in &graph.symbols {
-            files_to_check.push(s.file.clone());
-        }
-
-        for path in files_to_check {
-            if !seen_files.insert(path.clone()) {
+            if !matches_scope(path, norm_scope.as_deref()) {
                 continue;
             }
             let path_lower = path.to_lowercase();
-            if matches_scope(&path, norm_scope.as_deref())
-                && q_terms.iter().any(|t| path_lower.contains(t))
-            {
+            if q_terms.iter().any(|t| path_lower.contains(t)) {
                 matches.push(FindMatch {
-                    name: Path::new(&path)
+                    name: Path::new(path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default(),
                     kind: "file".to_string(),
-                    file: path.clone(),
-                    coordinate: path,
+                    file: path.to_string(),
+                    coordinate: path.to_string(),
                     start_line: 1,
                     end_line: 1,
                     signature: String::new(),
@@ -284,10 +302,11 @@ pub fn execute_find(
 
     if !files_only {
         for s in &graph.symbols {
+            if !matches_scope(&s.file, norm_scope.as_deref()) {
+                continue;
+            }
             let name_lower = s.name.to_lowercase();
-            if matches_scope(&s.file, norm_scope.as_deref())
-                && q_terms.iter().any(|t| name_lower.contains(t))
-            {
+            if q_terms.iter().any(|t| name_lower.contains(t)) {
                 matches.push(FindMatch {
                     name: s.name.clone(),
                     kind: s.kind.as_str().to_string(),
@@ -302,15 +321,27 @@ pub fn execute_find(
         }
     }
 
-    // Hybrid fallback: for any query term with zero symbol and file matches,
-    // scan workspace files line by line, emitting one hit per matching line.
+    // Precompute lowercase sort/filter keys once per match instead of inside O(N log N) sort_by.
+    let match_lowers: Vec<(String, String)> = matches
+        .iter()
+        .map(|m| {
+            (
+                m.name.to_lowercase(),
+                if m.kind == "file" {
+                    m.file.to_lowercase()
+                } else {
+                    String::new()
+                },
+            )
+        })
+        .collect();
+
     if !files_only && !symbols_only {
         let unmatched_terms: Vec<&String> = q_terms
             .iter()
             .filter(|t| {
-                !matches.iter().any(|m| {
-                    m.name.to_lowercase().contains(t.as_str())
-                        || (m.kind == "file" && m.file.to_lowercase().contains(t.as_str()))
+                !match_lowers.iter().any(|(nl, fl)| {
+                    nl.contains(t.as_str()) || (!fl.is_empty() && fl.contains(t.as_str()))
                 })
             })
             .collect();
@@ -318,6 +349,7 @@ pub fn execute_find(
         if !unmatched_terms.is_empty() {
             collect_literal_fallback(
                 root,
+                &graph.indexed_files,
                 &graph.symbols,
                 norm_scope.as_deref(),
                 &unmatched_terms,
@@ -326,20 +358,23 @@ pub fn execute_find(
         }
     }
 
-    matches.sort_by(|a, b| {
-        let a_lower = a.name.to_lowercase();
-        let b_lower = b.name.to_lowercase();
-        let a_exact = q_terms.contains(&a_lower);
-        let b_exact = q_terms.contains(&b_lower);
+    let mut keyed: Vec<(bool, FindMatch)> = matches
+        .into_iter()
+        .map(|m| {
+            let exact = q_terms.contains(&m.name.to_lowercase());
+            (exact, m)
+        })
+        .collect();
+    keyed.sort_by(|(a_exact, a), (b_exact, b)| {
         b_exact
-            .cmp(&a_exact)
-            .then_with(|| {
-                b.centrality
-                    .partial_cmp(&a.centrality)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .cmp(a_exact)
+            .then_with(|| b.centrality.total_cmp(&a.centrality))
             .then_with(|| a.name.len().cmp(&b.name.len()))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.name.cmp(&b.name))
     });
+    let mut matches: Vec<FindMatch> = keyed.into_iter().map(|(_, m)| m).collect();
 
     let total_matches = matches.len();
     let truncated_from = match limit {

@@ -36,12 +36,38 @@ pub fn compute_weighted_pagerank(
     edge_weights: &HashMap<(usize, usize), f64>,
     focus_indices: Option<&[usize]>,
 ) -> PagerankStats {
+    let (scores, stats) = compute_pagerank_scores(
+        symbols,
+        callers_map,
+        callees_map,
+        edge_weights,
+        focus_indices,
+    );
+    for (i, sym) in symbols.iter_mut().enumerate() {
+        sym.centrality = scores[i];
+    }
+    stats
+}
+
+/// Score-decoupled Weighted PageRank over a flat CSR transition matrix:
+/// returns `(scores, stats)` without mutating `symbols` so personalized MCP
+/// queries (`--focus` / `--seed`) never have to clone `SymbolGraph`.
+pub fn compute_pagerank_scores(
+    symbols: &[Symbol],
+    callers_map: &HashMap<usize, Vec<usize>>,
+    callees_map: &HashMap<usize, Vec<usize>>,
+    edge_weights: &HashMap<(usize, usize), f64>,
+    focus_indices: Option<&[usize]>,
+) -> (Vec<f64>, PagerankStats) {
     let n = symbols.len();
     if n == 0 {
-        return PagerankStats {
-            iters: 0,
-            converged: true,
-        };
+        return (
+            Vec::new(),
+            PagerankStats {
+                iters: 0,
+                converged: true,
+            },
+        );
     }
 
     let damping = 0.85;
@@ -73,8 +99,6 @@ pub fn compute_weighted_pagerank(
     let mut scores = vec![1.0 / n as f64; n];
     let mut next_scores = vec![0.0; n];
 
-    // Personalization vector
-    let mut has_focus = false;
     let personalization: Vec<f64> = match focus_indices {
         Some(indices) if !indices.is_empty() => {
             let mut valid: Vec<usize> = indices.iter().copied().filter(|&i| i < n).collect();
@@ -83,7 +107,6 @@ pub fn compute_weighted_pagerank(
             if valid.is_empty() {
                 default_prior()
             } else {
-                has_focus = true;
                 let mut p = vec![0.0; n];
                 let mass = 1.0 / valid.len() as f64;
                 for idx in valid {
@@ -108,43 +131,71 @@ pub fn compute_weighted_pagerank(
         })
         .collect();
 
-    // Precompute normalized transition probabilities P(u -> v) = edge_w(u, v) / out_weight[u]
-    // for each caller u of v. Avoids repeated HashMap lookups and divisions in the power iteration loop.
-    let normalized_callers: Vec<Vec<(usize, f64)>> = (0..n)
-        .map(|v| {
-            let callers = callers_map.get(&v).map_or(&[][..], |c| c.as_slice());
-            callers
-                .iter()
-                .filter_map(|&u| {
-                    let total = out_weight[u];
-                    if total > 0.0 {
-                        Some((u, edge_w(u, v) / total))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+    // Test callers transfer only `TEST_EDGE_WEIGHT` of their damped walk mass
+    // along outbound call edges; the remaining `(1 - TEST_EDGE_WEIGHT)` returns
+    // to the teleportation distribution so test-only callees are not inflated
+    // and total probability mass stays strictly 1.0 at every iteration.
+    let edge_retention = |u: usize| -> f64 {
+        if is_test[u] {
+            crate::graph::TEST_EDGE_WEIGHT
+        } else {
+            1.0
+        }
+    };
+
+    // Contiguous CSR representation of incoming transitions `(u, trans_prob)`
+    // for cache-local power iteration (2 allocations instead of `V` Vecs).
+    let total_edges: usize = callers_map.values().map(|c| c.len()).sum();
+    let mut csr_offsets: Vec<usize> = Vec::with_capacity(n + 1);
+    let mut csr_edges: Vec<(u32, f64)> = Vec::with_capacity(total_edges);
+    csr_offsets.push(0);
+    for v in 0..n {
+        if let Some(callers) = callers_map.get(&v) {
+            for &u in callers {
+                let total = out_weight[u];
+                if total > 0.0 {
+                    let prob = edge_retention(u) * edge_w(u, v) / total;
+                    csr_edges.push((u as u32, prob));
+                }
+            }
+        }
+        csr_offsets.push(csr_edges.len());
+    }
+
+    // Precompute per-node teleport leak weight: 1.0 for dangling nodes,
+    // `(1 - TEST_EDGE_WEIGHT)` for non-dangling test nodes, 0.0 otherwise.
+    let leak_factor: Vec<f64> = (0..n)
+        .map(|u| {
+            if out_weight[u] == 0.0 {
+                1.0
+            } else {
+                1.0 - edge_retention(u)
+            }
         })
         .collect();
-
-    // Which nodes are dangling never changes; only their scores do.
-    let dangling: Vec<usize> = (0..n).filter(|&u| out_weight[u] == 0.0).collect();
+    let leak_nodes: Vec<(usize, f64)> = leak_factor
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, f)| f > 0.0)
+        .collect();
 
     let mut stats = PagerankStats {
         iters: 0,
         converged: false,
     };
     for iter in 0..MAX_ITERATIONS {
-        let dangling_sum: f64 = dangling.iter().map(|&u| scores[u]).sum();
+        let leaked_sum: f64 = leak_nodes.iter().map(|&(u, f)| scores[u] * f).sum();
 
         for v in 0..n {
+            let start = csr_offsets[v];
+            let end = csr_offsets[v + 1];
             let mut in_sum = 0.0;
-            for &(u, trans_prob) in &normalized_callers[v] {
-                in_sum += scores[u] * trans_prob;
+            for &(u, trans_prob) in &csr_edges[start..end] {
+                in_sum += scores[u as usize] * trans_prob;
             }
 
             next_scores[v] = (1.0 - damping) * personalization[v]
-                + damping * (in_sum + dangling_sum * personalization[v]);
+                + damping * (in_sum + leaked_sum * personalization[v]);
         }
 
         let residual: f64 = next_scores
@@ -160,23 +211,5 @@ pub fn compute_weighted_pagerank(
         }
     }
 
-    // Demote test symbols in unseeded global ranking and normalize to unit mass.
-    if !has_focus {
-        for (score, &test_sym) in scores.iter_mut().zip(is_test.iter()) {
-            if test_sym {
-                *score *= crate::graph::TEST_EDGE_WEIGHT;
-            }
-        }
-        let total: f64 = scores.iter().sum();
-        if total > 0.0 {
-            for score in &mut scores {
-                *score /= total;
-            }
-        }
-    }
-
-    for (i, sym) in symbols.iter_mut().enumerate() {
-        sym.centrality = scores[i];
-    }
-    stats
+    (scores, stats)
 }

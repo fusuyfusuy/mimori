@@ -71,6 +71,127 @@ pub struct MemoryLedger {
     pub vocab_gotchas: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemorySection {
+    Epics,
+    Debt,
+    Vocab,
+    Gotchas,
+    Other,
+}
+
+pub(crate) fn classify_memory_heading(trimmed_line: &str) -> Option<MemorySection> {
+    let rest = trimmed_line.trim().strip_prefix("## ")?;
+    let heading = rest.trim().to_lowercase();
+    if heading.contains("epic") {
+        Some(MemorySection::Epics)
+    } else if heading.contains("debt") {
+        Some(MemorySection::Debt)
+    } else if heading.contains("vocab") || heading.contains("glossary") {
+        Some(MemorySection::Vocab)
+    } else if heading.contains("gotcha") || heading.contains("trap") {
+        Some(MemorySection::Gotchas)
+    } else {
+        Some(MemorySection::Other)
+    }
+}
+
+pub(crate) fn update_code_fence(trimmed_line: &str, fence_ticks: &mut usize) -> bool {
+    let trimmed = trimmed_line.trim();
+    let ticks = trimmed.bytes().take_while(|&b| b == b'`').count();
+    if *fence_ticks == 0 {
+        if ticks >= 3 && !trimmed[ticks..].contains('`') {
+            *fence_ticks = ticks;
+            return true;
+        }
+        false
+    } else {
+        if ticks >= *fence_ticks && trimmed[ticks..].trim().is_empty() {
+            *fence_ticks = 0;
+        }
+        true
+    }
+}
+
+fn flush_section(
+    section: Option<MemorySection>,
+    content: &str,
+    epics: &mut String,
+    vocab_gotchas: &mut String,
+) {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match section {
+        Some(MemorySection::Epics) => {
+            if epics.is_empty() {
+                *epics = trimmed.to_string();
+            } else {
+                epics.push_str("\n\n");
+                epics.push_str(trimmed);
+            }
+        }
+        Some(MemorySection::Vocab | MemorySection::Gotchas) => {
+            if vocab_gotchas.is_empty() {
+                *vocab_gotchas = trimmed.to_string();
+            } else {
+                vocab_gotchas.push_str("\n\n");
+                vocab_gotchas.push_str(trimmed);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn confine_agents_path(workspace_root: &Path, rel: &str) -> Result<PathBuf> {
+    let root = if workspace_root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        workspace_root
+    };
+    let canon_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace root {}", root.display()))?;
+
+    let rel_path = Path::new(rel);
+    if rel_path
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("Path '{}' escapes workspace root", root.join(rel).display());
+    }
+
+    let agents_dir = root.join(".agents");
+    if fs::symlink_metadata(&agents_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        match agents_dir.canonicalize() {
+            Ok(canon_target) if canon_target.starts_with(&canon_root) => {}
+            _ => anyhow::bail!("Path '{}' escapes workspace root", agents_dir.display()),
+        }
+    }
+
+    let target = root.join(rel_path);
+    if target != agents_dir
+        && fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        match target.canonicalize() {
+            Ok(canon_target) if canon_target.starts_with(&canon_root) => {}
+            _ => anyhow::bail!("Path '{}' escapes workspace root", target.display()),
+        }
+    }
+
+    if let Some(parent) = target.parent().filter(|p| fs::symlink_metadata(p).is_ok()) {
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("Path '{}' escapes workspace root", target.display()))?;
+        if !canon_parent.starts_with(&canon_root) {
+            anyhow::bail!("Path '{}' escapes workspace root", target.display());
+        }
+    }
+
+    Ok(target)
+}
+
 impl MemoryLedger {
     pub fn memory_path(workspace_root: &Path) -> PathBuf {
         workspace_root.join(".agents").join("memory.md")
@@ -87,11 +208,13 @@ impl MemoryLedger {
                 workspace_root.display()
             );
         }
-        let agents_dir = workspace_root.join(".agents");
+        let agents_dir = confine_agents_path(workspace_root, ".agents")?;
+        let mem_file = confine_agents_path(workspace_root, ".agents/memory.md")?;
+        let dec_file = confine_agents_path(workspace_root, ".agents/decisions.md")?;
+
         fs::create_dir_all(&agents_dir)
             .with_context(|| format!("create dir {}", agents_dir.display()))?;
 
-        let mem_file = Self::memory_path(workspace_root);
         let memory_created = if !mem_file.exists() || force {
             let template = "\
 # Project Memory
@@ -105,14 +228,13 @@ impl MemoryLedger {
 ## Domain Vocabulary & Gotchas
 - Terms: Define key domain vocabulary here.
 ";
-            fs::write(&mem_file, template)
+            Self::atomic_write(&mem_file, template)
                 .with_context(|| format!("write {}", mem_file.display()))?;
             true
         } else {
             false
         };
 
-        let dec_file = Self::decisions_path(workspace_root);
         let decisions_created = if !dec_file.exists() || force {
             let template = "\
 # Architectural Decisions (ADRs)
@@ -123,7 +245,7 @@ impl MemoryLedger {
 - **Decision**: Adopt M2M language contract and .mimori/ cache vs .agents/ memory boundaries.
 - **Consequences**: Deterministic code intelligence and verifiable technical debt tracking.
 ";
-            fs::write(&dec_file, template)
+            Self::atomic_write(&dec_file, template)
                 .with_context(|| format!("write {}", dec_file.display()))?;
             true
         } else {
@@ -140,81 +262,60 @@ impl MemoryLedger {
                 workspace_root.display()
             );
         }
-        let path = Self::memory_path(workspace_root);
+        let path = confine_agents_path(workspace_root, ".agents/memory.md")?;
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read memory file {}", path.display()))?;
         Ok(Self::from_str(&content, workspace_root.to_path_buf()))
     }
 
     pub fn from_str(content: &str, workspace_root: PathBuf) -> Self {
-        let lines: Vec<&str> = content.lines().collect();
         let mut epics = String::new();
         let mut vocab_gotchas = String::new();
         let mut debt_items = Vec::new();
         let mut raw_debt_lines = Vec::new();
 
-        let mut current_section = "";
+        let mut current_section: Option<MemorySection> = None;
         let mut section_content = String::new();
+        let mut fence_ticks = 0usize;
 
-        for (idx, &line) in lines.iter().enumerate() {
+        for (idx, line) in content.lines().enumerate() {
             let line_number = idx + 1;
             let trimmed = line.trim();
+            let in_fence = update_code_fence(trimmed, &mut fence_ticks);
 
-            if trimmed.starts_with("## ") {
-                // Save previous section
-                if current_section.eq_ignore_ascii_case("epics") {
-                    epics = section_content.trim().to_string();
-                } else if current_section.eq_ignore_ascii_case("vocab")
-                    || current_section.eq_ignore_ascii_case("gotchas")
-                {
-                    if vocab_gotchas.is_empty() {
-                        vocab_gotchas = section_content.trim().to_string();
-                    } else {
-                        vocab_gotchas.push_str("\n\n");
-                        vocab_gotchas.push_str(section_content.trim());
-                    }
+            if !in_fence {
+                if let Some(next_section) = classify_memory_heading(trimmed) {
+                    flush_section(
+                        current_section,
+                        &section_content,
+                        &mut epics,
+                        &mut vocab_gotchas,
+                    );
+                    section_content.clear();
+                    current_section = Some(next_section);
+                    continue;
                 }
-                section_content.clear();
-
-                let heading = trimmed.trim_start_matches('#').trim().to_lowercase();
-                if heading.contains("epic") {
-                    current_section = "epics";
-                } else if heading.contains("known debt") || heading.contains("debt") {
-                    current_section = "debt";
-                } else if heading.contains("vocab") || heading.contains("gotcha") {
-                    current_section = "vocab";
-                } else {
-                    current_section = "other";
-                }
-                continue;
             }
 
-            if current_section == "debt" {
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if current_section == Some(MemorySection::Debt) {
+                if !in_fence && !trimmed.is_empty() && !trimmed.starts_with('#') {
                     raw_debt_lines.push((line_number, line.to_string()));
                     if let Ok(item) = parse_debt_line(line, line_number) {
                         debt_items.push(item);
                     }
                 }
-            } else if !current_section.is_empty() {
+            } else if current_section.is_some() {
                 section_content.push_str(line);
                 section_content.push('\n');
             }
         }
 
-        // Final section flush
-        if current_section.eq_ignore_ascii_case("epics") {
-            epics = section_content.trim().to_string();
-        } else if current_section.eq_ignore_ascii_case("vocab")
-            || current_section.eq_ignore_ascii_case("gotchas")
-        {
-            if vocab_gotchas.is_empty() {
-                vocab_gotchas = section_content.trim().to_string();
-            } else {
-                vocab_gotchas.push_str("\n\n");
-                vocab_gotchas.push_str(section_content.trim());
-            }
-        }
+        flush_section(
+            current_section,
+            &section_content,
+            &mut epics,
+            &mut vocab_gotchas,
+        );
 
         Self {
             workspace_root,
@@ -227,22 +328,35 @@ impl MemoryLedger {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::memory_path(&self.workspace_root);
+        let path = confine_agents_path(&self.workspace_root, ".agents/memory.md")?;
         Self::atomic_write(&path, &self.raw_content)
     }
 
     pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         if let Some(parent) = path.parent() {
+            if parent.file_name().is_some_and(|n| n == ".agents") {
+                if let (Some(ws_root), Some(fname)) = (parent.parent(), path.file_name()) {
+                    let rel = format!(".agents/{}", fname.to_string_lossy());
+                    confine_agents_path(ws_root, &rel)?;
+                }
+            } else if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                anyhow::bail!("Path '{}' escapes workspace root", path.display());
+            }
             fs::create_dir_all(parent)?;
         }
+
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         fs::write(&tmp_path, content)
             .with_context(|| format!("write temporary memory file {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("atomic rename memory file {}", path.display()))?;
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err)
+                .with_context(|| format!("atomic rename memory file {}", path.display()));
+        }
         Ok(())
     }
 
@@ -311,15 +425,19 @@ impl MemoryLedger {
         let lines: Vec<&str> = self.raw_content.lines().collect();
         let mut new_lines = Vec::with_capacity(lines.len());
         let mut in_debt_section = false;
+        let mut fence_ticks = 0usize;
         let mut deleted_count = 0;
 
         let pattern_lower = pattern_trimmed.to_lowercase();
 
         for line in lines {
             let trimmed = line.trim();
-            if trimmed.starts_with("## ") {
-                let heading = trimmed.trim_start_matches('#').trim().to_lowercase();
-                in_debt_section = heading.contains("known debt") || heading.contains("debt");
+            if update_code_fence(trimmed, &mut fence_ticks) {
+                new_lines.push(line);
+                continue;
+            }
+            if let Some(section) = classify_memory_heading(trimmed) {
+                in_debt_section = section == MemorySection::Debt;
                 new_lines.push(line);
                 continue;
             }
@@ -367,7 +485,11 @@ impl MemoryLedger {
                 }
                 Some(out.trim_end().to_string())
             }
-        } else if sec.contains("vocab") || sec.contains("gotcha") {
+        } else if sec.contains("vocab")
+            || sec.contains("glossary")
+            || sec.contains("gotcha")
+            || sec.contains("trap")
+        {
             if self.vocab_gotchas.is_empty() {
                 None
             } else {

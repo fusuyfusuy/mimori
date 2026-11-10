@@ -1,31 +1,48 @@
 use crate::model::{Symbol, SymbolKind};
 use anyhow::Result;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
-pub fn parse_python(file: &str, content: &str) -> Result<Vec<Symbol>> {
-    let mut parser = Parser::new();
-    let language = tree_sitter_python::LANGUAGE.into();
-    parser.set_language(&language)?;
+thread_local! {
+    static PY_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Error loading Python grammar");
+        p
+    });
+}
 
-    let tree = parser
-        .parse(content, None)
+pub fn parse_python(file: &str, content: &str) -> Result<Vec<Symbol>> {
+    let tree = PY_PARSER
+        .with(|p| p.borrow_mut().parse(content, None))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse Python source"))?;
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
     walk_python_node(root, content, file, None, &mut symbols, None, 0);
-    let mut import_aliases = std::collections::HashMap::new();
+    let mut import_aliases = HashMap::new();
     collect_py_local_aliases(root, content, &mut import_aliases, 0);
     super::apply_import_aliases(&mut symbols, &import_aliases);
-    let external_imports = collect_file_external_imports(root, content);
+    let external_imports: Arc<[String]> = collect_file_external_imports(root, content).into();
     for s in &mut symbols {
-        s.external_imports = external_imports.clone();
+        s.external_imports = Arc::clone(&external_imports);
     }
 
     Ok(symbols)
 }
 
 const MAX_AST_DEPTH: usize = 512;
+
+fn is_module_level_assignment(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "module"
+        || (parent.kind() == "expression_statement"
+            && parent.parent().is_some_and(|gp| gp.kind() == "module"))
+}
 
 fn walk_python_node(
     node: Node,
@@ -56,7 +73,14 @@ fn walk_python_node(
                 };
 
                 let symbol_node = outer_node.unwrap_or(node);
-                let symbol = create_symbol(symbol_node, content, file, full_name, sym_kind);
+                let symbol = create_symbol(
+                    symbol_node,
+                    content,
+                    file,
+                    full_name,
+                    sym_kind,
+                    parent_class,
+                );
                 symbols.push(symbol);
             }
         }
@@ -70,6 +94,7 @@ fn walk_python_node(
                     file,
                     name.to_string(),
                     SymbolKind::Class,
+                    Some(name),
                 );
                 symbols.push(symbol);
 
@@ -104,7 +129,9 @@ fn walk_python_node(
                 return;
             }
         }
-        "assignment" | "annotated_assignment" if parent_class.is_none() => {
+        "assignment" | "annotated_assignment"
+            if parent_class.is_none() && is_module_level_assignment(node) =>
+        {
             let left_node = node
                 .child_by_field_name("left")
                 .or_else(|| node.child_by_field_name("target"));
@@ -125,7 +152,8 @@ fn walk_python_node(
                             SymbolKind::Constant
                         }
                     };
-                    let symbol = create_symbol(node, content, file, name.to_string(), sym_kind);
+                    let symbol =
+                        create_symbol(node, content, file, name.to_string(), sym_kind, None);
                     symbols.push(symbol);
                 }
             }
@@ -133,31 +161,77 @@ fn walk_python_node(
         _ => {}
     }
 
+    let next_parent = if matches!(kind, "function_definition" | "async_function_definition") {
+        None
+    } else {
+        parent_class
+    };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_python_node(child, content, file, parent_class, symbols, None, depth + 1);
+        walk_python_node(child, content, file, next_parent, symbols, None, depth + 1);
     }
 }
 
-fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: SymbolKind) -> Symbol {
+#[derive(Default)]
+struct RefCollector {
+    calls: Vec<String>,
+    mentions: Vec<String>,
+    mention_set: HashSet<String>,
+    counts: HashMap<String, u32>,
+    member_calls: Vec<String>,
+    bare_calls: HashSet<String>,
+}
+
+impl RefCollector {
+    fn push_call(&mut self, name: &str, is_member: bool) {
+        let name = name.trim();
+        if name.is_empty() || name == "self" || name == "cls" {
+            return;
+        }
+        if let Some(c) = self.counts.get_mut(name) {
+            *c += 1;
+        } else {
+            let owned = name.to_string();
+            self.counts.insert(owned.clone(), 1);
+            self.calls.push(owned);
+        }
+        if is_member {
+            if !self.bare_calls.contains(name) && !self.member_calls.iter().any(|c| c == name) {
+                self.member_calls.push(name.to_string());
+            }
+        } else if self.bare_calls.insert(name.to_string()) {
+            self.member_calls.retain(|c| c != name);
+        }
+    }
+
+    fn push_mention(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || name == "self" || name == "cls" {
+            return;
+        }
+        if !self.mention_set.contains(name) {
+            let owned = name.to_string();
+            self.mention_set.insert(owned.clone());
+            self.mentions.push(owned);
+        }
+    }
+}
+
+fn create_symbol(
+    node: Node,
+    content: &str,
+    file: &str,
+    name: String,
+    kind: SymbolKind,
+    enclosing_class: Option<&str>,
+) -> Symbol {
     let start_pos = node.start_position();
     let end_pos = node.end_position();
-    let body = node_text(node, content).to_string();
-    let signature = extract_signature(node, content, &body);
+    let raw_body = node_text(node, content);
+    let signature = extract_signature(node, content, raw_body);
 
-    let mut calls = Vec::new();
-    let mut mentions = Vec::new();
-    let mut call_counts = std::collections::HashMap::new();
-    let mut member_calls = Vec::new();
-    collect_references(
-        node,
-        content,
-        &mut calls,
-        &mut mentions,
-        &mut call_counts,
-        &mut member_calls,
-        0,
-    );
+    let mut refs = RefCollector::default();
+    collect_references(node, content, enclosing_class, &mut refs, 0);
 
     Symbol {
         name,
@@ -166,23 +240,21 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         start_line: start_pos.row + 1,
         end_line: end_pos.row + 1,
         signature,
-        body,
+        body: String::new(),
         centrality: 0.0,
-        calls,
-        mentions,
-        call_counts,
-        member_calls,
-        external_imports: Vec::new(),
+        calls: refs.calls,
+        mentions: refs.mentions,
+        call_counts: refs.counts,
+        member_calls: refs.member_calls,
+        external_imports: crate::model::symbol::empty_external_imports(),
     }
 }
 
 fn collect_references(
     node: Node,
     content: &str,
-    calls: &mut Vec<String>,
-    mentions: &mut Vec<String>,
-    counts: &mut std::collections::HashMap<String, u32>,
-    member_calls: &mut Vec<String>,
+    enclosing_class: Option<&str>,
+    refs: &mut RefCollector,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
@@ -203,91 +275,96 @@ fn collect_references(
             continue;
         }
         if kind == "call" {
-            if let Some(func_node) = child.child_by_field_name("function") {
-                // `x.build()` (attribute function) is a member call:
-                // file-local only. Bare `build()` may resolve globally.
-                let is_member = func_node.kind() == "attribute";
-                let text = node_text(func_node, content);
-                let func_name = text.rsplit('.').next().unwrap_or(text).trim();
-                if !func_name.is_empty() {
-                    *counts.entry(func_name.to_string()).or_insert(0) += 1;
-                    if !calls.iter().any(|c| c == func_name) {
-                        calls.push(func_name.to_string());
-                    }
-                    if is_member && !member_calls.iter().any(|c| c == func_name) {
-                        member_calls.push(func_name.to_string());
-                    }
-                }
-            }
-            if let Some(args_node) = child.child_by_field_name("arguments") {
-                let mut acursor = args_node.walk();
-                for arg in args_node.children(&mut acursor) {
-                    if arg.kind() == "identifier" {
-                        push_mention(mentions, node_text(arg, content));
-                    } else if arg.kind() == "attribute" {
-                        if let Some(attr) = arg.child_by_field_name("attribute") {
-                            push_mention(mentions, node_text(attr, content));
-                        }
-                    } else if arg.kind() == "keyword_argument" {
-                        if let Some(val) = arg.child_by_field_name("value") {
-                            if val.kind() == "identifier" {
-                                push_mention(mentions, node_text(val, content));
-                            } else if val.kind() == "attribute" {
-                                if let Some(attr) = val.child_by_field_name("attribute") {
-                                    push_mention(mentions, node_text(attr, content));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            extract_py_call(child, content, enclosing_class, refs);
         } else if kind == "attribute" {
             if let Some(attr) = child.child_by_field_name("attribute") {
-                push_mention(mentions, node_text(attr, content));
+                refs.push_mention(node_text(attr, content));
             }
         } else if kind == "type" {
-            collect_type_mentions(child, content, mentions);
+            collect_type_mentions(child, content, refs, depth + 1);
+            continue;
         }
-        collect_references(
-            child,
-            content,
-            calls,
-            mentions,
-            counts,
-            member_calls,
-            depth + 1,
-        );
+        collect_references(child, content, enclosing_class, refs, depth + 1);
     }
 }
 
-fn collect_type_mentions(node: Node, content: &str, mentions: &mut Vec<String>) {
+fn extract_py_call(
+    call_node: Node,
+    content: &str,
+    enclosing_class: Option<&str>,
+    refs: &mut RefCollector,
+) {
+    if let Some(func_node) = call_node.child_by_field_name("function") {
+        // `x.build()` (attribute function) is a member call:
+        // file-local only. Bare `build()` may resolve globally.
+        if func_node.kind() == "attribute" {
+            let func_name = func_node
+                .child_by_field_name("attribute")
+                .map(|a| node_text(a, content).trim())
+                .unwrap_or_else(|| {
+                    let t = node_text(func_node, content);
+                    t.rsplit('.').next().unwrap_or(t).trim()
+                });
+            refs.push_call(func_name, true);
+            if let (Some(obj), Some(cls_name)) =
+                (func_node.child_by_field_name("object"), enclosing_class)
+            {
+                let recv = node_text(obj, content).trim();
+                if (recv == "self" || recv == "cls") && !func_name.is_empty() {
+                    refs.push_call(&format!("{cls_name}::{func_name}"), false);
+                }
+            }
+        } else {
+            let text = node_text(func_node, content);
+            let func_name = text.rsplit('.').next().unwrap_or(text).trim();
+            refs.push_call(func_name, false);
+        }
+    }
+    if let Some(args_node) = call_node.child_by_field_name("arguments") {
+        let mut acursor = args_node.walk();
+        for arg in args_node.children(&mut acursor) {
+            if arg.kind() == "identifier" {
+                refs.push_mention(node_text(arg, content));
+            } else if arg.kind() == "attribute" {
+                if let Some(attr) = arg.child_by_field_name("attribute") {
+                    refs.push_mention(node_text(attr, content));
+                }
+            } else if arg.kind() == "keyword_argument" {
+                if let Some(val) = arg.child_by_field_name("value") {
+                    if val.kind() == "identifier" {
+                        refs.push_mention(node_text(val, content));
+                    } else if val.kind() == "attribute" {
+                        if let Some(attr) = val.child_by_field_name("attribute") {
+                            refs.push_mention(node_text(attr, content));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_type_mentions(node: Node, content: &str, refs: &mut RefCollector, depth: usize) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
     if kind == "identifier" {
-        push_mention(mentions, node_text(node, content));
+        refs.push_mention(node_text(node, content));
     } else if kind == "attribute" {
         if let Some(attr) = node.child_by_field_name("attribute") {
-            push_mention(mentions, node_text(attr, content));
+            refs.push_mention(node_text(attr, content));
         }
     } else if kind == "type" {
         let text = node_text(node, content).trim();
         if !text.is_empty() && !text.contains('[') && !text.contains('(') && !text.contains('|') {
             let simple = text.rsplit('.').next().unwrap_or(text).trim();
-            push_mention(mentions, simple);
+            refs.push_mention(simple);
         }
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_type_mentions(c, content, mentions);
-    }
-}
-
-fn push_mention(mentions: &mut Vec<String>, name: &str) {
-    let name = name.trim();
-    if name.is_empty() || name == "self" || name == "cls" {
-        return;
-    }
-    if !mentions.iter().any(|m| m == name) {
-        mentions.push(name.to_string());
+        collect_type_mentions(c, content, refs, depth + 1);
     }
 }
 
@@ -316,45 +393,99 @@ fn extract_signature(node: Node, content: &str, body: &str) -> String {
     first_line.to_string()
 }
 
+#[derive(Default)]
+struct ImportSet {
+    items: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl ImportSet {
+    fn push(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() && !self.seen.contains(name) {
+            let owned = name.to_string();
+            self.seen.insert(owned.clone());
+            self.items.push(owned);
+        }
+    }
+}
+
+struct PyFromImport<'a> {
+    module: &'a str,
+    items: Vec<(&'a str, Option<&'a str>)>,
+}
+
+fn parse_from_import_ast<'a>(node: Node, content: &'a str) -> Option<PyFromImport<'a>> {
+    let module = node
+        .child_by_field_name("module_name")
+        .map(|m| node_text(m, content).trim())?;
+    let mut items = Vec::new();
+    let mut seen_import = false;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "import" {
+            seen_import = true;
+            continue;
+        }
+        if !seen_import {
+            continue;
+        }
+        match child.kind() {
+            "aliased_import" => {
+                if let Some(orig_node) = child.child_by_field_name("name") {
+                    let orig = node_text(orig_node, content).trim();
+                    let alias = child
+                        .child_by_field_name("alias")
+                        .map(|a| node_text(a, content).trim());
+                    if !orig.is_empty() {
+                        items.push((orig, alias));
+                    }
+                }
+            }
+            "dotted_name" => {
+                let orig = node_text(child, content).trim();
+                if !orig.is_empty() {
+                    items.push((orig, None));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(PyFromImport { module, items })
+}
+
 /// Local names bound to non-relative imports. `from pkg import y as z`
 /// binds `z`; `from .local import y` binds nothing (resolvable locally).
 fn collect_file_external_imports(root: Node, content: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = ImportSet::default();
     collect_py_imports(root, content, &mut out, 0);
-    out
+    out.items
 }
 
 fn collect_py_local_aliases(
     node: Node,
     content: &str,
-    out: &mut std::collections::HashMap<String, (String, String)>,
+    out: &mut HashMap<String, (String, String)>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
         return;
     }
     if node.kind() == "import_from_statement" {
-        let text = node_text(node, content);
-        let after_from = text.strip_prefix("from").unwrap_or(text).trim();
-        if let Some((module, names)) = after_from.split_once(" import ") {
-            let module = module.trim();
-            let top_segment = module
+        if let Some(parsed) = parse_from_import_ast(node, content) {
+            let top_segment = parsed
+                .module
                 .trim_start_matches('.')
                 .split('.')
                 .next()
                 .unwrap_or("")
                 .trim();
-            let is_local = module.starts_with('.') || !PYTHON_STDLIB.contains(&top_segment);
+            let is_local = parsed.module.starts_with('.') || !PYTHON_STDLIB.contains(&top_segment);
             if is_local {
-                let hint = module.trim_start_matches('.').replace('.', "/");
-                for part in names.split(',') {
-                    let part = part.trim().trim_matches(['(', ')', ' ']);
-                    if let Some((orig, alias)) = part.split_once(" as ") {
-                        let orig = orig.trim();
-                        let alias = alias.trim();
-                        if !orig.is_empty() && !alias.is_empty() && orig != alias {
-                            out.insert(alias.to_string(), (hint.clone(), orig.to_string()));
-                        }
+                let hint = parsed.module.trim_start_matches('.').replace('.', "/");
+                for (orig, alias) in parsed.items {
+                    if let Some(alias) = alias.filter(|a| !a.is_empty() && *a != orig) {
+                        out.insert(alias.to_string(), (hint.clone(), orig.to_string()));
                     }
                 }
             }
@@ -407,47 +538,56 @@ const PYTHON_STDLIB: &[&str] = &[
     "warnings",
 ];
 
-fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>, depth: usize) {
+fn collect_py_imports(node: Node, content: &str, out: &mut ImportSet, depth: usize) {
     if depth >= MAX_AST_DEPTH {
         return;
     }
     let kind = node.kind();
     if kind == "import_statement" {
         // `import a.b as c` binds `c`, else the top segment `a`.
-        let text = node_text(node, content);
-        let clause = text.strip_prefix("import").unwrap_or(text).trim();
-        for part in clause.split(',') {
-            let part = part.trim();
-            if let Some((_, alias)) = part.split_once(" as ") {
-                let top = part.split('.').next().unwrap_or(part).trim();
-                if PYTHON_STDLIB.contains(&top) {
-                    push_import(out, alias.trim());
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "aliased_import" => {
+                    if let Some(orig_node) = child.child_by_field_name("name") {
+                        let orig = node_text(orig_node, content).trim();
+                        let top = orig.split('.').next().unwrap_or(orig).trim();
+                        if PYTHON_STDLIB.contains(&top) {
+                            let bound = child
+                                .child_by_field_name("alias")
+                                .map(|a| node_text(a, content).trim())
+                                .unwrap_or(top);
+                            out.push(bound);
+                        }
+                    }
                 }
-            } else {
-                let top = part.split('.').next().unwrap_or(part).trim();
-                if PYTHON_STDLIB.contains(&top) {
-                    push_import(out, top);
+                "dotted_name" => {
+                    let orig = node_text(child, content).trim();
+                    let top = orig.split('.').next().unwrap_or(orig).trim();
+                    if PYTHON_STDLIB.contains(&top) {
+                        out.push(top);
+                    }
                 }
+                _ => {}
             }
         }
         return;
     }
     if kind == "import_from_statement" {
-        let text = node_text(node, content);
-        let after_from = text.strip_prefix("from").unwrap_or(text).trim();
-        if let Some((module, names)) = after_from.split_once(" import ") {
-            if !module.trim().starts_with('.') {
-                let top_segment = module.split('.').next().unwrap_or(module).trim();
+        if let Some(parsed) = parse_from_import_ast(node, content) {
+            if !parsed.module.starts_with('.') {
+                let top_segment = parsed
+                    .module
+                    .split('.')
+                    .next()
+                    .unwrap_or(parsed.module)
+                    .trim();
                 if PYTHON_STDLIB.contains(&top_segment) {
-                    for part in names.split(',') {
-                        let part = part.trim().trim_matches(['(', ')', ' ']);
-                        if part.is_empty() || part == "*" {
-                            continue;
-                        }
-                        if let Some((_, alias)) = part.split_once(" as ") {
-                            push_import(out, alias.trim());
+                    for (orig, alias) in parsed.items {
+                        if let Some(alias) = alias {
+                            out.push(alias);
                         } else {
-                            push_import(out, part.split('.').next().unwrap_or(part));
+                            out.push(orig.split('.').next().unwrap_or(orig));
                         }
                     }
                 }
@@ -458,13 +598,6 @@ fn collect_py_imports(node: Node, content: &str, out: &mut Vec<String>, depth: u
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
         collect_py_imports(c, content, out, depth + 1);
-    }
-}
-
-fn push_import(out: &mut Vec<String>, name: &str) {
-    let name = name.trim();
-    if !name.is_empty() && !out.contains(&name.to_string()) {
-        out.push(name.to_string());
     }
 }
 

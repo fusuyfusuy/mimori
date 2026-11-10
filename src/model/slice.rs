@@ -33,7 +33,7 @@ fn chars_per_token_for(file: &str) -> usize {
 
 impl SliceResult {
     fn estimate_tokens(&self, s: &str) -> usize {
-        s.len().div_ceil(chars_per_token_for(&self.file))
+        s.chars().count().div_ceil(chars_per_token_for(&self.file))
     }
 
     pub fn to_markdown(&self) -> String {
@@ -227,7 +227,7 @@ impl SliceResult {
     /// Split `content` into the symbol body and the inlined `--follow-local`
     /// block (empty when `-f` was not used).
     fn split_locals(&self) -> (&str, &str) {
-        match self.content.find(FOLLOW_LOCAL_MARKER) {
+        match self.content.rfind(FOLLOW_LOCAL_MARKER) {
             Some(pos) => self.content.split_at(pos),
             None => (self.content.as_str(), ""),
         }
@@ -267,49 +267,77 @@ impl SliceResult {
                 .unwrap_or(1)
                 .max(1);
 
-            for (i, line) in main.lines().enumerate() {
+            let mut cur_line = start_line;
+            let mut lines_iter = main.lines().peekable();
+            while let Some(line) = lines_iter.next() {
+                if line.is_empty() {
+                    if let Some(&next_line) = lines_iter.peek() {
+                        if let Some(skipped) = parse_truncated_line_count(next_line) {
+                            let marker = lines_iter.next().unwrap();
+                            if matches!(lines_iter.peek(), Some(&"")) {
+                                lines_iter.next();
+                            }
+                            out.push('\n');
+                            out.push_str(marker);
+                            out.push_str("\n\n");
+                            cur_line += skipped;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(skipped) = parse_truncated_line_count(line) {
+                    if matches!(lines_iter.peek(), Some(&"")) {
+                        lines_iter.next();
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+                    cur_line += skipped;
+                    continue;
+                }
+
                 let (lineno, content) = if self.symbol.is_none() {
                     if let Some((num_part, code_part)) = line.split_once(" | ") {
                         if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
                             (parsed_num, code_part)
                         } else {
-                            (start_line + i, line)
+                            (cur_line, line)
                         }
                     } else {
-                        (start_line + i, line)
+                        (cur_line, line)
                     }
                 } else {
-                    (start_line + i, line)
+                    (cur_line, line)
                 };
                 out.push_str(&format!("L{}: {}\n", lineno, content));
+                cur_line += 1;
             }
             if include_locals && !locals.is_empty() {
-                let mut callee_line: Option<usize> = None;
+                let mut callee_range: Option<(usize, usize)> = None;
                 for line in locals.lines() {
                     if line.starts_with("// --- Inlined Local Callees") {
-                        callee_line = None;
+                        callee_range = None;
                         out.push_str(line);
                         out.push('\n');
                     } else if line.starts_with("// Symbol: `") {
-                        if let Some(pos) = line.find("(L") {
-                            let rest = &line[pos + 2..];
-                            if let Some(dash) = rest.find('-') {
-                                callee_line = rest[..dash].parse::<usize>().ok();
-                            } else {
-                                callee_line = None;
-                            }
-                        } else {
-                            callee_line = None;
-                        }
+                        callee_range = parse_callee_header_range(line);
                         out.push_str(line);
                         out.push('\n');
-                    } else if let Some(ref mut lno) = callee_line {
-                        if line.is_empty() {
-                            out.push_str(&format!("L{}:\n", lno));
+                    } else if let Some((ref mut lno, end_line)) = callee_range {
+                        if *lno <= end_line {
+                            if line.is_empty() {
+                                out.push_str(&format!("L{}:\n", lno));
+                            } else {
+                                out.push_str(&format!("L{}: {}\n", lno, line));
+                            }
+                            *lno += 1;
+                            if *lno > end_line {
+                                callee_range = None;
+                            }
                         } else {
-                            out.push_str(&format!("L{}: {}\n", lno, line));
+                            callee_range = None;
+                            out.push_str(line);
+                            out.push('\n');
                         }
-                        *lno += 1;
                     } else {
                         out.push_str(line);
                         out.push('\n');
@@ -320,6 +348,26 @@ impl SliceResult {
         out.push_str("```\n");
         out
     }
+}
+
+fn parse_truncated_line_count(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("// ... [")?;
+    let num_str = rest.strip_suffix(" lines truncated for token efficiency] ...")?;
+    num_str.trim().parse::<usize>().ok()
+}
+
+fn parse_callee_header_range(line: &str) -> Option<(usize, usize)> {
+    let pos = line.rfind("(L")?;
+    let rest = line[pos + 2..].strip_suffix(')')?;
+    let (start_s, end_s) = rest.split_once('-')?;
+    let start = start_s.trim().parse::<usize>().ok()?;
+    let end = end_s
+        .trim()
+        .strip_prefix(['L', 'l'])
+        .unwrap_or(end_s.trim())
+        .parse::<usize>()
+        .ok()?;
+    Some((start, end.max(start)))
 }
 
 #[cfg(test)]
@@ -344,7 +392,7 @@ mod tests {
                 mentions: vec![],
                 call_counts: std::collections::HashMap::from([("bar".to_string(), 1)]),
                 member_calls: vec![],
-                external_imports: vec![],
+                external_imports: crate::model::symbol::empty_external_imports(),
             }),
             line_range: Some((1, 3)),
             content: format!(

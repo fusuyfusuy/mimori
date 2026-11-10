@@ -9,7 +9,7 @@ pub use lang::Language;
 use crate::model::Symbol;
 use crate::workspace::AliasSet;
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn parse_file(path: &Path, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
@@ -28,23 +28,42 @@ pub fn parse_file(path: &Path, content: &str, aliases: &AliasSet) -> Result<Vec<
     }
 }
 
+const SCRIPT_EXTS: &[&str] = &[".tsx", ".mts", ".cts", ".jsx", ".mjs", ".cjs", ".ts", ".js"];
+
+fn strip_alias_prefix(s: &str) -> &str {
+    if !s.starts_with(['@', '~', '$']) {
+        return s;
+    }
+    let Some((first, rest)) = s.split_once('/') else {
+        return s;
+    };
+    if first.starts_with(['~', '$']) || first.len() <= 2 {
+        return rest;
+    }
+    if first.starts_with('@') {
+        return match rest.split_once('/') {
+            Some((_, after_pkg)) => after_pkg,
+            None => rest,
+        };
+    }
+    s
+}
+
 pub(crate) fn spec_to_module_hint(spec: &str) -> String {
     let mut s = spec.trim();
     while let Some(rest) = s.strip_prefix("./").or_else(|| s.strip_prefix("../")) {
         s = rest;
     }
-    if s.starts_with(['@', '~', '$']) {
-        if let Some((first, rest)) = s.split_once('/') {
-            if first.len() <= 2 {
-                s = rest;
-            } else if first.starts_with('@') {
-                if let Some((_, after_pkg)) = rest.split_once('/') {
-                    s = after_pkg;
-                }
-            }
+    s = strip_alias_prefix(s).trim_matches('/');
+    for ext in SCRIPT_EXTS {
+        if let Some(stem) = s
+            .strip_suffix(ext)
+            .filter(|stem| !stem.is_empty() && !stem.ends_with('/'))
+        {
+            return stem.to_string();
         }
     }
-    s.trim_matches('/').to_string()
+    s.to_string()
 }
 
 pub(crate) fn apply_import_aliases(
@@ -67,12 +86,14 @@ pub(crate) fn apply_import_aliases(
                 *call = rewritten;
             }
         }
-        s.calls.dedup();
+        let mut seen_calls = HashSet::with_capacity(s.calls.len());
+        s.calls.retain(|c| seen_calls.insert(c.clone()));
         for m in &mut s.mentions {
             if let Some((_, exported)) = aliases.get(m.as_str()) {
                 *m = exported.clone();
             }
         }
-        s.mentions.dedup();
+        let mut seen_mentions = HashSet::with_capacity(s.mentions.len());
+        s.mentions.retain(|m| seen_mentions.insert(m.clone()));
     }
 }

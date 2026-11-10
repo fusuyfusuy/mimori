@@ -1,7 +1,9 @@
 use crate::graph::SymbolGraph;
 use crate::parser::parse_file;
 use crate::storage::db::Database;
-use crate::workspace::walker::scan_workspace_with_stats;
+use crate::workspace::walker::{
+    discover_workspace, fnv1a_hash, hash_discovered_files, HashedFile, WorkspaceDiscovery,
+};
 use crate::workspace::AliasSet;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -9,7 +11,19 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
+/// Single-pass workspace discovery + FNV-1a content hashes, shared between
+/// `McpCache` invalidation and `sync_prepared_workspace` so zero files are
+/// walked or hashed twice.
+pub struct PreparedWorkspace {
+    pub discovery: WorkspaceDiscovery,
+    pub aliases: AliasSet,
+    pub hashed: Vec<HashedFile>,
+    pub transient_failed: Vec<String>,
+    pub indexed_files: usize,
+    pub content_fingerprint: String,
+}
+
+pub fn prepare_workspace(root: &Path) -> Result<PreparedWorkspace> {
     if crate::workspace::walker::is_disallowed_workspace_root(root) {
         anyhow::bail!(
             "Refusing to index home or system directory '{}' as workspace root",
@@ -17,6 +31,37 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
         );
     }
 
+    let _p = crate::Phase::start("scan+read+hash");
+    let discovery = discover_workspace(root);
+    let aliases = AliasSet::collect_with_discovery(root, &discovery);
+    let (hashed, transient_failed, indexed_files) = hash_discovered_files(&discovery);
+    drop(_p);
+
+    let mut fp_hash: u64 = 0xcbf29ce484222325;
+    let mix = |h: u64, bytes: &[u8]| fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3);
+    fp_hash = mix(fp_hash, aliases.fingerprint().as_bytes());
+    for h in &hashed {
+        fp_hash = mix(fp_hash, h.rel.as_bytes());
+        fp_hash = mix(fp_hash, h.hash.as_bytes());
+    }
+    let content_fingerprint = format!("{fp_hash:016x}");
+
+    Ok(PreparedWorkspace {
+        discovery,
+        aliases,
+        hashed,
+        transient_failed,
+        indexed_files,
+        content_fingerprint,
+    })
+}
+
+pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
+    let prep = prepare_workspace(root)?;
+    sync_prepared_workspace(root, &prep)
+}
+
+pub fn sync_prepared_workspace(root: &Path, prep: &PreparedWorkspace) -> Result<SymbolGraph> {
     let mimori_dir = root.join(".mimori");
 
     if !mimori_dir.exists() {
@@ -26,46 +71,41 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     let db_path = mimori_dir.join("index.db");
     let mut db = Database::open_or_create(&db_path)?;
 
-    let _p = crate::Phase::start("scan+read+hash");
-    // Path aliases are workspace-level facts (`tsconfig.json`), read before
-    // parsing because they decide whether an import is first-party.
-    let aliases = AliasSet::collect(root);
-    db.enforce_alias_fingerprint(aliases.fingerprint())?;
-    let (scans, scan_stats) = scan_workspace_with_stats(root);
-    drop(_p);
+    db.enforce_alias_fingerprint(prep.aliases.fingerprint())?;
+    // Read existing DB file records BEFORE comparing against the disk snapshot.
     let db_files = db.get_file_records()?;
 
-    let mut disk_paths = HashSet::new();
-    let mut stale = Vec::new();
+    let mut disk_paths: HashSet<&str> =
+        HashSet::with_capacity(prep.hashed.len() + prep.transient_failed.len());
+    for failed_rel in &prep.transient_failed {
+        disk_paths.insert(failed_rel.as_str());
+    }
 
-    for scan in &scans {
-        let rel = scan.rel.to_string_lossy().to_string();
-        disk_paths.insert(rel.clone());
-
-        // Invalidate on content, not on timestamps. mtime is recorded but never
-        // trusted: preserving it while changing content is routine (cp -p,
-        // touch -r, rsync -t) and used to leave the index silently wrong.
-        let cached = db_files.get(&rel);
-        if !matches!(cached, Some((_, _, db_hash)) if *db_hash == scan.hash) {
-            stale.push((rel, scan));
+    let mut stale: Vec<&HashedFile> = Vec::new();
+    for h in &prep.hashed {
+        disk_paths.insert(h.rel.as_str());
+        let cached = db_files.get(&h.rel);
+        if !matches!(cached, Some((_, _, db_hash)) if *db_hash == h.hash) {
+            stale.push(h);
         }
     }
 
-    // Parse in parallel; write serially, since the connection is not Sync.
+    // Read full source text ONLY for stale/new files, parse in parallel.
     let _p = crate::Phase::start("parse (parallel)");
     let parsed: Vec<(String, i64, String, Option<Vec<_>>)> = stale
         .par_iter()
-        .map(|(rel, scan)| {
-            let full = root.join(&scan.rel);
-            let symbols = parse_file(&full, &scan.content, &aliases)
+        .filter_map(|h| {
+            let bytes = fs::read(&h.full).ok()?;
+            let content = String::from_utf8_lossy(&bytes);
+            let symbols = parse_file(&h.full, &content, &prep.aliases)
                 .ok()
                 .map(|mut syms| {
                     for s in &mut syms {
-                        s.file = rel.clone();
+                        s.file = h.rel.clone();
                     }
                     syms
                 });
-            (rel.clone(), scan.mtime, scan.hash.clone(), symbols)
+            Some((h.rel.clone(), h.mtime, h.hash.clone(), symbols))
         })
         .collect();
 
@@ -75,9 +115,6 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     let mut batch_updates = Vec::with_capacity(parsed.len());
 
     for (rel, mtime, hash, symbols) in &parsed {
-        // A file that fails to parse is still recorded, with zero symbols. Not
-        // recording it left `needs_reparse` true forever, so every subsequent
-        // command re-read and re-parsed it, invisibly.
         let syms: &[crate::model::Symbol] = match symbols {
             Some(syms) => syms.as_slice(),
             None => {
@@ -90,7 +127,7 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
 
     let mut deleted_file_ids = Vec::new();
     for (db_path_str, (file_id, _, _)) in &db_files {
-        if !disk_paths.contains(db_path_str) {
+        if !disk_paths.contains(db_path_str.as_str()) {
             deleted_file_ids.push(*file_id);
         }
     }
@@ -111,19 +148,20 @@ pub fn get_or_sync_graph(root: &Path) -> Result<SymbolGraph> {
     let _p = crate::Phase::start("SymbolGraph::new");
     let mut g = SymbolGraph::new(symbols);
     drop(_p);
+    g.root = Some(root.to_path_buf());
+    g.indexed_files = prep.hashed.iter().map(|h| h.rel.clone()).collect();
+    let scan_stats = &prep.discovery.stats;
     g.coverage = Some(crate::graph::CoverageStats {
-        indexed_files: scan_stats.indexed_files,
+        indexed_files: prep.indexed_files,
         crawled_files: scan_stats.crawled_files,
         unindexed_exts: scan_stats.unindexed_exts.clone(),
     });
-    // P1-4: a zero that means "none indexed" must never present as
-    // "none exists". One line on stderr when coverage drops below half.
-    if scan_stats.crawled_files > 0 && scan_stats.indexed_files * 2 < scan_stats.crawled_files {
+    if scan_stats.crawled_files > 0 && prep.indexed_files * 2 < scan_stats.crawled_files {
         eprintln!(
             "Note: indexed {}/{} files ({}%); unindexed exts: {}. Coverage below 50% — map/doctor reflect indexed files only.",
-            scan_stats.indexed_files,
+            prep.indexed_files,
             scan_stats.crawled_files,
-            scan_stats.indexed_files * 100 / scan_stats.crawled_files,
+            prep.indexed_files * 100 / scan_stats.crawled_files,
             if scan_stats.unindexed_exts.is_empty() {
                 "(none)".to_string()
             } else {

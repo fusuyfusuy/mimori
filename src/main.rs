@@ -1,8 +1,9 @@
 use anyhow::{bail, Result};
 use clap::Parser;
 use mimori::cli::{Cli, Commands, DebtCommand, MemoryCommand};
-use mimori::graph::map::generate_map;
-use mimori::graph::{slice_line_coordinate, SymbolGraph};
+use mimori::graph::blast::{format_sink_hits, parse_sink_list, sweep_literal_sinks};
+use mimori::graph::map::{generate_map, personalize_map};
+use mimori::graph::{slice_line_coordinate, zero_caller_hint, SymbolGraph};
 use mimori::memory::{check_debt, generate_dump, list_debt, sync_debt, MemoryLedger};
 use mimori::model::Coordinate;
 use mimori::storage::{clean_cache, get_or_sync_graph};
@@ -71,8 +72,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Find(args) => {
+            let root = find_workspace_root(None, &current_dir);
             let res = match mimori::workspace::execute_find(
-                &current_dir,
+                &root,
                 &args.pattern,
                 args.symbols_only,
                 args.files_only,
@@ -228,7 +230,7 @@ fn main() -> ExitCode {
                 }
             };
 
-            if let Err(e) = personalize(
+            if let Err(e) = personalize_map(
                 &mut graph,
                 args.focus.as_deref(),
                 args.seed.as_deref(),
@@ -259,6 +261,10 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Diff(args) => {
+            if let Err(e) = mimori::graph::diff::validate_diff_base(args.base.as_deref()) {
+                eprintln!("Error: {}", e);
+                return ExitCode::FAILURE;
+            }
             let root = find_workspace_root(None, &current_dir);
             if mimori::workspace::walker::is_disallowed_workspace_root(&root) {
                 eprintln!(
@@ -430,6 +436,13 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let mimori_dir = root.join(".mimori");
+            if fs::symlink_metadata(&mimori_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                eprintln!(
+                    "INIT_FAIL: Refusing to follow symlink '{}'; exit 1.",
+                    mimori_dir.display()
+                );
+                return ExitCode::FAILURE;
+            }
             if let Err(e) = fs::create_dir_all(&mimori_dir) {
                 eprintln!(
                     "INIT_FAIL: create dir {}: {}; exit 1.",
@@ -440,8 +453,21 @@ fn main() -> ExitCode {
             }
 
             let gitignore_path = root.join(".gitignore");
+            if fs::symlink_metadata(&gitignore_path).is_ok_and(|m| m.file_type().is_symlink()) {
+                eprintln!(
+                    "INIT_FAIL: Refusing to modify symlinked .gitignore '{}'; exit 1.",
+                    gitignore_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
             let gitignore_status = if gitignore_path.exists() {
-                let content = fs::read_to_string(&gitignore_path).unwrap_or_default();
+                let content = match fs::read_to_string(&gitignore_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("INIT_FAIL: read .gitignore: {}; exit 1.", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
                 if content
                     .lines()
                     .any(|l| l.trim() == ".mimori" || l.trim() == ".mimori/")
@@ -453,11 +479,17 @@ fn main() -> ExitCode {
                         updated.push('\n');
                     }
                     updated.push_str(".mimori/\n");
-                    let _ = fs::write(&gitignore_path, updated);
+                    if let Err(e) = fs::write(&gitignore_path, updated) {
+                        eprintln!("INIT_FAIL: write .gitignore: {}; exit 1.", e);
+                        return ExitCode::FAILURE;
+                    }
                     "updated"
                 }
             } else {
-                let _ = fs::write(&gitignore_path, ".mimori/\n");
+                if let Err(e) = fs::write(&gitignore_path, ".mimori/\n") {
+                    eprintln!("INIT_FAIL: create .gitignore: {}; exit 1.", e);
+                    return ExitCode::FAILURE;
+                }
                 "created"
             };
 
@@ -749,33 +781,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Apply `--focus` (personalized PageRank around a symbol) and/or `--seed`
-/// (bias toward symbols matching a term) to the ranking.
-fn personalize(
-    graph: &mut SymbolGraph,
-    focus: Option<&str>,
-    seed: Option<&str>,
-    cwd: &Path,
-) -> Result<()> {
-    let mut indices = Vec::new();
-
-    if let Some(target) = focus {
-        let coord = Coordinate::parse(target)?.normalize_against(cwd);
-        indices.extend(graph.resolve_all(&coord));
-    }
-    if let Some(term) = seed {
-        indices.extend(graph.seed_indices(term));
-    }
-
-    indices.sort_unstable();
-    indices.dedup();
-
-    if !indices.is_empty() {
-        graph.apply_personalization(&indices);
-    }
-    Ok(())
-}
-
 /// Parse a raw target, locate the workspace root from it, load the index, and
 /// return the coordinate normalized onto the paths the index stores.
 fn parse_and_prepare(raw: &str, cwd: &Path) -> Result<(SymbolGraph, Coordinate)> {
@@ -799,6 +804,13 @@ fn validate_coord_workspace(coord: &Coordinate, cwd: &Path) -> Result<std::path:
         {
             let full = root.join(file);
             mimori::workspace::walker::confine_to_workspace(&root, &full)?;
+        } else {
+            for candidate in [cwd.join(file), root.join(file)] {
+                if fs::symlink_metadata(&candidate).is_ok() {
+                    mimori::workspace::walker::confine_to_workspace(&root, &candidate)?;
+                    break;
+                }
+            }
         }
     }
     Ok(root)
@@ -846,7 +858,12 @@ fn build_cli_slice(
         let full = if file.is_absolute() {
             file.to_path_buf()
         } else {
-            cwd.join(file)
+            let from_cwd = cwd.join(file);
+            if fs::symlink_metadata(&from_cwd).is_ok() {
+                from_cwd
+            } else {
+                root.join(file)
+            }
         };
         let target_path = mimori::workspace::walker::confine_to_workspace(&root, &full)?;
         return slice_line_coordinate(&target_path, *start, *end, with_imports);
@@ -878,102 +895,19 @@ fn render_cli_blast_markdown(
     out
 }
 
-/// P2: when `up`/`blast` on a class-like returns zero, point at the
-/// constructor and the confirming `rg` before the user detours.
-fn zero_caller_hint(graph: &SymbolGraph, coord: &Coordinate) -> Option<String> {
-    let name = coord.name()?;
-    // Skip targets that already name a member (`X::ctor`) — the hint is for
-    // bare classes whose construction sites live under the constructor.
-    if name.contains("::") || name.contains('.') {
-        return None;
-    }
-    let has_ctor = ["::constructor", "::new"].iter().any(|sfx| {
-        graph
-            .name_to_indices
-            .contains_key(&format!("{}{}", name, sfx))
-    });
-    let is_type = graph.resolve_all(coord).iter().any(|&i| {
-        matches!(
-            graph.symbols[i].kind.as_str(),
-            "class" | "struct" | "interface" | "trait"
-        )
-    });
-    if has_ctor || is_type {
-        Some(format!(
-            "💡 0 callers — if `{0}` is a class, construction sites are `new {0}(...)` edges: try `mimori up {0}::constructor`, and confirm with `rg -n \"new {0}\"`.",
-            name
-        ))
-    } else {
-        None
-    }
-}
-
-fn parse_sink_list(raw: Option<&str>) -> Vec<String> {
-    match raw {
-        None => Vec::new(),
-        Some(s) => s
-            .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect(),
-    }
-}
-
-/// P3: case-sensitive substring sweep over indexed files, one hit per matching
-/// line, capped so a noisy sink (e.g. `console.`) can't flood the context.
-fn sweep_literal_sinks(root: &Path, graph: &SymbolGraph, sinks: &[String]) -> Vec<String> {
-    const CAP: usize = 100;
-    let mut files: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
-    files.sort_unstable();
-    files.dedup();
-    let mut hits = Vec::new();
-    'files: for rel in files {
-        let Ok(content) = fs::read_to_string(root.join(rel)) else {
-            continue;
-        };
-        for (idx, line) in content.lines().enumerate() {
-            if sinks.iter().any(|s| line.contains(s)) {
-                hits.push(format!("{}:#L{}: {}", rel, idx + 1, line.trim()));
-                if hits.len() >= CAP {
-                    hits.push(format!(
-                        "… capped at {} hits; refine --with-sinks or use rg.",
-                        CAP
-                    ));
-                    break 'files;
-                }
-            }
-        }
-    }
-    hits
-}
-
-fn format_sink_hits(sinks: &[String], hits: &[String]) -> String {
-    let mut out = format!(
-        "\n### 🔍 Literal sink hits (`--with-sinks {}`)\n\n",
-        sinks.join(",")
-    );
-    if hits.is_empty() {
-        out.push_str("No literal sink hits.\n");
-    } else {
-        for h in hits {
-            out.push_str(&format!("- `{}`\n", h));
-        }
-    }
-    out
-}
-
 fn print_budgeted(text: &str, budget: Option<usize>) {
     if let Some(b) = budget {
-        let max_chars = b * 4;
-        if text.len() > max_chars {
-            let mut acc = 0;
+        let max_chars = b.saturating_mul(4);
+        if text.chars().count() > max_chars {
+            let mut acc = 0usize;
             for line in text.lines() {
-                if acc + line.len() + 1 > max_chars {
+                let line_chars = line.chars().count() + 1;
+                if acc.saturating_add(line_chars) > max_chars {
                     println!("… [truncated to fit token budget]");
                     break;
                 }
                 println!("{}", line);
-                acc += line.len() + 1;
+                acc = acc.saturating_add(line_chars);
             }
             return;
         }

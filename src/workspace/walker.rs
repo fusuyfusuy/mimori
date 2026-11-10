@@ -33,7 +33,9 @@ const IGNORED_DIRS: &[&str] = &[
     ".mimori",
 ];
 
-const SUPPORTED_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go"];
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go",
+];
 
 /// Coverage accounting (P1-4): what the walker crawled vs indexed, so a zero
 /// that means "none indexed" never presents as "none exists".
@@ -42,6 +44,28 @@ pub struct ScanStats {
     pub indexed_files: usize,
     pub crawled_files: usize,
     pub unindexed_exts: Vec<String>,
+}
+
+/// Single-pass workspace discovery collecting supported source files and
+/// workspace manifest/config paths without redundant directory walks.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceDiscovery {
+    /// `(normalized_rel, full_path, mtime)` sorted deterministically by `normalized_rel`.
+    pub supported: Vec<(String, PathBuf, i64)>,
+    pub package_manifests: Vec<PathBuf>,
+    pub tsconfigs: Vec<PathBuf>,
+    pub cargo_manifests: Vec<PathBuf>,
+    pub go_mods: Vec<PathBuf>,
+    pub stats: ScanStats,
+}
+
+/// Hashed file entry produced by `hash_discovered_files`: carries `content`
+/// only when `retain_content` requested it (e.g., stale/new files).
+pub struct HashedFile {
+    pub rel: String,
+    pub full: PathBuf,
+    pub mtime: i64,
+    pub hash: String,
 }
 
 /// Walk the workspace, then read and hash every supported file in parallel.
@@ -54,68 +78,121 @@ pub fn scan_workspace(root: &Path) -> Vec<FileScan> {
 }
 
 pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
-    let paths = discover_workspace_files(root);
-
-    let stats = ScanStats {
-        indexed_files: paths.supported.len(),
-        crawled_files: paths.crawled,
-        unindexed_exts: paths.unindexed_exts.clone(),
-    };
-
-    let scans = paths
+    let discovery = discover_workspace(root);
+    let scans: Vec<FileScan> = discovery
         .supported
         .into_par_iter()
-        .filter_map(|(rel, full, mtime, _size)| {
-            let content = fs::read_to_string(&full).ok()?;
-            let hash = format!("{:x}", fnv1a_hash(content.as_bytes()));
+        .filter_map(|(rel, full, mtime)| {
+            let bytes = fs::read(&full).ok()?;
+            let hash = format!("{:x}", fnv1a_hash(&bytes));
+            let content = String::from_utf8_lossy(&bytes).into_owned();
             Some(FileScan {
-                rel,
+                rel: PathBuf::from(rel),
                 mtime,
                 hash,
                 content,
             })
         })
         .collect();
+    let mut stats = discovery.stats;
+    stats.indexed_files = scans.len();
     (scans, stats)
 }
 
-struct DiscoveredFiles {
-    supported: Vec<(PathBuf, PathBuf, i64, u64)>,
-    crawled: usize,
-    unindexed_exts: Vec<String>,
-}
+/// Hash all discovered source files in parallel, dropping file byte buffers
+/// immediately so clean workspaces retain zero source contents in heap memory.
+/// Files failing transient reads (`!NotFound`) are reported in the second tuple
+/// item so callers do not mistakenly purge their cached symbols.
+pub fn hash_discovered_files(
+    discovery: &WorkspaceDiscovery,
+) -> (Vec<HashedFile>, Vec<String>, usize) {
+    enum ReadOutcome {
+        Hashed(HashedFile),
+        TransientErr(String),
+        Gone,
+    }
 
-pub fn discover_workspace_file_stats(root: &Path) -> (Vec<(PathBuf, i64, u64)>, ScanStats) {
-    let discovered = discover_workspace_files(root);
-    let stats = ScanStats {
-        indexed_files: discovered.supported.len(),
-        crawled_files: discovered.crawled,
-        unindexed_exts: discovered.unindexed_exts,
-    };
-    let file_stats = discovered
+    let outcomes: Vec<ReadOutcome> = discovery
         .supported
-        .into_iter()
-        .map(|(rel, _full, mtime, size)| (rel, mtime, size))
+        .par_iter()
+        .map(|(rel, full, mtime)| match fs::read(full) {
+            Ok(bytes) => {
+                let hash = format!("{:x}", fnv1a_hash(&bytes));
+                ReadOutcome::Hashed(HashedFile {
+                    rel: rel.clone(),
+                    full: full.clone(),
+                    mtime: *mtime,
+                    hash,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Gone,
+            Err(_) => ReadOutcome::TransientErr(rel.clone()),
+        })
         .collect();
-    (file_stats, stats)
+
+    let mut hashed = Vec::with_capacity(outcomes.len());
+    let mut transient_failed = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            ReadOutcome::Hashed(h) => hashed.push(h),
+            ReadOutcome::TransientErr(rel) => transient_failed.push(rel),
+            ReadOutcome::Gone => {}
+        }
+    }
+    let indexed_count = hashed.len() + transient_failed.len();
+    (hashed, transient_failed, indexed_count)
 }
 
-fn discover_workspace_files(root: &Path) -> DiscoveredFiles {
+pub fn discover_workspace(root: &Path) -> WorkspaceDiscovery {
     let builder = walk_builder(root);
+    let canon_root = root.canonicalize().ok();
 
     let mut supported = Vec::new();
+    let mut package_manifests = Vec::new();
+    let mut tsconfigs = Vec::new();
+    let mut cargo_manifests = Vec::new();
+    let mut go_mods = Vec::new();
     let mut crawled = 0usize;
     let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for entry in builder.build().flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            let Some(ref cr) = canon_root else {
+                continue;
+            };
+            let Ok(canon_target) = path.canonicalize() else {
+                continue;
+            };
+            if !canon_target.starts_with(cr) || !canon_target.is_file() {
+                continue;
+            }
+        } else if !ft.is_file() {
             continue;
         }
-        let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-        if is_ignored_rel(&rel) {
+
+        let rel_path = path.strip_prefix(root).unwrap_or(path);
+        if is_ignored_rel(rel_path) {
             continue;
         }
+
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name == "package.json" {
+                package_manifests.push(path.to_path_buf());
+            } else if name == "jsconfig.json"
+                || (name.starts_with("tsconfig") && name.ends_with(".json"))
+            {
+                tsconfigs.push(path.to_path_buf());
+            } else if name == "Cargo.toml" {
+                cargo_manifests.push(path.to_path_buf());
+            } else if name == "go.mod" {
+                go_mods.push(path.to_path_buf());
+            }
+        }
+
         crawled += 1;
         if !has_supported_extension(path) {
             let ext = path
@@ -134,20 +211,44 @@ fn discover_workspace_files(root: &Path) -> DiscoveredFiles {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
-        supported.push((rel, path.to_path_buf(), mtime, size));
+        let rel_norm = normalize_rel_str(rel_path);
+        supported.push((rel_norm, path.to_path_buf(), mtime));
     }
+
+    supported.sort_by(|a, b| a.0.cmp(&b.0));
+    package_manifests.sort();
+    tsconfigs.sort();
+    cargo_manifests.sort();
+    go_mods.sort();
 
     let mut unindexed_exts: Vec<String> = ext_counts
         .into_iter()
         .map(|(ext, n)| format!("{ext}×{n}"))
         .collect();
     unindexed_exts.sort();
-    DiscoveredFiles {
+
+    let indexed_files = supported.len();
+    WorkspaceDiscovery {
         supported,
-        crawled,
-        unindexed_exts,
+        package_manifests,
+        tsconfigs,
+        cargo_manifests,
+        go_mods,
+        stats: ScanStats {
+            indexed_files,
+            crawled_files: crawled,
+            unindexed_exts,
+        },
+    }
+}
+
+pub fn normalize_rel_str(rel: &Path) -> String {
+    let raw = rel.to_string_lossy();
+    if raw.contains('\\') {
+        raw.replace('\\', "/")
+    } else {
+        raw.into_owned()
     }
 }
 
@@ -299,6 +400,7 @@ pub fn is_system_directory(path: &Path) -> bool {
     ];
     const SYSTEM_PREFIXES: &[&str] = &[
         "/etc",
+        "/private/etc",
         "/usr",
         "/bin",
         "/sbin",
@@ -318,8 +420,19 @@ pub fn is_system_directory(path: &Path) -> bool {
         "/var/backups",
         "/var/db",
     ];
-    EXACT_CONTAINERS.iter().any(|&c| path == Path::new(c))
-        || SYSTEM_PREFIXES.iter().any(|&p| path.starts_with(p))
+    let matches_sys = |p: &Path| {
+        EXACT_CONTAINERS.iter().any(|&c| p == Path::new(c))
+            || SYSTEM_PREFIXES.iter().any(|&pref| p.starts_with(pref))
+    };
+    if matches_sys(path) {
+        return true;
+    }
+    if let Ok(canon) = path.canonicalize() {
+        if matches_sys(&canon) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn is_disallowed_workspace_root(path: &Path) -> bool {

@@ -6,8 +6,8 @@ pub use tools::*;
 
 use anyhow::Result;
 use serde_json::json;
-use std::collections::HashSet;
-use std::io::{self, BufRead, Write};
+use std::collections::HashMap;
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -17,13 +17,21 @@ enum IncomingRpc {
     TooLarge,
 }
 
-/// Hard cap on one JSON-RPC line; larger frames are drained and rejected.
+/// Hard cap on one JSON-RPC frame (line or Content-Length payload).
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IN_FLIGHT_RPC: usize = 64;
 
 enum LineRead {
     Eof,
     Line,
     Oversized,
+}
+
+enum FrameRead {
+    Eof,
+    Frame,
+    Oversized,
+    InvalidHeader(String),
 }
 
 /// Reads one `\n`-terminated line into `buf`, never holding more than
@@ -63,6 +71,59 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> io::Resul
     }
 }
 
+/// Reads either a `Content-Length: <N>\r\n\r\n<payload>` frame or a legacy
+/// newline-delimited JSON-RPC frame into `buf`, enforcing `MAX_LINE_BYTES`.
+fn read_rpc_frame<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<FrameRead> {
+    loop {
+        match read_bounded_line(reader, buf)? {
+            LineRead::Eof => return Ok(FrameRead::Eof),
+            LineRead::Oversized => return Ok(FrameRead::Oversized),
+            LineRead::Line => {}
+        }
+        let line_str = String::from_utf8_lossy(buf);
+        let trimmed = line_str.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((hdr_name, hdr_val)) = trimmed.split_once(':') else {
+            return Ok(FrameRead::Frame);
+        };
+        if !hdr_name.trim().eq_ignore_ascii_case("content-length") {
+            return Ok(FrameRead::Frame);
+        }
+        let Ok(content_len) = hdr_val.trim().parse::<usize>() else {
+            return Ok(FrameRead::InvalidHeader(format!(
+                "Invalid Content-Length header: {}",
+                trimmed
+            )));
+        };
+
+        // Drain any remaining HTTP-style headers up to the blank `\r\n` separator line.
+        let mut hdr_buf = Vec::new();
+        loop {
+            match read_bounded_line(reader, &mut hdr_buf)? {
+                LineRead::Eof => return Ok(FrameRead::Eof),
+                LineRead::Oversized => return Ok(FrameRead::Oversized),
+                LineRead::Line => {
+                    if String::from_utf8_lossy(&hdr_buf).trim().is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if content_len > MAX_LINE_BYTES {
+            let _ = io::copy(&mut reader.take(content_len as u64), &mut io::sink())?;
+            return Ok(FrameRead::Oversized);
+        }
+
+        buf.clear();
+        buf.resize(content_len, 0);
+        reader.read_exact(buf)?;
+        return Ok(FrameRead::Frame);
+    }
+}
+
 pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let default_root = workspace
@@ -96,46 +157,67 @@ pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
     let mut cache = McpCache::new();
     let mut stdout = io::stdout();
 
-    let (tx, rx) = mpsc::channel();
-    let cancelled_ids: Arc<Mutex<HashSet<serde_json::Value>>> =
-        Arc::new(Mutex::new(HashSet::new()));
-    let cancelled_ids_reader = Arc::clone(&cancelled_ids);
+    let (tx, rx) = mpsc::sync_channel(MAX_IN_FLIGHT_RPC);
+    // Maps currently queued/executing cancellable request IDs to `cancelled: bool`.
+    // Bounded by `MAX_IN_FLIGHT_RPC + 1`: late cancellations for unknown/finished
+    // IDs are ignored and never poison future reused request IDs.
+    let in_flight: Arc<Mutex<HashMap<serde_json::Value, bool>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let in_flight_reader = Arc::clone(&in_flight);
 
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut raw = Vec::new();
         loop {
-            match read_bounded_line(&mut stdin, &mut raw) {
-                Ok(LineRead::Line) => {}
-                Ok(LineRead::Oversized) => {
+            match read_rpc_frame(&mut stdin, &mut raw) {
+                Ok(FrameRead::Frame) => {}
+                Ok(FrameRead::Oversized) => {
                     if tx.send(IncomingRpc::TooLarge).is_err() {
                         break;
                     }
                     continue;
                 }
-                Ok(LineRead::Eof) | Err(_) => break,
+                Ok(FrameRead::InvalidHeader(msg)) => {
+                    if tx.send(IncomingRpc::ParseError(msg)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(FrameRead::Eof) | Err(_) => break,
             }
-            let line = String::from_utf8_lossy(&raw);
-            let line = line.trim();
-            if line.is_empty() {
+            let payload = String::from_utf8_lossy(&raw);
+            let payload = payload.trim();
+            if payload.is_empty() {
                 continue;
             }
 
-            match serde_json::from_str::<JsonRpcRequest>(line) {
+            match serde_json::from_str::<JsonRpcRequest>(payload) {
                 Ok(req) => {
                     if req.method == "notifications/cancelled" {
                         if let Some(params) = &req.params {
                             if let Some(req_id) = params.get("requestId") {
-                                let mut set = cancelled_ids_reader.lock().unwrap();
-                                if set.len() >= 256 {
-                                    set.clear();
+                                if let Some(cancelled) =
+                                    in_flight_reader.lock().unwrap().get_mut(req_id)
+                                {
+                                    *cancelled = true;
                                 }
-                                set.insert(req_id.clone());
                             }
                         }
                         continue;
                     }
+                    // Per MCP lifecycle spec, `initialize` MUST NOT be cancelled.
+                    let tracked_id = if req.method != "initialize" {
+                        req.id.clone()
+                    } else {
+                        None
+                    };
+                    if let Some(ref id) = tracked_id {
+                        in_flight_reader.lock().unwrap().insert(id.clone(), false);
+                    }
                     if tx.send(IncomingRpc::Request(req)).is_err() {
+                        if let Some(ref id) = tracked_id {
+                            in_flight_reader.lock().unwrap().remove(id);
+                        }
                         break;
                     }
                 }
@@ -166,20 +248,28 @@ pub fn run_mcp_server(workspace: Option<PathBuf>) -> Result<()> {
                 send_response(&mut stdout, &resp)?;
             }
             IncomingRpc::Request(req) => {
-                let req_id = req.id.clone();
-                if let Some(ref id) = req_id {
-                    if cancelled_ids.lock().unwrap().remove(id) {
+                let tracked_id = if req.method != "initialize" {
+                    req.id.clone()
+                } else {
+                    None
+                };
+                if let Some(ref id) = tracked_id {
+                    let mut map = in_flight.lock().unwrap();
+                    if map.get(id) == Some(&true) {
+                        map.remove(id);
                         continue;
                     }
                 }
 
-                if let Some(resp) = handle_request(req, &session, &mut cache) {
-                    if let Some(ref id) = req_id {
-                        if cancelled_ids.lock().unwrap().remove(id) {
-                            continue;
-                        }
+                let maybe_resp = handle_request(req, &session, &mut cache);
+                let was_cancelled = match tracked_id {
+                    Some(ref id) => in_flight.lock().unwrap().remove(id) == Some(true),
+                    None => false,
+                };
+                if !was_cancelled {
+                    if let Some(resp) = maybe_resp {
+                        send_response(&mut stdout, &resp)?;
                     }
-                    send_response(&mut stdout, &resp)?;
                 }
             }
         }
@@ -200,6 +290,17 @@ pub fn handle_request(
             return None;
         }
     };
+
+    if req.jsonrpc != "2.0" {
+        return Some(JsonRpcResponse::error(
+            req_id,
+            -32600,
+            format!(
+                "Invalid Request: expected jsonrpc '2.0', got '{}'",
+                req.jsonrpc
+            ),
+        ));
+    }
 
     match req.method.as_str() {
         "initialize" => {
@@ -257,16 +358,16 @@ pub fn handle_request(
             };
 
             match tools::call_tool(tool_name, arguments, session, cache) {
-                Ok(text) => Some(JsonRpcResponse::success(
+                Ok(outcome) => Some(JsonRpcResponse::success(
                     req_id,
                     json!({
                         "content": [
                             {
                                 "type": "text",
-                                "text": text
+                                "text": outcome.text
                             }
                         ],
-                        "isError": false
+                        "isError": outcome.is_error
                     }),
                 )),
                 Err(ToolError::InvalidParams(err_msg)) => {

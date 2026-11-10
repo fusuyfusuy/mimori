@@ -1,4 +1,7 @@
-use crate::memory::ledger::{MemoryLedger, MAX_DEBT_CEILING};
+use super::ledger::{
+    classify_memory_heading, confine_agents_path, update_code_fence, MemoryLedger, MemorySection,
+    MAX_DEBT_CEILING,
+};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -194,17 +197,26 @@ pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> 
     }
 
     let mut builder = WalkBuilder::new(&scan_root);
-    builder.hidden(false);
-    builder.git_ignore(true);
-    builder.git_global(true);
-    builder.git_exclude(true);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".mimoriignore");
+    if scan_root != root {
+        let root_ignore = root.join(".mimoriignore");
+        if root_ignore.is_file() {
+            let _ = builder.add_ignore(root_ignore);
+        }
+    }
 
     let mut files = Vec::new();
     for entry in builder.build().flatten() {
-        let path = entry.path();
-        if !path.is_file() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
+        let path = entry.path();
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
@@ -212,13 +224,10 @@ pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> 
         if rel_str.ends_with(".md") || rel_str.ends_with(".markdown") {
             continue;
         }
-        let is_ignored_dir = rel.components().any(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            matches!(
-                s.as_ref(),
-                ".git" | ".mimori" | "target" | "node_modules" | "dist" | "build" | ".agents"
-            )
-        });
+        let is_ignored_dir = crate::workspace::walker::is_ignored_rel(rel)
+            || rel
+                .components()
+                .any(|c| c.as_os_str() == std::ffi::OsStr::new(".agents"));
         if is_ignored_dir {
             continue;
         }
@@ -282,6 +291,34 @@ pub fn list_debt(root: &Path, scope: Option<&str>) -> (Vec<InCodeMarker>, String
     (markers, output)
 }
 
+fn strip_accepted_prefix(what: &str) -> &str {
+    let w = what.trim();
+    if w.len() >= 10 && w.as_bytes()[..10].eq_ignore_ascii_case(b"[accepted]") {
+        let rest = &w[10..];
+        return rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    }
+    if w.len() >= 8 && w.as_bytes()[..8].eq_ignore_ascii_case(b"accepted") {
+        let rest = &w[8..];
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            return after_colon.trim_start();
+        }
+        let trimmed = rest.trim_start();
+        if trimmed.len() < rest.len() {
+            return trimmed;
+        }
+    }
+    w
+}
+
+fn normalize_debt_key(what: &str, ceiling: &str, trigger: &str) -> String {
+    format!(
+        "{} <- {} -> {}",
+        strip_accepted_prefix(what),
+        ceiling.trim(),
+        trigger.trim()
+    )
+}
+
 pub fn check_debt(root: &Path) -> (bool, String) {
     if crate::workspace::walker::is_disallowed_workspace_root(root) {
         return (
@@ -294,10 +331,25 @@ pub fn check_debt(root: &Path) -> (bool, String) {
     }
     let markers = scan_debt_markers(root, None);
     let total_markers = markers.len();
-    let valid_count = markers.iter().filter(|m| m.valid_trigger).count();
+    let valid_markers: Vec<_> = markers.iter().filter(|m| m.valid_trigger).collect();
+    let valid_count = valid_markers.len();
+
+    let valid_keys: HashSet<String> = valid_markers
+        .iter()
+        .map(|m| normalize_debt_key(&m.what, &m.ceiling, &m.trigger))
+        .collect();
 
     let manual_count = if let Ok(ledger) = MemoryLedger::load(root) {
-        ledger.debt_items.iter().filter(|d| d.is_accepted).count()
+        let mut seen_manual = HashSet::new();
+        ledger
+            .debt_items
+            .iter()
+            .filter(|d| d.is_accepted)
+            .filter(|d| {
+                let key = normalize_debt_key(&d.what, &d.why, &d.trigger);
+                !valid_keys.contains(&key) && seen_manual.insert(key)
+            })
+            .count()
     } else {
         0
     };
@@ -353,19 +405,28 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
 
     let valid_markers: Vec<_> = markers.iter().filter(|m| m.valid_trigger).collect();
 
-    if !MemoryLedger::memory_path(root).exists() {
+    let mem_path = confine_agents_path(root, ".agents/memory.md")?;
+    if !mem_path.exists() {
         MemoryLedger::scaffold(root, false)?;
     }
 
     let ledger = MemoryLedger::load(root)?;
     let mut manual_items: Vec<String> = Vec::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
 
     for item in &ledger.debt_items {
-        if item.is_accepted {
-            manual_items.push(format!(
-                "- {} <- {} -> {}",
-                item.what, item.why, item.trigger
-            ));
+        if item.is_accepted
+            && !valid_markers
+                .iter()
+                .any(|m| m.what == item.what && m.ceiling == item.why && m.trigger == item.trigger)
+        {
+            let key = normalize_debt_key(&item.what, &item.why, &item.trigger);
+            if seen_keys.insert(key) {
+                manual_items.push(format!(
+                    "- {} <- {} -> {}",
+                    item.what, item.why, item.trigger
+                ));
+            }
         }
     }
 
@@ -375,9 +436,9 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
     }
 
     for m in &valid_markers {
-        let line = format!("- {} <- {} -> {}", m.what, m.ceiling, m.trigger);
-        if !combined_lines.contains(&line) {
-            combined_lines.push(line);
+        let key = normalize_debt_key(&m.what, &m.ceiling, &m.trigger);
+        if seen_keys.insert(key) {
+            combined_lines.push(format!("- {} <- {} -> {}", m.what, m.ceiling, m.trigger));
         }
     }
 
@@ -395,9 +456,8 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         .filter(|l| !combined_lines.contains(l))
         .collect();
 
-    let raw = fs::read_to_string(MemoryLedger::memory_path(root))?;
-    let updated_raw = replace_debt_section(&raw, &combined_lines);
-    MemoryLedger::atomic_write(&MemoryLedger::memory_path(root), &updated_raw)?;
+    let updated_raw = replace_debt_section(&ledger.raw_content, &combined_lines);
+    MemoryLedger::atomic_write(&mem_path, &updated_raw)?;
 
     let in_code_count = valid_markers.len();
     let manual_count = manual_items.len();
@@ -435,27 +495,33 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
 
     let mut in_debt_section = false;
     let mut debt_inserted = false;
+    let mut fence_ticks = 0usize;
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.starts_with("## ") {
-            let heading = trimmed.trim_start_matches('#').trim().to_lowercase();
-            if heading.contains("known debt") || heading.contains("debt") {
-                in_debt_section = true;
-                out.push(line.to_string());
-                out.push(
-                    "# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>"
-                        .to_string(),
-                );
-                out.push(String::new());
-                for debt in new_debt_lines {
-                    out.push(debt.clone());
+        let in_fence = update_code_fence(trimmed, &mut fence_ticks);
+
+        if !in_fence {
+            if let Some(section) = classify_memory_heading(trimmed) {
+                if section == MemorySection::Debt && !debt_inserted {
+                    in_debt_section = true;
+                    out.push(line.to_string());
+                    out.push(
+                        "# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>"
+                            .to_string(),
+                    );
+                    out.push(String::new());
+                    if !new_debt_lines.is_empty() {
+                        for debt in new_debt_lines {
+                            out.push(debt.clone());
+                        }
+                        out.push(String::new());
+                    }
+                    debt_inserted = true;
+                    continue;
+                } else {
+                    in_debt_section = false;
                 }
-                out.push(String::new());
-                debt_inserted = true;
-                continue;
-            } else {
-                in_debt_section = false;
             }
         }
 

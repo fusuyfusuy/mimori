@@ -1,26 +1,35 @@
 use crate::model::{Symbol, SymbolKind};
 use crate::workspace::AliasSet;
 use anyhow::Result;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
-pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
-    let mut parser = Parser::new();
-    let language = tree_sitter_rust::LANGUAGE.into();
-    parser.set_language(&language)?;
+thread_local! {
+    static RUST_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Error loading Rust grammar");
+        p
+    });
+}
 
-    let tree = parser
-        .parse(content, None)
+pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
+    let tree = RUST_PARSER
+        .with(|p| p.borrow_mut().parse(content, None))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse Rust source"))?;
 
     let mut symbols = Vec::new();
     let root = tree.root_node();
     walk_rust_node(root, content, file, None, &mut symbols, 0);
-    let mut import_aliases = std::collections::HashMap::new();
+    let mut import_aliases = HashMap::new();
     collect_local_use_aliases(root, content, &mut import_aliases, aliases, 0);
     super::apply_import_aliases(&mut symbols, &import_aliases);
-    let external_imports = collect_file_external_imports(root, content, aliases);
+    let external_imports: Arc<[String]> =
+        collect_file_external_imports(root, content, aliases).into();
     for s in &mut symbols {
-        s.external_imports = external_imports.clone();
+        s.external_imports = Arc::clone(&external_imports);
     }
 
     Ok(symbols)
@@ -55,30 +64,49 @@ fn walk_rust_node(
                     SymbolKind::Function
                 };
 
-                let symbol = create_symbol(node, content, file, full_name, sym_kind);
+                let symbol = create_symbol(node, content, file, full_name, sym_kind, parent_type);
                 symbols.push(symbol);
             }
         }
         "struct_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                let symbol =
-                    create_symbol(node, content, file, name.to_string(), SymbolKind::Struct);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    name.to_string(),
+                    SymbolKind::Struct,
+                    Some(name),
+                );
                 symbols.push(symbol);
             }
         }
         "enum_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                let symbol = create_symbol(node, content, file, name.to_string(), SymbolKind::Enum);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    name.to_string(),
+                    SymbolKind::Enum,
+                    Some(name),
+                );
                 symbols.push(symbol);
             }
         }
         "trait_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                let symbol =
-                    create_symbol(node, content, file, name.to_string(), SymbolKind::Trait);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    name.to_string(),
+                    SymbolKind::Trait,
+                    Some(name),
+                );
                 symbols.push(symbol);
 
                 // Recurse into trait items
@@ -90,9 +118,7 @@ fn walk_rust_node(
             }
         }
         "impl_item" => {
-            let type_name = node
-                .child_by_field_name("type")
-                .map(|t| node_text(t, content));
+            let type_name = extract_impl_type_name(node, content);
 
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
@@ -105,8 +131,14 @@ fn walk_rust_node(
         "type_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                let symbol =
-                    create_symbol(node, content, file, name.to_string(), SymbolKind::TypeAlias);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    name.to_string(),
+                    SymbolKind::TypeAlias,
+                    parent_type,
+                );
                 symbols.push(symbol);
             }
         }
@@ -117,38 +149,112 @@ fn walk_rust_node(
                     Some(pt) => format!("{}::{}", pt, name),
                     None => name.to_string(),
                 };
-                let symbol = create_symbol(node, content, file, full_name, SymbolKind::Constant);
+                let symbol = create_symbol(
+                    node,
+                    content,
+                    file,
+                    full_name,
+                    SymbolKind::Constant,
+                    parent_type,
+                );
                 symbols.push(symbol);
             }
         }
         _ => {}
     }
 
+    let next_parent = if kind == "function_item" {
+        None
+    } else {
+        parent_type
+    };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_rust_node(child, content, file, parent_type, symbols, depth + 1);
+        walk_rust_node(child, content, file, next_parent, symbols, depth + 1);
     }
 }
 
-fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: SymbolKind) -> Symbol {
+fn extract_impl_type_name<'a>(impl_node: Node, content: &'a str) -> Option<&'a str> {
+    let mut cur = impl_node.child_by_field_name("type")?;
+    for _ in 0..16 {
+        match cur.kind() {
+            "generic_type" | "reference_type" => {
+                cur = cur.child_by_field_name("type")?;
+            }
+            "pointer_type" => {
+                cur = cur.child_by_field_name("type").or_else(|| {
+                    (0..cur.named_child_count())
+                        .rev()
+                        .find_map(|i| cur.named_child(i))
+                })?;
+            }
+            "scoped_type_identifier" => {
+                cur = cur.child_by_field_name("name")?;
+            }
+            _ => break,
+        }
+    }
+    let name = node_text(cur, content).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+#[derive(Default)]
+struct RefCollector {
+    calls: Vec<String>,
+    mentions: Vec<String>,
+    mention_set: HashSet<String>,
+    counts: HashMap<String, u32>,
+    member_calls: Vec<String>,
+    bare_calls: HashSet<String>,
+}
+
+impl RefCollector {
+    fn push_call(&mut self, name: &str, is_member: bool) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(c) = self.counts.get_mut(name) {
+            *c += 1;
+        } else {
+            let owned = name.to_string();
+            self.counts.insert(owned.clone(), 1);
+            self.calls.push(owned);
+        }
+        if is_member {
+            if !self.bare_calls.contains(name) && !self.member_calls.iter().any(|c| c == name) {
+                self.member_calls.push(name.to_string());
+            }
+        } else if self.bare_calls.insert(name.to_string()) {
+            self.member_calls.retain(|c| c != name);
+        }
+    }
+
+    fn push_mention(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() && !self.mention_set.contains(name) {
+            let owned = name.to_string();
+            self.mention_set.insert(owned.clone());
+            self.mentions.push(owned);
+        }
+    }
+}
+
+fn create_symbol(
+    node: Node,
+    content: &str,
+    file: &str,
+    name: String,
+    kind: SymbolKind,
+    enclosing_type: Option<&str>,
+) -> Symbol {
     let start_pos = node.start_position();
     let end_pos = node.end_position();
-    let body = node_text(node, content).to_string();
-    let signature = extract_signature(node, content, &body, &kind);
+    let raw_body = node_text(node, content);
+    let signature = extract_signature(node, content, raw_body, &kind);
 
-    let mut calls = Vec::new();
-    let mut mentions = Vec::new();
-    let mut call_counts = std::collections::HashMap::new();
-    let mut member_calls = Vec::new();
-    collect_references(
-        node,
-        content,
-        &mut calls,
-        &mut mentions,
-        &mut call_counts,
-        &mut member_calls,
-        0,
-    );
+    let mut refs = RefCollector::default();
+    collect_references(node, content, enclosing_type, &mut refs, 0);
 
     Symbol {
         name,
@@ -157,101 +263,181 @@ fn create_symbol(node: Node, content: &str, file: &str, name: String, kind: Symb
         start_line: start_pos.row + 1,
         end_line: end_pos.row + 1,
         signature,
-        body,
+        body: String::new(),
         centrality: 0.0,
-        calls,
-        mentions,
-        call_counts,
-        member_calls,
-        external_imports: Vec::new(),
+        calls: refs.calls,
+        mentions: refs.mentions,
+        call_counts: refs.counts,
+        member_calls: refs.member_calls,
+        external_imports: crate::model::symbol::empty_external_imports(),
     }
 }
 
 fn collect_references(
     node: Node,
     content: &str,
-    calls: &mut Vec<String>,
-    mentions: &mut Vec<String>,
-    counts: &mut std::collections::HashMap<String, u32>,
-    member_calls: &mut Vec<String>,
+    enclosing_type: Option<&str>,
+    refs: &mut RefCollector,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
         return;
-    }
-    fn push_call(
-        calls: &mut Vec<String>,
-        counts: &mut std::collections::HashMap<String, u32>,
-        member_calls: &mut Vec<String>,
-        name: &str,
-        is_member: bool,
-    ) {
-        let name = name.trim();
-        if name.is_empty() {
-            return;
-        }
-        *counts.entry(name.to_string()).or_insert(0) += 1;
-        if !calls.iter().any(|c| c == name) {
-            calls.push(name.to_string());
-        }
-        if is_member && !member_calls.iter().any(|c| c == name) {
-            member_calls.push(name.to_string());
-        }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let kind = child.kind();
         if matches!(
             kind,
-            "function_item" | "struct_item" | "enum_item" | "trait_item" | "impl_item"
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "impl_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "mod_item"
         ) {
             continue;
         }
         if kind == "call_expression" {
-            if let Some(func_node) = child.child_by_field_name("function") {
-                let text = node_text(func_node, content);
-                // A `field_expression` function (`self.save`, `x.build()`)
-                // is a member call: file-local only. Bare paths may
-                // resolve workspace-wide.
-                let is_member = func_node.kind() == "field_expression";
-                let func_name = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
-                push_call(calls, counts, member_calls, func_name, is_member);
+            extract_rust_call(child, content, enclosing_type, refs);
+        } else if kind == "type_identifier" {
+            refs.push_mention(node_text(child, content));
+        } else if let Some((name, is_member)) = macro_token_call(child, content) {
+            refs.push_call(name, is_member);
+        }
+        collect_references(child, content, enclosing_type, refs, depth + 1);
+    }
+}
 
-                // Preserve qualified calls (e.g. S::method) for exact resolution.
-                if let Some(sep) = text.rfind("::") {
-                    let ty = text[..sep].rsplit("::").next().unwrap_or("").trim();
-                    if !ty.is_empty() && ty != "self" && ty != "Self" {
-                        if func_name == "new" || func_name == "default" {
-                            push_call(calls, counts, member_calls, ty, false);
-                        }
-                        push_call(
-                            calls,
-                            counts,
-                            member_calls,
-                            &format!("{}::{}", ty, func_name),
-                            false,
-                        );
-                    }
+fn extract_rust_call(
+    call_node: Node,
+    content: &str,
+    enclosing_type: Option<&str>,
+    refs: &mut RefCollector,
+) {
+    let Some(mut func_node) = call_node.child_by_field_name("function") else {
+        return;
+    };
+    while func_node.kind() == "generic_function" {
+        let Some(inner) = func_node.child_by_field_name("function") else {
+            break;
+        };
+        func_node = inner;
+    }
+    match func_node.kind() {
+        "identifier" => {
+            refs.push_call(node_text(func_node, content), false);
+        }
+        "field_expression" => {
+            let Some(field_node) = func_node.child_by_field_name("field") else {
+                return;
+            };
+            let func_name = node_text(field_node, content).trim();
+            refs.push_call(func_name, true);
+            if let (Some(val_node), Some(ty)) =
+                (func_node.child_by_field_name("value"), enclosing_type)
+            {
+                if node_text(val_node, content).trim() == "self" && !func_name.is_empty() {
+                    refs.push_call(&format!("{ty}::{func_name}"), false);
                 }
             }
-        } else if child.kind() == "type_identifier" {
-            let tname = node_text(child, content).trim();
-            if !tname.is_empty() && !mentions.iter().any(|m| m == tname) {
-                mentions.push(tname.to_string());
-            }
-        } else if let Some((name, is_member)) = macro_token_call(child, content) {
-            push_call(calls, counts, member_calls, name, is_member);
         }
-        collect_references(
-            child,
-            content,
-            calls,
-            mentions,
-            counts,
-            member_calls,
-            depth + 1,
-        );
+        "scoped_identifier" => {
+            let Some(name_node) = func_node.child_by_field_name("name") else {
+                return;
+            };
+            let func_name = node_text(name_node, content).trim();
+            if func_name.is_empty() {
+                return;
+            }
+            let ty = func_node
+                .child_by_field_name("path")
+                .and_then(|p| extract_scoped_type(p, content, enclosing_type));
+            if let Some(ty) = ty {
+                if func_name == "new" || func_name == "default" {
+                    refs.push_call(ty, false);
+                }
+                refs.push_call(&format!("{ty}::{func_name}"), false);
+            } else {
+                refs.push_call(func_name, false);
+            }
+        }
+        _ => {}
     }
+}
+
+fn extract_scoped_type<'a>(
+    mut path_node: Node,
+    content: &'a str,
+    enclosing_type: Option<&'a str>,
+) -> Option<&'a str> {
+    let mut root_node = path_node;
+    while matches!(
+        root_node.kind(),
+        "scoped_identifier" | "scoped_type_identifier" | "generic_type"
+    ) {
+        let next = root_node
+            .child_by_field_name("path")
+            .or_else(|| root_node.child_by_field_name("type"));
+        let Some(n) = next else { break };
+        root_node = n;
+    }
+    let root_seg = node_text(root_node, content).trim();
+
+    for _ in 0..8 {
+        match path_node.kind() {
+            "generic_type" | "qualified_type" => {
+                path_node = path_node.child_by_field_name("type")?;
+            }
+            "bracketed_type" => {
+                path_node = path_node.named_child(0)?;
+            }
+            _ => break,
+        }
+    }
+    let seg_node = match path_node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => path_node.child_by_field_name("name")?,
+        _ => path_node,
+    };
+    let seg = node_text(seg_node, content).trim();
+    if seg.is_empty() {
+        return None;
+    }
+    if seg == "Self" {
+        return Some(enclosing_type.unwrap_or("Self"));
+    }
+    if seg.starts_with(|c: char| c.is_ascii_uppercase()) || is_rust_primitive_type(seg) {
+        return Some(seg);
+    }
+    if matches!(root_seg, "std" | "core" | "alloc") {
+        return Some(seg);
+    }
+    None
+}
+
+fn is_rust_primitive_type(s: &str) -> bool {
+    matches!(
+        s,
+        "bool"
+            | "char"
+            | "str"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
 }
 
 /// Macro arguments (`format!("{}", self.f())`) parse as flat token trees, not
@@ -299,14 +485,31 @@ fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
     &content[node.start_byte()..node.end_byte()]
 }
 
+#[derive(Default)]
+struct ImportSet {
+    items: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl ImportSet {
+    fn push(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() && name != "*" && !self.seen.contains(name) {
+            let owned = name.to_string();
+            self.seen.insert(owned.clone());
+            self.items.push(owned);
+        }
+    }
+}
+
 /// Local names bound by `use` to anything outside the current crate's
 /// namespace (`crate::`, `self::`, `super::` stay local). `std::` and third-
 /// party crates can never be workspace symbols, so calls matching these
 /// names are external, never resolved locally.
 fn collect_file_external_imports(root: Node, content: &str, aliases: &AliasSet) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = ImportSet::default();
     collect_uses(root, content, &mut out, aliases, 0);
-    out
+    out.items
 }
 
 fn collect_local_use_aliases(
@@ -393,13 +596,7 @@ fn collect_use_tree_aliases(
     }
 }
 
-fn collect_uses(
-    node: Node,
-    content: &str,
-    out: &mut Vec<String>,
-    aliases: &AliasSet,
-    depth: usize,
-) {
+fn collect_uses(node: Node, content: &str, out: &mut ImportSet, aliases: &AliasSet, depth: usize) {
     if depth >= MAX_AST_DEPTH {
         return;
     }
@@ -463,7 +660,7 @@ fn split_top_level_comma(s: &str) -> Vec<&str> {
 /// Last-segment binding of each imported path; `{a, b as c}` enumerates.
 /// Glob (`*`) binds nothing enumerable — its names stay resolvable, a
 /// documented recall-over-precision choice for globs.
-fn collect_use_tree_names(tree: &str, out: &mut Vec<String>) {
+fn collect_use_tree_names(tree: &str, out: &mut ImportSet) {
     let tree = tree.trim();
     if let Some((_head, rest)) = tree.split_once('{') {
         let rest = rest.trim_end_matches('}');
@@ -473,12 +670,12 @@ fn collect_use_tree_names(tree: &str, out: &mut Vec<String>) {
                 continue;
             }
             if let Some((_, alias)) = part.split_once(" as ") {
-                push_import(out, alias.trim());
+                out.push(alias.trim());
             } else if part.contains('{') {
                 collect_use_tree_names(part, out);
             } else {
                 let last = part.rsplit("::").next().unwrap_or(part).trim();
-                push_import(out, last);
+                out.push(last);
             }
         }
         return;
@@ -487,17 +684,10 @@ fn collect_use_tree_names(tree: &str, out: &mut Vec<String>) {
         return;
     }
     if let Some((_path, alias)) = tree.split_once(" as ") {
-        push_import(out, alias.trim());
+        out.push(alias.trim());
     } else {
         let last = tree.rsplit("::").next().unwrap_or(tree).trim();
-        push_import(out, last);
-    }
-}
-
-fn push_import(out: &mut Vec<String>, name: &str) {
-    let name = name.trim();
-    if !name.is_empty() && name != "*" && !out.contains(&name.to_string()) {
-        out.push(name.to_string());
+        out.push(last);
     }
 }
 

@@ -124,6 +124,11 @@ impl DoctorResult {
 pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
     let files: HashSet<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
     let edges: usize = graph.callees_map.values().map(|v| v.len()).sum();
+    let mentioned_names: HashSet<&str> = graph
+        .mention_to_indices
+        .keys()
+        .map(String::as_str)
+        .collect();
 
     let mut isolated = 0usize;
     let mut likely_dead = Vec::new();
@@ -134,16 +139,20 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         if !has_callers && !has_callees {
             isolated += 1;
         }
-        // Dead-weight = isolated, not a `main` program entry, not a test,
-        // and not a framework-dispatched entry (P1-3): tRPC router
-        // procedures, Next.js page/route/layout/middleware/server
-        // conventions, and index-barrel re-exports are reachable without a
-        // tracked call edge, so flagging them trains users to ignore the list.
-        // Note: deliberately NOT using `is_entry_point` here — that treats
-        // every uncalled symbol as an entry, which would exclude exactly the
-        // isolated symbols we want to flag.
+        let is_mentioned = mentioned_names.contains(sym.name.as_str())
+            || sym
+                .name
+                .rsplit([':', '.'])
+                .next()
+                .is_some_and(|leaf| mentioned_names.contains(leaf));
+
+        // Dead-weight = isolated, unmentioned, not a `main` program entry, not a
+        // test, and not a framework-dispatched entry (P1-3): tRPC router
+        // procedures, Next.js page/route/layout/middleware/server conventions,
+        // and index-barrel re-exports are reachable without a tracked call edge.
         if !has_callers
             && !has_callees
+            && !is_mentioned
             && !is_program_entry(sym)
             && !is_test_symbol(sym)
             && !is_framework_entry(sym)
@@ -155,10 +164,11 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
                 coordinate: sym.coordinate(),
                 centrality: sym.centrality,
             };
-            // Free functions/methods are the strongest delete candidates;
-            // types, traits and constants are often exported API surface.
+            // Free functions are the strongest delete candidates; methods (whose
+            // cross-file receiver calls are dropped by design), types, traits
+            // and constants require human review.
             match sym.kind {
-                SymbolKind::Function | SymbolKind::Method => likely_dead.push(dead),
+                SymbolKind::Function => likely_dead.push(dead),
                 _ => needs_review.push(dead),
             }
         }
@@ -170,13 +180,8 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
     /// through an index barrel.
     pub(crate) fn is_framework_entry(sym: &crate::model::Symbol) -> bool {
         let file = sym.file.replace('\\', "/");
-        let stem = file
-            .rsplit('/')
-            .next()
-            .unwrap_or(&file)
-            .rsplit('.')
-            .nth(1)
-            .unwrap_or("");
+        let filename = file.rsplit('/').next().unwrap_or(&file);
+        let stem = filename.split('.').next().unwrap_or("");
         if matches!(
             stem,
             "page" | "route" | "layout" | "loading" | "error" | "middleware" | "server"
@@ -207,13 +212,14 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
 
     let mut by_centrality = |a: &DeadSymbol, b: &DeadSymbol| {
         a.centrality
-            .partial_cmp(&b.centrality)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&b.centrality)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.coordinate.cmp(&b.coordinate))
     };
     likely_dead.sort_by(&mut by_centrality);
     needs_review.sort_by(&mut by_centrality);
     // `--limit` applies per tier (documented in `--help`). Without one, cap
-    // the "likely" tier at 50: an unbounded list trains users to ignore it.
+    // both tiers at 50: an unbounded list trains users to ignore it.
     match limit {
         Some(n) => {
             likely_dead.truncate(n);
@@ -221,6 +227,7 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         }
         None => {
             likely_dead.truncate(50);
+            needs_review.truncate(50);
         }
     }
 
@@ -244,11 +251,10 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         })
         .collect();
     hubs.sort_by(|a, b| {
-        b.fan_in.cmp(&a.fan_in).then_with(|| {
-            b.centrality
-                .partial_cmp(&a.centrality)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        b.fan_in
+            .cmp(&a.fan_in)
+            .then_with(|| b.centrality.total_cmp(&a.centrality))
+            .then_with(|| a.coordinate.cmp(&b.coordinate))
     });
     hubs.truncate(5);
 
@@ -293,7 +299,7 @@ mod tests {
             mentions: vec![],
             call_counts: counts,
             member_calls: vec![],
-            external_imports: vec![],
+            external_imports: crate::model::symbol::empty_external_imports(),
         }
     }
 

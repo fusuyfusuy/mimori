@@ -219,7 +219,10 @@ pub struct MissingArgs {
 
 #[derive(Args, Debug)]
 pub struct CleanArgs {
-    #[arg(long, help = "Purge all caches and memory")]
+    #[arg(
+        long,
+        help = "Purge all .mimori/ cache files (index.db, WAL/SHM, and auxiliary cache; preserves .agents/)"
+    )]
     pub all: bool,
 }
 
@@ -283,7 +286,7 @@ pub struct MemoryShowArgs {
 
 #[derive(Args, Debug)]
 pub struct MemoryResolveArgs {
-    #[arg(help = "Substring or regex pattern matching debt line to resolve and delete")]
+    #[arg(help = "Case-insensitive substring matching debt item to delete")]
     pub pattern: String,
 }
 

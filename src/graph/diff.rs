@@ -1,7 +1,6 @@
-use crate::graph::blast::{calculate_blast_radius, BlastNode};
+use crate::graph::blast::{traverse_multi_upstream, BlastNode};
 use crate::graph::SymbolGraph;
 use crate::memory::{check_debt, MemoryLedger};
-use crate::model::Coordinate;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -114,6 +113,18 @@ impl DiffBlastReport {
     }
 }
 
+pub fn validate_diff_base(base: Option<&str>) -> Result<()> {
+    if let Some(b) = base {
+        if b.trim().is_empty() || b.starts_with('-') || b.chars().any(|c| c.is_control()) {
+            bail!(
+                "Invalid diff base revision '{}': must not be empty, start with '-', or contain control characters",
+                b
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn calculate_diff_blast(
     root: &Path,
     graph: &SymbolGraph,
@@ -121,16 +132,25 @@ pub fn calculate_diff_blast(
     base: Option<&str>,
     depth: usize,
 ) -> Result<DiffBlastReport> {
+    validate_diff_base(base)?;
+
     let mut cmd = Command::new("git");
-    cmd.current_dir(root)
-        .stdin(Stdio::null())
-        .args(["diff", "--no-color", "--no-ext-diff", "-U0"]);
+    cmd.current_dir(root).stdin(Stdio::null()).args([
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--relative",
+        "--no-color",
+        "--no-ext-diff",
+        "-U0",
+    ]);
     if staged {
         cmd.arg("--staged");
     }
     if let Some(b) = base {
         cmd.arg(b);
     }
+    cmd.arg("--");
 
     let output = cmd.output().context("Failed to execute 'git diff'")?;
     if !output.status.success() {
@@ -139,34 +159,46 @@ pub fn calculate_diff_blast(
     }
 
     let diff_text = String::from_utf8_lossy(&output.stdout);
-    let hunks = parse_unified_diff(&diff_text);
+    let hunks = parse_unified_diff_detailed(&diff_text);
 
     let mut touched_files = Vec::new();
-    let mut seen_files = HashSet::new();
-    for (file, _, _) in &hunks {
-        if seen_files.insert(file.clone()) {
-            touched_files.push(file.clone());
+    let mut seen_files: HashSet<String> = HashSet::new();
+    for h in &hunks {
+        if seen_files.insert(h.file.clone()) {
+            touched_files.push(h.file.clone());
+        }
+    }
+
+    let mut syms_by_file: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, sym) in graph.symbols.iter().enumerate() {
+        if seen_files.contains(sym.file.as_str()) {
+            syms_by_file.entry(sym.file.as_str()).or_default().push(idx);
         }
     }
 
     let mut mutated_indices = Vec::new();
     let mut seen_mutated = HashSet::new();
-    for (file, h_start, h_end) in &hunks {
-        for (idx, sym) in graph.symbols.iter().enumerate() {
-            if &sym.file == file
-                && sym.start_line <= *h_end
-                && sym.end_line >= *h_start
-                && seen_mutated.insert(idx)
-            {
+    for h in &hunks {
+        let Some(file_syms) = syms_by_file.get(h.file.as_str()) else {
+            continue;
+        };
+        for &idx in file_syms {
+            let sym = &graph.symbols[idx];
+            let overlaps = if h.is_deletion {
+                // Pure deletion (`+anchor,0`): lines were removed immediately
+                // after `h.anchor_start` in the new file. Deleting lines *after*
+                // `sym.end_line` (e.g. a sibling function below `sym`) does not
+                // mutate `sym`.
+                h.start > 0 && sym.start_line <= h.start && h.start < sym.end_line
+            } else {
+                sym.start_line <= h.end && sym.end_line >= h.start
+            };
+            if overlaps && seen_mutated.insert(idx) {
                 mutated_indices.push(idx);
             }
         }
     }
-
-    let mutated_coords: HashSet<String> = mutated_indices
-        .iter()
-        .map(|&i| graph.symbols[i].coordinate())
-        .collect();
+    mutated_indices.sort_unstable();
 
     let mutated_symbols: Vec<MutatedSymbol> = mutated_indices
         .iter()
@@ -183,70 +215,18 @@ pub fn calculate_diff_blast(
         })
         .collect();
 
-    let mut best_affected: HashMap<String, BlastNode> = HashMap::new();
-    let mut entry_points = Vec::new();
-    let mut test_suites = Vec::new();
-    let mut literal_test_mentions = Vec::new();
-
-    for m in &mutated_symbols {
-        let Ok(coord) = Coordinate::parse(&m.coordinate) else {
-            continue;
-        };
-        let Ok(blast) = calculate_blast_radius(graph, &coord, depth) else {
-            continue;
-        };
-        for ep in blast.entry_points {
-            if !entry_points.contains(&ep) {
-                entry_points.push(ep);
-            }
-        }
-        for ts in blast.test_suites {
-            if !test_suites.contains(&ts) {
-                test_suites.push(ts);
-            }
-        }
-        for lit in blast.literal_test_mentions {
-            if !literal_test_mentions.contains(&lit) {
-                literal_test_mentions.push(lit);
-            }
-        }
-        for node in blast.affected {
-            if mutated_coords.contains(&node.coordinate) {
-                continue;
-            }
-            match best_affected.get_mut(&node.coordinate) {
-                Some(existing) => {
-                    if node.depth < existing.depth {
-                        existing.depth = node.depth;
-                    }
-                    for l in node.call_lines {
-                        if !existing.call_lines.contains(&l) {
-                            existing.call_lines.push(l);
-                        }
-                    }
-                }
-                None => {
-                    best_affected.insert(node.coordinate.clone(), node);
-                }
-            }
-        }
-    }
-
-    let mut affected: Vec<BlastNode> = best_affected.into_values().collect();
-    affected.sort_by(|a, b| {
-        a.depth
-            .cmp(&b.depth)
-            .then_with(|| a.coordinate.cmp(&b.coordinate))
-    });
+    let (affected, entry_points, test_suites, literal_test_mentions) =
+        traverse_multi_upstream(graph, &mutated_indices, depth);
 
     let (_debt_ok, debt_status) = check_debt(root);
-    let memory_status = if MemoryLedger::memory_path(root).exists() {
-        match MemoryLedger::load(root) {
+    let memory_status = match crate::memory::ledger::confine_agents_path(root, ".agents/memory.md")
+    {
+        Ok(p) if p.exists() => match MemoryLedger::load(root) {
             Ok(ledger) => ledger.lint().to_m2m_output(),
             Err(e) => format!("MEM_ERR: {}", e),
-        }
-    } else {
-        "MEM_SKIP: no .agents/memory.md present.".to_string()
+        },
+        Ok(_) => "MEM_SKIP: no .agents/memory.md present.".to_string(),
+        Err(e) => format!("MEM_ERR: {}", e),
     };
 
     Ok(DiffBlastReport {
@@ -261,13 +241,29 @@ pub fn calculate_diff_blast(
     })
 }
 
-pub fn parse_unified_diff(diff_text: &str) -> Vec<(String, usize, usize)> {
+struct DiffHunk {
+    file: String,
+    start: usize,
+    end: usize,
+    is_deletion: bool,
+}
+
+fn unquote_diff_path(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+fn parse_unified_diff_detailed(diff_text: &str) -> Vec<DiffHunk> {
     let mut hunks = Vec::new();
     let mut current_file: Option<String> = None;
 
     for line in diff_text.lines() {
         if let Some(rest) = line.strip_prefix("+++ ") {
-            let trimmed = rest.trim();
+            let trimmed = unquote_diff_path(rest);
             if trimmed == "/dev/null" {
                 current_file = None;
             } else if let Some(rel) = trimmed.strip_prefix("b/") {
@@ -276,15 +272,29 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<(String, usize, usize)> {
                 current_file = Some(trimmed.to_string());
             }
         } else if line.starts_with("@@ ") {
-            if let (Some(file), Some((start, end))) = (&current_file, parse_hunk_header(line)) {
-                hunks.push((file.clone(), start, end));
+            if let (Some(file), Some((start, end, is_deletion))) =
+                (&current_file, parse_hunk_header_detailed(line))
+            {
+                hunks.push(DiffHunk {
+                    file: file.clone(),
+                    start,
+                    end,
+                    is_deletion,
+                });
             }
         }
     }
     hunks
 }
 
-pub fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+pub fn parse_unified_diff(diff_text: &str) -> Vec<(String, usize, usize)> {
+    parse_unified_diff_detailed(diff_text)
+        .into_iter()
+        .map(|h| (h.file, h.start.max(1), h.end.max(1)))
+        .collect()
+}
+
+fn parse_hunk_header_detailed(line: &str) -> Option<(usize, usize, bool)> {
     let body = line.strip_prefix("@@ ")?;
     let (ranges, _) = body.split_once(" @@")?;
     let plus_part = ranges
@@ -300,11 +310,20 @@ pub fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
         None => 1,
     };
     if count == 0 {
+        Some((start, start, true))
+    } else {
+        let s = start.max(1);
+        Some((s, s + count - 1, false))
+    }
+}
+
+pub fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    let (start, end, is_deletion) = parse_hunk_header_detailed(line)?;
+    if is_deletion {
         let anchor = start.max(1);
         Some((anchor, anchor))
     } else {
-        let s = start.max(1);
-        Some((s, s + count - 1))
+        Some((start, end))
     }
 }
 

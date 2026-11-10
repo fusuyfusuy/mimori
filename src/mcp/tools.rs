@@ -2,7 +2,7 @@ use crate::graph::blast::{
     calculate_blast_radius, calculate_downstream_blast, format_sink_hits, parse_sink_list,
     sweep_literal_sinks,
 };
-use crate::graph::map::{generate_map, personalize_map};
+use crate::graph::map::{compute_personalized_scores, generate_map_with_scores};
 use crate::graph::{
     format_downstream, format_upstream, format_uses, slice_line_coordinate, zero_caller_hint,
     SymbolGraph,
@@ -11,11 +11,23 @@ use crate::mcp::protocol::ToolError;
 use crate::model::Coordinate;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+pub struct ToolOutcome {
+    pub text: String,
+    pub is_error: bool,
+}
+
+impl ToolOutcome {
+    pub fn ok(text: String) -> Self {
+        Self {
+            text,
+            is_error: false,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct McpSession {
@@ -70,8 +82,11 @@ pub fn confine(session_root: &Path, candidate: &Path) -> Result<PathBuf, ToolErr
     }
 }
 
+const MAX_CACHED_WORKSPACES: usize = 8;
+
 pub struct McpCache {
     graphs: HashMap<PathBuf, (String, Arc<SymbolGraph>)>,
+    order: VecDeque<PathBuf>,
 }
 
 impl Default for McpCache {
@@ -84,41 +99,40 @@ impl McpCache {
     pub fn new() -> Self {
         Self {
             graphs: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
     pub fn get_graph(&mut self, root: &Path) -> anyhow::Result<Arc<SymbolGraph>> {
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let current_fingerprint = compute_fingerprint(&canonical_root);
+        let prep = crate::storage::prepare_workspace(&canonical_root)?;
 
         if let Some((fp, graph)) = self.graphs.get(&canonical_root) {
-            if *fp == current_fingerprint {
+            if *fp == prep.content_fingerprint {
                 return Ok(Arc::clone(graph));
             }
         }
 
-        let graph = crate::storage::get_or_sync_graph(&canonical_root)?;
+        let graph = crate::storage::sync_prepared_workspace(&canonical_root, &prep)?;
         let arc_graph = Arc::new(graph);
+
+        if !self.graphs.contains_key(&canonical_root) {
+            while self.graphs.len() >= MAX_CACHED_WORKSPACES {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.graphs.remove(&evicted);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(canonical_root.clone());
+        }
+
         self.graphs.insert(
             canonical_root,
-            (current_fingerprint, Arc::clone(&arc_graph)),
+            (prep.content_fingerprint, Arc::clone(&arc_graph)),
         );
         Ok(arc_graph)
     }
-}
-
-fn compute_fingerprint(root: &Path) -> String {
-    let aliases = crate::workspace::AliasSet::collect(root);
-    let (file_stats, _) = crate::workspace::walker::discover_workspace_file_stats(root);
-
-    let mut hasher = DefaultHasher::new();
-    aliases.fingerprint().hash(&mut hasher);
-    for (rel, mtime, size) in file_stats {
-        rel.hash(&mut hasher);
-        mtime.hash(&mut hasher);
-        size.hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
 }
 
 pub fn list_tools() -> Vec<serde_json::Value> {
@@ -574,7 +588,7 @@ pub fn call_tool(
     arguments: &serde_json::Value,
     session: &McpSession,
     cache: &mut McpCache,
-) -> Result<String, ToolError> {
+) -> Result<ToolOutcome, ToolError> {
     match name {
         "mimori_slice" => {
             let args: SliceToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
@@ -625,7 +639,7 @@ pub fn call_tool(
                     rendered.push(slice.render_markdown(numbered));
                 }
             }
-            Ok(rendered.join("\n---\n"))
+            Ok(ToolOutcome::ok(rendered.join("\n---\n")))
         }
         "mimori_map" => {
             let args: MapToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
@@ -635,28 +649,40 @@ pub fn call_tool(
             let base_graph = cache
                 .get_graph(&scope_dir)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
-            let mut graph = (*base_graph).clone();
 
-            personalize_map(
-                &mut graph,
+            let personalized = compute_personalized_scores(
+                &base_graph,
                 args.focus.as_deref(),
                 args.seed.as_deref(),
                 &scope_dir,
             )
             .map_err(|e| ToolError::Execution(e.to_string()))?;
+            let scores_ref = personalized
+                .as_ref()
+                .map(|(scores, stats)| (scores.as_slice(), stats));
 
             let scope = args.scope.as_deref();
-            let map_result = generate_map(&graph, scope, args.focus.as_deref(), args.limit);
-            Ok(map_result.to_markdown())
+            let map_result = generate_map_with_scores(
+                &base_graph,
+                scores_ref,
+                scope,
+                args.focus.as_deref(),
+                args.limit,
+            );
+            Ok(ToolOutcome::ok(map_result.to_markdown()))
         }
         "mimori_find" => {
             let args: FindToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_find': {}", e))
             })?;
             let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+            let graph = cache
+                .get_graph(&scope_dir)
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
             let limit = args.limit.or(Some(50));
-            let res = crate::workspace::execute_find(
+            let res = crate::workspace::execute_find_with_graph(
                 &scope_dir,
+                &graph,
                 &args.pattern,
                 args.symbols_only.unwrap_or(false),
                 args.files_only.unwrap_or(false),
@@ -664,12 +690,14 @@ pub fn call_tool(
                 limit,
             )
             .map_err(|e| ToolError::Execution(e.to_string()))?;
-            Ok(res.to_markdown())
+            Ok(ToolOutcome::ok(res.to_markdown()))
         }
         "mimori_diff" => {
             let args: DiffToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
                 ToolError::InvalidParams(format!("Invalid arguments for 'mimori_diff': {}", e))
             })?;
+            crate::graph::diff::validate_diff_base(args.base.as_deref())
+                .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
             let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let graph = cache
                 .get_graph(&scope_dir)
@@ -682,7 +710,7 @@ pub fn call_tool(
                 args.depth.unwrap_or(3),
             )
             .map_err(|e| ToolError::Execution(e.to_string()))?;
-            Ok(report.to_markdown())
+            Ok(ToolOutcome::ok(report.to_markdown()))
         }
         "mimori_blast" => {
             let args: BlastToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
@@ -733,7 +761,7 @@ pub fn call_tool(
                 blocks.push(md);
             }
 
-            Ok(blocks.join("\n---\n"))
+            Ok(ToolOutcome::ok(blocks.join("\n---\n")))
         }
         "mimori_graph" => {
             let args: GraphToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
@@ -772,7 +800,7 @@ pub fn call_tool(
                 };
                 blocks.push(block);
             }
-            Ok(blocks.join("\n---\n"))
+            Ok(ToolOutcome::ok(blocks.join("\n---\n")))
         }
         "mimori_memory" => {
             let args: MemoryToolArgs = serde_json::from_value(arguments.clone()).map_err(|e| {
@@ -793,25 +821,31 @@ pub fn call_tool(
                         ledger.raw_content
                     };
                     if let Some(b) = args.budget {
-                        let max_chars = b * 4;
-                        if text.len() > max_chars {
+                        let max_chars = b.saturating_mul(4);
+                        if text.chars().count() > max_chars {
                             let mut truncated = String::new();
+                            let mut used = 0usize;
                             for line in text.lines() {
-                                if truncated.len() + line.len() + 1 > max_chars {
+                                let line_chars = line.chars().count() + 1;
+                                if used.saturating_add(line_chars) > max_chars {
                                     truncated.push_str("… [truncated to fit token budget]\n");
                                     break;
                                 }
                                 truncated.push_str(line);
                                 truncated.push('\n');
+                                used = used.saturating_add(line_chars);
                             }
-                            return Ok(truncated);
+                            return Ok(ToolOutcome::ok(truncated));
                         }
                     }
-                    Ok(text)
+                    Ok(ToolOutcome::ok(text))
                 }
                 "lint" => {
                     let report = ledger.lint();
-                    Ok(report.to_m2m_output())
+                    Ok(ToolOutcome {
+                        text: report.to_m2m_output(),
+                        is_error: !report.passed,
+                    })
                 }
                 "resolve" => {
                     let target = args.target.ok_or_else(|| {
@@ -822,12 +856,12 @@ pub fn call_tool(
                     let deleted = ledger
                         .resolve(&target)
                         .map_err(|e| ToolError::Execution(format!("Resolve: {}", e)))?;
-                    Ok(format!(
+                    Ok(ToolOutcome::ok(format!(
                         "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/30 lines; exit 0.",
                         deleted,
                         target,
                         ledger.raw_debt_lines.len()
-                    ))
+                    )))
                 }
                 other => Err(ToolError::InvalidParams(format!(
                     "Invalid action '{}': expected 'show', 'lint', or 'resolve'",
@@ -848,16 +882,19 @@ pub fn call_tool(
                 "list" => {
                     let (_markers, output) =
                         crate::memory::list_debt(&scope_dir, args.scope.as_deref());
-                    Ok(output)
+                    Ok(ToolOutcome::ok(output))
                 }
                 "check" => {
-                    let (_passed, output) = crate::memory::check_debt(&scope_dir);
-                    Ok(output)
+                    let (passed, output) = crate::memory::check_debt(&scope_dir);
+                    Ok(ToolOutcome {
+                        text: output,
+                        is_error: !passed,
+                    })
                 }
                 "sync" => {
                     let (_in_code, _manual, _synced, output) = crate::memory::sync_debt(&scope_dir)
                         .map_err(|e| ToolError::Execution(format!("Debt sync: {}", e)))?;
-                    Ok(output)
+                    Ok(ToolOutcome::ok(output))
                 }
                 other => Err(ToolError::InvalidParams(format!(
                     "Invalid action '{}': expected 'list', 'check', or 'sync'",
@@ -871,10 +908,15 @@ pub fn call_tool(
             })?;
             let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
             let budget = args.budget.unwrap_or(1500);
-            let dump =
-                crate::memory::dump::generate_dump(&scope_dir, budget, args.focus.as_deref())
-                    .map_err(|e| ToolError::Execution(e.to_string()))?;
-            Ok(dump.markdown)
+            let graph = cache.get_graph(&scope_dir).ok();
+            let dump = crate::memory::dump::generate_dump_with_graph(
+                &scope_dir,
+                graph.as_deref(),
+                budget,
+                args.focus.as_deref(),
+            )
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+            Ok(ToolOutcome::ok(dump.markdown))
         }
         unknown => Err(ToolError::NotFound(unknown.to_string())),
     }
