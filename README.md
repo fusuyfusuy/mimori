@@ -1,24 +1,127 @@
 # mimori
 
-> **Fast, local AST code intelligence, blast-radius analysis, and JIT in-repo agent memory in Rust.**
+**Give coding agents a faster way to learn the repo they are in — and see the blast radius before they touch code.**
 
-[![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)]()
-[![Version](https://img.shields.io/badge/version-3.2.0-blue.svg)]()
+[![CI](https://github.com/fusuyfusuy/mimori/actions/workflows/ci.yml/badge.svg)](https://github.com/fusuyfusuy/mimori/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-3.2.0-blue.svg)](https://github.com/fusuyfusuy/mimori/releases/tag/v3.2.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Mission**: Give coding agents a faster, token-disciplined way to **learn the repo they are in** (`dump`, stratified `map`, `find`, `slice` + JIT in-repo memory) and **inspect blast radii & change impact** before/after edits (`blast`, `diff`, `up`/`down`/`uses`, `missing`, `doctor`)—zero background daemons, deterministic outputs, and strict workspace confinement.
+`mimori` is a single-binary, zero-daemon AST code-intelligence and in-repo agent memory engine written in Rust. It uses embedded Tree-sitter parsers (Rust, TypeScript/JavaScript/TSX/JSX, Python, Go) and an atomic local SQLite cache to answer two questions in ~20 ms — over the CLI or native MCP stdio:
+
+| Job | Commands & MCP Tools | What It Gives an Agent |
+| --- | --- | --- |
+| **1. Learn the repo fast** | `dump`, `map`, `find`, `slice`, `memory` | Budget-capped Turn-0 snapshot (module-stratified map + `docs/adr/` titles + gotchas), hybrid search, and 1-hop AST symbol slices with **JIT `@scope:`/`@sym:` memory** auto-injected at edit time. |
+| **2. Trace blast radii & change impact** | `blast`, `diff`, `up`, `down`, `uses`, `missing`, `doctor` | Transitive callers/callees, affected entry points and test suites, explicit **unresolved `.method()` honesty warnings**, absence sweeps, and combined blast analysis over your uncommitted `git diff`. |
 
 ---
 
 ## Why mimori?
 
-Reading whole files to find one function wastes context tokens; grepping for callers misses aliases, constructors, receiver types, and transitive impact. `mimori` gives coding agents and developers a fast, deterministic view of a codebase:
+Reading whole files to inspect one function burns context tokens; grepping for callers misses path aliases, constructors, receiver types, and multi-hop entry points; static repo docs go stale unless memory is surfaced where code is actually edited.
 
-- **Slice (`mimori slice`)**: Read a single symbol's body, signature, imports (`-i`), line numbers (`-n`), 1-hop callers/callees, inlined private helpers (`-f`), and **JIT scoped memory notes** (`@scope:`/`@sym:`) in ~150–400 tokens instead of 3,000+.
-- **Blast Radius (`mimori blast` & `mimori diff`)**: Trace upstream callers, affected entry points, test suites, scoped memory, and explicit **unresolved member-call honesty warnings** before changing a signature—or run `mimori diff` to inspect the combined blast cone of your uncommitted `git diff` in one command.
-- **Architectural Map (`mimori map` & `mimori dump`)**: Module-stratified, public-API-weighted PageRank orientation (defaults to top 30 symbols; `--limit 0` for all). `mimori dump` packs the map, `docs/adr/` titles, domain vocabulary, gotchas, and active debt into a budget-capped Turn-0 snapshot.
-- **In-Repo Agent Memory & Debt (`mimori memory` & `mimori debt`)**: Maintain a git-tracked `.agents/memory.md` ledger (`show`, `add --scope/--sym`, `lint`, `resolve`) and scan in-code `# mimodept: <what> <- <ceiling> -> <trigger>` comments via Tree-sitter comment AST extraction (soft 30-item warning ceiling).
-- **Polyglot & Content-Hash Indexed**: Embedded Tree-sitter parsers for Rust, TypeScript/JavaScript, Python, and Go, backed by an atomic SQLite cache (`.mimori/index.db`) governed by FNV-1a content hashes with automatic corruption recovery and read-only in-memory fallback.
+Measured on this repository (`51` source files, `843` symbols, `v3.2.0` release binary):
+
+| Task | `mimori` | Baseline | Warm Latency |
+| --- | --- | --- | --- |
+| Read `confine_to_workspace` + imports + 1-hop callers + scoped gotcha | **~366 tok** (`slice -i -n`) | ~5,433 tok full file (**0.07×**) | ~21 ms |
+| Read `SymbolGraph::resolve` + imports + 1-hop callers | **~713 tok** (`slice -i -n`) | ~16,667 tok full file (**0.04×**) | ~24 ms |
+| Orient across core modules + ADRs + gotchas + debt | **~1,493 tok** (`dump --budget 1500`) | Manual tree + manifests + docs | ~22 ms |
+| Upstream impact of `MemoryLedger::lint` (entry points + tests + warning) | **~422 tok** (`blast -d 2`) | Multi-hop manual `rg` | ~23 ms |
+
+---
+
+## See It in Action
+
+### 1. Slice a symbol (with JIT scoped memory + 1-hop graph)
+
+```shell
+mimori slice src/workspace/walker.rs:confine_to_workspace -i -n
+```
+
+```markdown
+### Slice: `src/workspace/walker.rs:confine_to_workspace`
+
+- **File**: `src/workspace/walker.rs`
+- **Symbol**: `confine_to_workspace` (function)
+- **Lines**: L535-L541
+- **Signature**: `pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf>`
+- **Scoped Memory**:
+  - [@scope: src/workspace/*] Confinement invariant: Every CLI, MCP, manifest, and `--scope` path must pass lexical normalization + `confine_path` before touching disk (eliminates symlink escapes and `../` existence oracles).
+- **1-Hop Callers**:
+  - `src/graph/blast.rs:FileLineCache::with_symbol_lines (L225-L262)`
+  - `src/graph/blast.rs:sweep_literal_sinks (L760-L804)`
+  - `src/graph/mod.rs:SymbolGraph::read_symbol_body (L982-L1005)`
+  - `src/graph/mod.rs:SymbolGraph::build_slice (L1007-L1108)`
+  - `src/main.rs:confine_and_normalize_coord (L96-L138)`
+  - _5 of 17 callers shown (use mimori up for full list)_
+- **1-Hop Callees**:
+  - `src/workspace/walker.rs:confine_path (L487-L533)`
+
+L535: pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
+L536:     confine_path(
+L537:         workspace_root,
+L538:         candidate,
+L539:         SymlinkPolicy::AllowWithinWorkspace,
+L540:     )
+L541: }
+```
+
+### 2. Trace blast radius before changing a signature
+
+```shell
+mimori blast MemoryLedger::lint -d 2
+```
+
+```markdown
+# Blast Radius (Upstream): `MemoryLedger::lint` (Depth: 2, Affected: 3)
+
+> Warning: 3 unresolved cross-file `.lint()` call site(s) exist in workspace (untyped receiver calls are not linked statically); verify with: `rg -n "\.lint\("`
+
+### Scoped Memory
+- [@scope: src/memory/*] Memory substrate invariant: `.mimori/` is ephemeral cache (gitignored); `.agents/memory.md` is git-tracked domain memory with soft 30-line debt ceiling (warn-only in CI) and Tree-sitter AST comment debt extraction.
+
+### Affected Entry Points
+- `src/main.rs:main`
+
+### Affected Test Suites
+- `src/memory/ledger.rs`
+
+### Transitive Call Tree
+  - (d=1) **`cmd_memory`** (function) -> `src/main.rs:cmd_memory` [calls @ L740]
+  - (d=1) **`lint_allows_brackets_inside_debt_prose_and_checks_word_boundary_accepted`** (function) -> `src/memory/ledger.rs:...` [calls @ L1170] [Test]
+    - (d=2) **`main`** (function) -> `src/main.rs:main` [Entry Point]
+```
+
+Notice the warning banner: when a method call crosses files through an untyped receiver, `mimori` **refuses to guess globally** and tells you exactly how many unresolved `.lint()` call sites exist plus the exact `rg` check to verify them.
+
+---
+
+## The 5-Step Agent Loop
+
+```shell
+# 1. Orient on Turn-0 (stratified map + docs/adr/ titles + gotchas + active debt)
+mimori dump --budget 1500
+
+# 2. Locate target symbols, files, or fallback literals (supports `|` batching)
+mimori find "SymbolGraph|Coordinate::parse"
+
+# 3. Inspect target code with imports, line numbers, local helpers, and JIT memory
+mimori slice src/graph/mod.rs:SymbolGraph::resolve -f -i -n
+
+# 4. Check upstream impact before editing a signature or contract
+mimori blast src/model/coordinate.rs:Coordinate::parse -d 3
+
+# 5. Audit your working-tree diff (mutated symbols, blast cone, tests, memory/debt gate)
+mimori diff
+```
+
+Capture hard-won repo invariants once so every future `slice`, `blast`, and `diff` in that directory automatically surfaces them:
+
+```shell
+mimori memory add --section gotchas --scope "src/storage/*" \
+  "Re-indexing is strictly FNV-1a content-hash driven."
+```
 
 ---
 
@@ -28,7 +131,7 @@ Reading whole files to find one function wastes context tokens; grepping for cal
 cargo install --git https://github.com/fusuyfusuy/mimori.git
 ```
 
-Or from a local checkout:
+Or build from a local checkout:
 
 ```bash
 git clone https://github.com/fusuyfusuy/mimori.git
@@ -36,73 +139,13 @@ cd mimori
 cargo install --path .
 ```
 
----
-
-## Usage
-
-Global flags available on all commands: `--json`, `-w | --workspace <dir>`.
-
-```shell
-mimori dump    [--budget <N>] [--focus <target>] [--json]
-mimori map     [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>] [--json]
-mimori slice   <coordinate>... [-f|--follow-local] [-i|--with-imports] [-n|--numbered] [--budget <N>] [--json]
-mimori find    <pattern> [-s|--symbols-only] [-f|--files-only] [--scope <dir>] [--limit <N>] [--json]
-mimori blast   <target>... [-d|--depth <N>] [--down] [--with-sinks <a,b,c>] [--json]
-mimori diff    [--staged] [--base <rev>] [-d|--depth <N>] [--json]
-mimori up      <target> [--json]
-mimori down    <target> [--json]
-mimori uses    <target> [--json]
-mimori missing <pattern> [--scope <dir>] [--defines <lit>] [--json]
-mimori doctor  [--limit <N>] [--json]
-mimori memory  [show|add|lint|check|resolve] [--section <sec>] [--scope <glob>] [--sym <name>] [--budget <N>] [--json]
-mimori debt    [list|check|sync] [--scope <dir>] [--json]
-mimori init    [--force]
-mimori clean   [--all]
-mimori mcp     [--workspace <dir>]
-```
-
-### Coordinates
-
-`mimori` accepts standard `file:symbol` coordinates as well as Markdown-style `#` anchors:
-
-```shell
-src/auth.rs:authenticate          # symbol in a file
-src/auth.rs#authenticate          # Markdown link style
-src/service.ts:UserService::find  # method on a class/type
-src/main.rs:#L20-45               # line range (also accepts #L20-L45 or :L20-45; 1-based)
-authenticate                      # bare symbol name across the workspace
-```
-
-Coordinates never guess silently and never escape the workspace root. If a name is ambiguous across files, `mimori` exits non-zero and lists ranked candidates; if a symbol is missing in a known file, it lists the symbols defined in that file.
-
-### Common Workflows
-
-```shell
-# 1. Orient on a repository in one call (map + ADRs + vocab + gotchas + debt)
-mimori dump --budget 1500
-
-# 2. Record a scope-anchored gotcha auto-injected into future slice/blast/diff calls
-mimori memory add --section gotchas --scope "src/storage/*" "Re-indexing is strictly FNV-1a content-hash driven."
-
-# 3. Slice a function with its imports, line numbers, local helpers, and scoped memory
-mimori slice src/graph/blast.rs:calculate_blast_radius -f -i -n
-
-# 4. Check upstream callers (with d=1 call-site line numbers & member-call honesty check)
-mimori blast src/model/coordinate.rs:Coordinate::parse -d 3
-
-# 5. Audit the blast radius, scoped memory, and test impact of your current git diff
-mimori diff
-
-# 6. Reconcile and gate in-code # mimodept: debt markers
-mimori debt sync
-mimori memory lint && mimori debt check
-```
+Agent skill instructions live in [SKILL.md](SKILL.md) (mirrored byte-identically at [skills/mimori/SKILL.md](skills/mimori/SKILL.md)).
 
 ---
 
 ## MCP Server
 
-Run `mimori` over JSON-RPC 2.0 stdio (`Content-Length` framed or NDJSON) for AI coding agents:
+Run `mimori` over JSON-RPC 2.0 stdio (`Content-Length` framed or NDJSON). Warm MCP sessions hold an LRU in-memory graph cache gated by POSIX `ino+size+mtime+ctime` stat fingerprints so repeated calls avoid disk re-hashing.
 
 ```json
 {
@@ -115,32 +158,102 @@ Run `mimori` over JSON-RPC 2.0 stdio (`Content-Length` framed or NDJSON) for AI 
 }
 ```
 
-Exposed tools (11 total):
-- `mimori_dump` — Turn-0 context snapshot (`budget`, `focus`)
-- `mimori_map` — Module-stratified centrality outline (`scope`, `focus`, `seed`, `limit`)
-- `mimori_find` — PageRank-ordered symbol, file, and literal fallback search (`pattern`, `scope`, `symbols_only`, `files_only`, `limit`)
-- `mimori_slice` — AST symbol or line-range slice with JIT scoped memory (`coordinate`, `follow_local`, `with_imports`, `numbered`, `budget`)
-- `mimori_graph` — Strict `up`, `down`, and `uses` traversal (`target`, `direction`)
-- `mimori_blast` — Upstream/downstream transitive impact with unresolved-member warnings (`target`, `depth`, `down`, `with_sinks`)
-- `mimori_diff` — Git diff symbol, blast-radius, and scoped-memory audit (`staged`, `base`, `depth`)
-- `mimori_missing` — Absence query for files lacking a literal pattern (`pattern`, `scope`, `defines`)
-- `mimori_doctor` — Repository health, top hubs, and dead-weight audit (`limit`)
-- `mimori_memory` — `.agents/memory.md` reader, structured writer (`add`), linter, and resolver (`action`, `section`, `text`, `scope`, `sym`, `target`, `all`, `budget`)
-- `mimori_debt` — Tree-sitter comment `# mimodept:` scanner, checker, and ledger sync (`action`, `scope`)
+### Exposed MCP Tools (11)
+
+| Tool | Purpose | Key Parameters |
+| --- | --- | --- |
+| `mimori_dump` | Turn-0 packed context (map + ADRs + vocab/gotchas + debt) | `budget`, `focus`, `workspace_dir` |
+| `mimori_map` | Module-stratified, public-API-weighted PageRank outline | `limit` (default `30`, `0` = all), `scope`, `focus`, `seed`, `workspace_dir` |
+| `mimori_find` | PageRank-ordered symbol, file, and literal fallback search (`\|` batching) | `pattern`, `scope`, `symbols_only`, `files_only`, `limit`, `workspace_dir` |
+| `mimori_slice` | AST symbol or line-range slice with JIT `@scope:`/`@sym:` memory | `coordinate` (`string \| string[]`), `follow_local`, `with_imports`, `numbered`, `budget`, `workspace_dir` |
+| `mimori_blast` | Upstream/downstream transitive blast radius + honesty warnings | `target` (`string \| string[]`), `depth`, `down`, `with_sinks`, `workspace_dir` |
+| `mimori_diff` | Mutated symbols, combined blast cone, tests, and debt/memory gate | `staged`, `base`, `depth`, `workspace_dir` |
+| `mimori_graph` | Strict 1-hop `up` (callers), `down` (callees), or `uses` (mentioners) | `target` (`string \| string[]`), `direction`, `workspace_dir` |
+| `mimori_missing` | Absence query: files under `scope` lacking every `\|` alternative | `pattern`, `scope`, `defines`, `workspace_dir` |
+| `mimori_doctor` | Index health, resolution metrics, top hubs, dead-weight candidates | `limit`, `workspace_dir` |
+| `mimori_memory` | Read, `add` scoped notes, `lint`, or safely `resolve` `.agents/memory.md` | `action`, `section`, `text`, `scope`, `sym`, `target`, `all`, `budget`, `workspace_dir` |
+| `mimori_debt` | Tree-sitter comment AST `# mimodept:` `list`, `check`, or `sync` | `action`, `scope`, `workspace_dir` |
 
 ---
 
-## Storage & Exit Codes
+## CLI Reference
 
-- **`.mimori/index.db`**: Ephemeral SQLite WAL cache. Safe to delete anytime via `mimori clean`; auto-rebuilds on schema/version change or corruption, and falls back to in-memory parsing on read-only filesystems.
-- **`.agents/memory.md`**: Git-tracked project memory, `@scope:`/`@sym:` JIT notes, and debt ledger.
-- **`docs/adr/*.md`**: Architecture Decision Records automatically indexed by `mimori dump`.
-- **`.mimoriignore`**: Optional ignore patterns supplementing `.gitignore`.
+Global flags on every command: `--json`, `-w | --workspace <dir>`.
+
+### Repo Orientation
+```shell
+mimori dump    [--budget <N>] [--focus <target>]
+mimori map     [--scope <dir>] [--focus <target>] [--seed <term>] [--limit <N>]
+mimori find    <pattern> [-s|--symbols-only] [-f|--files-only] [--scope <dir>] [--limit <N>]
+mimori slice   <coordinate>... [-f|--follow-local] [-i|--with-imports] [-n|--numbered] [--budget <N>]
+```
+
+### Blast Radius & Change Impact
+```shell
+mimori blast   <target>... [-d|--depth <N>] [--down] [--with-sinks <a,b,c>]
+mimori diff    [--staged] [--base <rev>] [-d|--depth <N>]
+mimori up      <target>
+mimori down    <target>
+mimori uses    <target>
+mimori missing <pattern> [--scope <dir>] [--defines <lit>]
+mimori doctor  [--limit <N>]
+```
+
+### In-Repo Memory, Debt & Maintenance
+```shell
+mimori memory  [show|add|lint|check|resolve] [--section <sec>] [--scope <glob>] [--sym <name>] [--all] [--budget <N>]
+mimori debt    [list|check|sync] [--scope <dir>]
+mimori init    [--force]
+mimori clean   [--all]
+mimori mcp
+```
+
+### Coordinates
+
+`mimori` accepts `file:symbol`, Markdown-style `file#symbol`, qualified `Type::method`, 1-based line ranges, and bare symbol names:
+
+```shell
+src/auth.rs:authenticate          # symbol in a file
+src/auth.rs#authenticate          # Markdown anchor form
+src/service.ts:UserService::find  # method on a type/class
+src/main.rs:#L20-45               # 1-based line range (also #L20-L45 or :L20-45)
+authenticate                      # bare symbol across the workspace
+```
+
+Ambiguous symbols never guess silently — `mimori` exits `1` with ranked candidates. Missing symbols inside a known file list the symbols actually defined in that file.
+
+---
+
+## Design Invariants & Honest Limits
+
+- **Supported languages**: Rust (`.rs`), TypeScript (`.ts`, `.mts`, `.cts`), TSX/JSX (`.tsx`, `.jsx`), JavaScript (`.js`, `.mjs`, `.cjs`), Python (`.py`), and Go (`.go`), with monorepo alias resolution (`tsconfig.json`, `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.mod`, `pyproject.toml`).
+- **Static AST precision, not full typechecking**: Local receiver types and imports are resolved from ASTs; untyped cross-file `.method()` calls are tracked explicitly and surfaced as `blast` warnings rather than silently linked or silently omitted.
+- **Content-hash indexed, zero daemons**: `.mimori/index.db` uses atomic SQLite WAL transactions keyed on FNV-1a content hashes (`PARSER_VERSION` bumps auto-rebuild). Corrupt caches rebuild automatically; read-only workspaces fall back to in-memory indexing.
+- **Strict workspace confinement**: CLI coordinates, MCP `workspace_dir`, `--scope` filters, manifest discovery, and `clean --all` enforce lexical normalization and symlink confinement — no outside-root reads, writes, or `../` existence oracles.
+- **Deterministic M2M output**: All `--json` and Markdown outputs are deterministically sorted (byte-identical across runs) and free of decorative noise.
+
+---
+
+## Storage Layout, Memory & ADRs
+
+- **`.mimori/index.db`** — Ephemeral SQLite WAL cache (gitignored). Safe to delete anytime via `mimori clean [--all]`.
+- **`.agents/memory.md`** — Git-tracked domain memory: active epics, domain vocabulary, `@scope:`/`@sym:` JIT gotchas, and open debt items synced from in-code `# mimodept: <what> <- <ceiling> -> <trigger>` comments (soft 30-item warning ceiling, never truncates waivers).
+- **`docs/adr/*.md`** — Architecture Decision Records automatically title-indexed by `mimori dump`:
+  - [ADR-0001](docs/adr/0001-rust-tree-sitter-architecture.md) — Rust CLI with Embedded Tree-sitter Grammars
+  - [ADR-0002](docs/adr/0002-syntactic-graph-with-binary-cache.md) — Syntactic Graph with SQLite Persistence
+  - [ADR-0003](docs/adr/0003-pagerank-in-degree-centrality.md) — In-Degree PageRank for Symbol Centrality
+  - [ADR-0004](docs/adr/0004-pure-code-dissection-engine.md) — Pure Code Dissection Engine
+  - [ADR-0005](docs/adr/0005-mcp-server-interface.md) — Model Context Protocol (MCP) Server Interface
+  - [ADR-0006](docs/adr/0006-reclaiming-project-memory-substrate.md) — Reclaiming Project Memory Substrate
+  - [ADR-0007](docs/adr/0007-typed-ast-stratified-ranking-and-jit-memory.md) — Typed AST Flags, Stratified Ranking, Hardened Confinement, and JIT Scoped Memory
+- **`.mimoriignore`** — Optional ignore rules supplementing `.gitignore`.
+
+### Exit Codes
 
 | Exit Code | Meaning |
-| --------- | ------- |
-| `0` | Success (including non-blocking soft debt ceiling warnings `> 30`) |
-| `1` | Symbol not found, ambiguous coordinate, workspace escape, schema lint/debt syntax failure, or runtime error |
+| --- | --- |
+| `0` | Success (including non-blocking soft debt warnings `> 30` items) |
+| `1` | Symbol not found, ambiguous coordinate, workspace escape, schema/debt syntax error, or runtime error |
 | `2` | Invalid CLI arguments |
 
 ---
