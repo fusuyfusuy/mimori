@@ -29,29 +29,40 @@ Measured on this repository (`51` source files, `843` symbols, `v3.2.0` release 
 | Orient across core modules + ADRs + gotchas + debt | **~1,493 tok** (`dump --budget 1500`) | Manual tree + manifests + docs | ~22 ms |
 | Upstream impact of `MemoryLedger::lint` (entry points + tests + warning) | **~422 tok** (`blast -d 2`) | Multi-hop manual `rg` | ~23 ms |
 
-### End-to-End 3-Arm Agent Benchmark (`Dokploy` Monorepo)
+### End-to-End 3-Arm Agent Benchmark (`Dokploy` Monorepo, N = 3 Real Issues)
 
-Measured end-to-end on real [Dokploy Issue #6096](https://github.com/Dokploy/dokploy/issues/6096) (zero filenames in prompt; pinned at pre-fix commit `e193834bb`, `1,168` indexed TS/TSX/JS/JSX files, `11,732` symbols; `mimori` cold index `568 ms`, warm query `169 ms`). Three isolated agents ran the identical task on the same model (`gemini-4-neon-xhigh`, zero timeouts, verified `0` `mimori` calls in Arms B & C). All three arms produced the **exact same byte-for-byte upstream fix** (`879d5c74a`, `100/100` rubric), isolating pure efficiency:
+Measured end-to-end across **3 real Dokploy issues** (`9` independent full-agent runs, zero filenames in prompts, pinned to each issue's pre-fix commit with future history stripped; `1,168` indexed TS/TSX/JS/JSX files, `11,732` symbols; `mimori v3.2.0` cold index `568 ms`, warm query `169 ms`). All 9 runs used the identical model (`gemini-4-neon-xhigh`), ran with zero timeouts (`--print-timeout 0s`), had verified **`0` `mimori` calls in Arms B & C**, and achieved **equivalent, upstream-matched fixes** on every issue (`9/9` `SUCCESS`), isolating pure efficiency:
+
+#### 3-Run Aggregate (`#6096` + `#5781` + `#6100`)
 
 | Metric | **Arm A (`mimori + rg`)** | **Arm B (`no-mimori surgical`)** | **Arm C (`default unsteered`)** | **A vs. B** | **A vs. C** |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **Upstream Fix & Rubric** | Exact (`100/100`) | Exact (`100/100`) | Exact (`100/100`) | Tied | Tied |
-| **Time to First Edit** | **326 s** (5m 26s) | 407 s (6m 47s) | 424 s (7m 04s) | **−19.9%** | **−23.1%** |
-| **Total Wall-Clock Time** | **477.8 s** (7m 58s) | 575.7 s (9m 36s) | 493.0 s (8m 13s) | **−17.0%** | **−3.1%** |
-| **LLM Turns** | **18** | 18 | 22 | 0.0% | **−18.2%** |
-| **Total Tool Calls** | 60 (`16` mimori, `9` read) | 64 (`0` mimori, `33` read) | 58 (`0` mimori, `31` read) | **−6.2%** | +3.4% |
-| **`read_file` Calls** | **9** | 33 | 31 | **−72.7%** | **−71.0%** |
-| **Distinct Files Opened** | **6** | 16 | 23 | **−62.5%** | **−73.9%** |
-| **Raw Lines Read (`read_file`)** | **1,099** | 3,068 | 4,210 | **−64.2%** | **−73.9%** |
-| **Uncached Input Tokens** | **130,697** | 157,462 | 157,290 | **−17.0%** | **−16.9%** |
-| **Cache-Read Tokens** | 1,444,019 | 1,316,084 | 1,821,924 | +9.7% | **−20.7%** |
-| **Output Tokens (incl. thinking)** | **48,205** | 58,024 | 54,142 | **−16.9%** | **−11.0%** |
-| **↳ Thinking Tokens** | **26,622** | 37,847 | 30,395 | **−29.7%** | **−12.4%** |
-| **Billable Tokens (`in + out`)** | **178,902** | 215,486 | 211,432 | **−17.0%** | **−15.4%** |
-| **Peak Single-Turn Context** | **143,680** | 155,429 | 153,168 | **−7.6%** | **−6.2%** |
-| **Est. API Cost** *(ref. rates)* | **$0.83** | $0.94 | $0.97 | **−12.3%** | **−14.5%** |
+| **Tasks Solved / Clean Swaps** | **3 / 3** (`9/9` matched) | 3 / 3 | 3 / 3 | Tied | Tied |
+| **Total Wall-Clock Time** | **1,191.9 s** (19m 52s) | 1,383.3 s (23m 03s) | 1,542.5 s (25m 43s) | **−13.8%** | **−22.7%** |
+| **Total Time to First Edit** | **679.0 s** (226s avg) | 967.0 s (322s avg) | 1,020.0 s (340s avg) | **−29.8%** | **−33.4%** |
+| **Total LLM Turns** | **49** (16.3 avg) | 60 (20.0 avg) | 70 (23.3 avg) | **−18.3%** | **−30.0%** |
+| **Total Tool Calls** | **158** (`52` mimori, `34` read) | 177 (`0` mimori, `101` read) | 198 (`0` mimori, `117` read) | **−10.7%** | **−20.2%** |
+| **`read_file` Calls** | **34** | 101 | 117 | **−66.3%** | **−70.9%** |
+| **Files Opened (`read_file`)** | **27** | 66 | 81 | **−59.1%** | **−66.7%** |
+| **Raw Lines Read (`read_file`)** | **3,808** | 10,413 | 13,895 | **−63.4%** | **−72.6%** |
+| **Uncached Input Tokens** | **374,626** | 506,920 | 493,614 | **−26.1%** | **−24.1%** |
+| **Cache-Read Tokens** | **3,637,318** | 4,310,753 | 6,225,090 | **−15.6%** | **−41.6%** |
+| **Output Tokens (incl. thinking)** | **117,327** | 136,864 | 164,106 | **−14.3%** | **−28.5%** |
+| **↳ Thinking Tokens** | **61,124** | 83,448 | 84,607 | **−26.8%** | **−27.8%** |
+| **Billable Tokens (`in + out`)** | **491,953** | 643,784 | 657,720 | **−23.6%** | **−25.2%** |
+| **All-In Tokens (`in + cache + out`)** | **4,129,271** | 4,954,537 | 6,882,810 | **−16.7%** | **−40.0%** |
+| **Mean Peak Context** | **132,484** | 137,085 | 159,628 | **−3.4%** | **−17.0%** |
+| **Total Est. API Cost** *(ref. rates)* | **$2.10** | $2.54 | $3.04 | **−17.5%** | **−31.0%** |
 
-*Notes: Reference cost weighted at `$1.25/M` uncached input, `$0.125/M` cache-read, `$10/M` output. All three arms also ran ~13–14 custom Python scripts to exhaustively audit all 68 Drizzle schema tables for the issue's sibling-query deliverable; on the pure orientation + root-cause + caller blast-radius phase, Arm A reached the exact function, callers, and `#4256` precedent in **26 seconds (2 turns)**.*
+#### Per-Issue Summary (Arm A Won 3/3 on Time, Time-to-Edit, Billable Tokens, Lines Read & Cost)
+
+| Run / Issue | Archetype | Wall Time (`A / B / C`) | Billable `in+out` (`A / B / C`) | Raw Lines Read (`A / B / C`) | Est. Cost (`A / B / C`) |
+| --- | --- | --- | --- | --- | --- |
+| **#6096** (`e193834bb`) | Webhook + Drizzle 100-arg + schema audit | **478s** / 576s / 493s | **179k** / 215k / 211k | **1,099** / 3,068 / 4,210 | **$0.83** / $0.94 / $0.97 |
+| **#5781** (`3b13bcde8`) | Multi-router RBAC across 7 `*.search` APIs | **251s** / 329s / 437s | **139k** / 164k / 225k | **1,050** / 3,976 / 5,849 | **$0.48** / $0.64 / $0.97 |
+| **#6100** (`5ccc51a9c`) | Traefik `dynamic/` reload (local + remote certs) | **463s** / 479s / 613s | **174k** / 264k / 221k | **1,659** / 3,369 / 3,836 | **$0.79** / $0.96 / $1.10 |
+
+*Notes: Reference cost weighted at `$1.25/M` uncached input, `$0.125/M` cache-read, `$10/M` output. Notice the largest wins occur on multi-file navigation & consistency tasks (`#5781`: **−42% wall time**, **−51% cost**, **−82% lines read** vs. default Arm C).*
 
 ---
 
