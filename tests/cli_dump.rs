@@ -85,17 +85,46 @@ fn test_cli_dump_json_output() {
     let dir = tempdir().unwrap();
     let agents_dir = dir.path().join(".agents");
     fs::create_dir_all(&agents_dir).unwrap();
+    fs::create_dir_all(dir.path().join("docs/adr")).unwrap();
 
     fs::write(
         agents_dir.join("memory.md"),
         "# Project Memory\n\n## KNOWN DEBT (open only — one line per item, delete when done)\n- bypass cache <- 100 rps -> add redis\n",
     )
     .unwrap();
+    fs::write(
+        dir.path().join("docs/adr/0001-core-engine.md"),
+        "# ADR-0001: Core AST Engine\n\nDecisions go here.\n",
+    )
+    .unwrap();
 
-    let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.current_dir(dir.path()).arg("--json").arg("dump");
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("\"budget\": 1500"))
-        .stdout(predicate::str::contains("\"debt_count\": 1"));
+    let out = Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "dump", "--budget", "400"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(val["budget"].as_u64(), Some(400));
+    assert_eq!(val["debt_count"].as_u64(), Some(1));
+    assert!(
+        val["estimated_tokens"].as_u64().unwrap() <= 400,
+        "dump must respect its own token budget: {}",
+        val["estimated_tokens"]
+    );
+    let adrs = val["adrs"].as_array().unwrap();
+    assert!(
+        adrs.iter().any(|a| a
+            .as_str()
+            .unwrap_or("")
+            .contains("ADR-0001: Core AST Engine")),
+        "dump must index docs/adr/ titles: {:?}",
+        adrs
+    );
+    assert!(val["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("ADR-0001: Core AST Engine"));
 }

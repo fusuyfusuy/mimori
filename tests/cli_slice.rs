@@ -22,7 +22,7 @@ pub fn subtract(a: i32, b: i32) -> i32 {
     let target = format!("{}:add", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target);
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
 
     cmd.assert()
         .success()
@@ -54,7 +54,7 @@ impl Point {
     let target = format!("{}:Point", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target);
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
 
     cmd.assert()
         .success()
@@ -64,7 +64,9 @@ impl Point {
     // Slice the method
     let target_method = format!("{}:distance", file_path.to_str().unwrap());
     let mut cmd2 = Command::cargo_bin("mimori").unwrap();
-    cmd2.arg("slice").arg(&target_method);
+    cmd2.current_dir(dir.path())
+        .arg("slice")
+        .arg(&target_method);
     cmd2.assert()
         .success()
         .stdout(predicate::str::contains("pub fn distance"));
@@ -93,7 +95,7 @@ export class UserService {
     let target = format!("{}:findUser", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target);
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
 
     cmd.assert()
         .success()
@@ -113,7 +115,7 @@ fn test_cli_slice_line_range() {
     let target = format!("{}:#L2-4", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target);
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
 
     cmd.assert()
         .success()
@@ -132,7 +134,10 @@ fn test_cli_slice_json_output() {
     let target = format!("{}:greet", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target).arg("--json");
+    cmd.current_dir(dir.path())
+        .arg("slice")
+        .arg(&target)
+        .arg("--json");
 
     let assert = cmd.assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -155,7 +160,7 @@ fn test_cli_slice_large_symbol_truncation() {
     let target = format!("{}:large_function", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target);
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
 
     cmd.assert().success().stdout(predicate::str::contains(
         "lines truncated for token efficiency",
@@ -172,7 +177,7 @@ fn test_cli_slice_symbol_not_found_error() {
     let target = format!("{}:bar", file_path.to_str().unwrap());
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
-    cmd.arg("slice").arg(&target);
+    cmd.current_dir(dir.path()).arg("slice").arg(&target);
 
     cmd.assert()
         .failure()
@@ -262,11 +267,10 @@ fn test_slice_result_numbered_code_slices() {
     let code = "pub fn calculate() {\n    let a = 10;\n    let b = 20;\n    let _ = a + b;\n}\n";
     fs::write(&file_path, code).unwrap();
 
-    let (graph, coord) = mimori::graph::prepare_coordinate(
-        mimori::model::Coordinate::parse(&format!("{}:calculate", file_path.display())).unwrap(),
-        dir.path(),
-    )
-    .unwrap();
+    let graph = mimori::storage::get_or_sync_graph(dir.path()).unwrap();
+    let coord = mimori::model::Coordinate::parse(&format!("{}:calculate", file_path.display()))
+        .unwrap()
+        .normalize_against(dir.path());
 
     let slice: SliceResult = graph.build_slice(&coord, false, false).unwrap();
     let numbered_md = slice.to_markdown_numbered();
@@ -287,11 +291,10 @@ fn test_slice_result_numbered_line_range() {
     let code = "first\nsecond\nthird\nfourth\nfifth\n";
     fs::write(&file_path, code).unwrap();
 
-    let (graph, coord) = mimori::graph::prepare_coordinate(
-        mimori::model::Coordinate::parse(&format!("{}:#L2-4", file_path.display())).unwrap(),
-        dir.path(),
-    )
-    .unwrap();
+    let graph = mimori::storage::get_or_sync_graph(dir.path()).unwrap();
+    let coord = mimori::model::Coordinate::parse(&format!("{}:#L2-4", file_path.display()))
+        .unwrap()
+        .normalize_against(dir.path());
 
     let slice: SliceResult = graph.build_slice(&coord, false, false).unwrap();
     let numbered_md = slice.to_markdown_numbered();
@@ -299,4 +302,134 @@ fn test_slice_result_numbered_line_range() {
     assert!(numbered_md.contains("L2: second"));
     assert!(numbered_md.contains("L3: third"));
     assert!(numbered_md.contains("L4: fourth"));
+}
+
+#[test]
+fn test_cli_slice_rejects_outside_workspace_paths() {
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::write(ws.path().join("local.rs"), "pub fn inside() {}\n").unwrap();
+    let secret = outside.path().join("secret.rs");
+    fs::write(&secret, "pub fn leak_me() { let _ = \"TOP_SECRET\"; }\n").unwrap();
+
+    // Line coordinate outside workspace must fail closed and never leak contents.
+    let mut cmd_line = Command::cargo_bin("mimori").unwrap();
+    cmd_line
+        .current_dir(ws.path())
+        .arg("slice")
+        .arg(format!("{}:#L1-1", secret.display()));
+    cmd_line
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("TOP_SECRET").not());
+
+    // Symbol coordinate outside workspace must also fail closed and never write external .mimori.
+    let mut cmd_sym = Command::cargo_bin("mimori").unwrap();
+    cmd_sym
+        .current_dir(ws.path())
+        .arg("slice")
+        .arg(format!("{}:leak_me", secret.display()));
+    cmd_sym
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("TOP_SECRET").not());
+    assert!(
+        !outside.path().join(".mimori").exists(),
+        "must never create .mimori outside workspace"
+    );
+}
+
+#[test]
+fn test_cli_slice_json_is_byte_deterministic() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("det.rs"),
+        r#"
+pub fn a() {}
+pub fn b() {}
+pub fn c() {}
+pub fn d() {}
+pub fn hub() {
+    a(); b(); c(); d(); a(); c();
+}
+"#,
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for _ in 0..5 {
+        let out = Command::cargo_bin("mimori")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(["--json", "slice", "det.rs:hub"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        outputs.push(out.stdout);
+    }
+    for out in &outputs[1..] {
+        assert_eq!(
+            out, &outputs[0],
+            "slice --json output must be byte-deterministic"
+        );
+    }
+}
+
+#[test]
+fn test_cli_slice_hash_symbol_and_line_zero_rejected() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("lib.rs"), "pub fn phase_one() {}\n").unwrap();
+
+    // Documented `file#symbol` form must resolve cleanly.
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["slice", "lib.rs#phase_one"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pub fn phase_one()"));
+
+    // 1-indexed line coordinates must reject line 0.
+    for bad in ["lib.rs:#L0", "lib.rs:#L0-0", "lib.rs:#L0-1"] {
+        Command::cargo_bin("mimori")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(["slice", bad])
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
+fn test_cli_slice_injects_jit_scoped_memory_notes() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src/db")).unwrap();
+    fs::create_dir_all(dir.path().join(".agents")).unwrap();
+    fs::write(
+        dir.path().join("src/db/pool.rs"),
+        "pub fn connect() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".agents/memory.md"),
+        "\
+# Project Memory
+
+## Domain Vocabulary & Gotchas
+- @scope:src/db/ Never open SQLite without busy_timeout.
+- @sym:connect Always verify WAL checkpoint after writes.
+- @scope:src/ui/ Unrelated frontend note must not leak into db slices.
+",
+    )
+    .unwrap();
+
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["slice", "src/db/pool.rs:connect"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("busy_timeout"))
+        .stdout(predicate::str::contains("WAL checkpoint"))
+        .stdout(predicate::str::contains("Unrelated frontend note").not());
 }

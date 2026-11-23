@@ -114,3 +114,128 @@ fn test_cli_init_reports_failure_when_it_creates_nothing() {
     cmd.current_dir(dir.path()).arg("init");
     cmd.assert().failure();
 }
+
+#[test]
+fn test_cli_corrupt_sqlite_auto_rebuilds() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("ok.rs"), "pub fn survivor() {}\n").unwrap();
+
+    // Build initial cache, then corrupt index.db with garbage bytes.
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["find", "survivor"])
+        .assert()
+        .success();
+
+    let db_path = dir.path().join(".mimori/index.db");
+    fs::write(&db_path, b"not a valid sqlite database at all!!!").unwrap();
+
+    // Next invocation must auto-rebuild and succeed instead of bricking.
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["find", "survivor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("survivor"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_readonly_workspace_falls_back_to_memory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("ro.rs"), "pub fn read_only_fn() {}\n").unwrap();
+
+    // Make workspace root read-only so `.mimori/` cannot be created on disk.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["find", "read_only_fn"])
+        .output()
+        .unwrap();
+
+    // Restore permissions before asserting so TempDir cleanup always succeeds.
+    let _ = fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755));
+
+    assert!(
+        out.status.success(),
+        "read-only workspace should fall back to in-memory graph; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("read_only_fn"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_clean_all_refuses_symlinked_mimori_dir() {
+    use std::os::unix::fs::symlink;
+
+    let ws = tempdir().unwrap();
+    let victim = tempdir().unwrap();
+    let victim_cache = victim.path().join(".cache");
+    fs::create_dir_all(&victim_cache).unwrap();
+    let victim_file = victim_cache.join("precious.txt");
+    fs::write(&victim_file, "do not delete").unwrap();
+
+    symlink(victim.path(), ws.path().join(".mimori")).unwrap();
+
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(ws.path())
+        .args(["clean", "--all"])
+        .assert()
+        .failure();
+
+    assert!(
+        victim_file.exists(),
+        "clean --all must never follow symlinked .mimori and delete outside files"
+    );
+}
+
+#[test]
+fn test_cli_concurrent_sync_never_returns_zero_symbols() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..8 {
+        fs::write(
+            src.join(format!("m{i}.rs")),
+            format!("pub fn f_{i}() {{ g_{i}(); }}\npub fn g_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let root = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let out = Command::cargo_bin("mimori")
+                    .unwrap()
+                    .current_dir(&root)
+                    .args(["--json", "doctor"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "concurrent doctor failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(parsed["symbols"].as_u64().unwrap(), 16);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+}

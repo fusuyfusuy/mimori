@@ -219,14 +219,14 @@ fn test_cli_debt_nested_ignore_directories() {
 }
 
 #[test]
-fn test_cli_debt_legacy_ponytail_and_mimodebt_fallback() {
+fn test_cli_debt_drops_legacy_ponytail_and_keeps_mimodebt_fallback() {
     let dir = tempdir().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
 
     fs::write(
         src.join("legacy.rs"),
-        "// ponytail: legacy debt <- cap 1 -> trigger 1\n",
+        "// ponytail: legacy debt <- cap 1 -> trigger 1\nlet raw = r#\"// mimodept: fake raw <- cap -> trigger\"#;\n",
     )
     .unwrap();
     fs::write(
@@ -240,11 +240,10 @@ fn test_cli_debt_legacy_ponytail_and_mimodebt_fallback() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains(
-            "DEBT_SCAN: 2 markers found across 2 files:",
+            "DEBT_SCAN: 1 markers found across 1 files:",
         ))
-        .stdout(predicate::str::contains(
-            "src/legacy.rs:1: legacy debt <- cap 1 -> trigger 1",
-        ))
+        .stdout(predicate::str::contains("legacy debt").not())
+        .stdout(predicate::str::contains("fake raw").not())
         .stdout(predicate::str::contains(
             "src/typo.rs:1: typo debt <- cap 2 -> trigger 2",
         ));

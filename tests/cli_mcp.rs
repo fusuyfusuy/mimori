@@ -33,6 +33,12 @@ impl McpClient {
         stdin.flush().unwrap();
     }
 
+    fn send_raw(&mut self, bytes: &[u8]) {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        stdin.write_all(bytes).unwrap();
+        stdin.flush().unwrap();
+    }
+
     fn recv(&mut self) -> serde_json::Value {
         let mut line = String::new();
         self.reader
@@ -102,7 +108,7 @@ fn test_mcp_tools_list() {
     let resp = client.recv();
     assert_eq!(resp["id"], 1);
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 11);
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -117,6 +123,8 @@ fn test_mcp_tools_list() {
             "mimori_memory",
             "mimori_debt",
             "mimori_diff",
+            "mimori_missing",
+            "mimori_doctor",
         ]
     );
 
@@ -422,7 +430,7 @@ fn test_mcp_error_handling() {
     assert_eq!(resp["id"], 23);
     assert_eq!(resp["error"]["code"], -32602);
 
-    // 5. Absent arguments -> -32602
+    // 5. Absent arguments defaults to {} per MCP spec (succeeds for zero-required-param tools, -32602 for required-param tools)
     client.send(&json!({
         "jsonrpc": "2.0",
         "id": 24,
@@ -433,6 +441,18 @@ fn test_mcp_error_handling() {
     }));
     let resp = client.recv();
     assert_eq!(resp["id"], 24);
+    assert_eq!(resp["result"]["isError"], false);
+
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 240,
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_slice"
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], 240);
     assert_eq!(resp["error"]["code"], -32602);
 
     // 6. Arguments as string -> -32602
@@ -1037,4 +1057,220 @@ fn test_mcp_memory_and_debt_tools() {
     let text6 = resp6["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text6.contains("DEBT_CHECK:"));
     assert!(text6.contains("exit 0."));
+}
+
+#[test]
+fn test_mcp_missing_and_doctor() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/auth.rs"),
+        "pub fn authed() { check_auth(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/open.rs"),
+        "pub fn unauthed() { println!(\"open\"); }\n",
+    )
+    .unwrap();
+
+    let mut client = McpClient::spawn(dir.path());
+
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "missing_1",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_missing",
+            "arguments": { "pattern": "check_auth", "scope": "src" }
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], "missing_1");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("src/open.rs"));
+    assert!(!text.contains("src/auth.rs"));
+
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "doctor_1",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_doctor",
+            "arguments": { "limit": 5 }
+        }
+    }));
+    let resp2 = client.recv();
+    assert_eq!(resp2["id"], "doctor_1");
+    let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text2.contains("# Doctor: repository health"));
+    assert!(text2.contains("- Files: 2"));
+}
+
+#[test]
+fn test_mcp_content_length_header_order_and_oversized_fail_fast() {
+    let dir = tempdir().unwrap();
+
+    // 1. Content-Type before Content-Length must succeed without spurious -32700.
+    let mut client = McpClient::spawn(dir.path());
+    let payload = r#"{"jsonrpc":"2.0","id":"framed_1","method":"ping"}"#;
+    let frame = format!(
+        "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    client.send_raw(frame.as_bytes());
+    let resp = client.recv();
+    assert_eq!(resp["id"], "framed_1");
+    assert_eq!(resp["result"], json!({}));
+
+    // 2. Huge Content-Length must fail fast with error and terminate instead of hanging.
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin("mimori"))
+        .arg("mcp")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin
+            .write_all(b"Content-Length: 999999999\r\n\r\n")
+            .unwrap();
+        stdin.flush().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err_resp: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(err_resp["error"]["code"], -32600);
+}
+
+#[test]
+fn test_mcp_null_id_and_invalid_utf8_rejected() {
+    let dir = tempdir().unwrap();
+    let mut client = McpClient::spawn(dir.path());
+
+    // Explicit `"id": null` is an invalid MCP request ID (-32600).
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "method": "ping"
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["error"]["code"], -32600);
+
+    // Invalid UTF-8 bytes emit -32700 and do not crash the server.
+    client.send_raw(&[0xff, 0xfe, b'\n']);
+    let resp2 = client.recv();
+    assert_eq!(resp2["error"]["code"], -32700);
+
+    // Subsequent valid request still works.
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "after_bad_utf8",
+        "method": "ping"
+    }));
+    let resp3 = client.recv();
+    assert_eq!(resp3["id"], "after_bad_utf8");
+    assert_eq!(resp3["result"], json!({}));
+}
+
+#[test]
+fn test_mcp_missing_rejects_root_scope_and_includes_defines() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+    fs::write(dir.path().join("src/b.rs"), "fn internal() {}\n").unwrap();
+
+    let mut client = McpClient::spawn(dir.path());
+
+    // scope: "/" must be rejected as InvalidParams (-32602), never sweep whole repo.
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "bad_scope",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_missing",
+            "arguments": { "pattern": "check_auth", "scope": "/" }
+        }
+    }));
+    let err_resp = client.recv();
+    assert_eq!(err_resp["id"], "bad_scope");
+    assert_eq!(err_resp["error"]["code"], -32602);
+
+    // Valid call with `defines` echoes `defines` in header and filters correctly.
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "with_defines",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_missing",
+            "arguments": { "pattern": "check_auth", "scope": "src", "defines": "pub fn" }
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], "with_defines");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("defines: `pub fn`"), "header was: {}", text);
+    assert!(text.contains("src/a.rs"));
+    assert!(!text.contains("src/b.rs"));
+}
+
+#[test]
+fn test_mcp_memory_add_and_subdir_workspace_no_nested_cache() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/core.rs"), "pub fn entry() {}\n").unwrap();
+
+    let mut client = McpClient::spawn(dir.path());
+
+    // Add a scoped gotcha via mimori_memory(action="add").
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "mem_add",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_memory",
+            "arguments": {
+                "action": "add",
+                "section": "gotchas",
+                "scope": "src/",
+                "sym": "entry",
+                "text": "Keep entry pure and fast."
+            }
+        }
+    }));
+    let resp = client.recv();
+    assert_eq!(resp["id"], "mem_add");
+    assert_ne!(
+        resp["result"]["isError"].as_bool(),
+        Some(true),
+        "unexpected error: {:?}",
+        resp
+    );
+
+    // Slice via plain subdir `workspace_dir: "src"` must reuse session root cache
+    // and inject the scoped memory note without creating `src/.mimori`.
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "slice_sub",
+        "method": "tools/call",
+        "params": {
+            "name": "mimori_slice",
+            "arguments": {
+                "coordinate": "core.rs:entry",
+                "workspace_dir": "src"
+            }
+        }
+    }));
+    let resp2 = client.recv();
+    assert_eq!(resp2["id"], "slice_sub");
+    let text = resp2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("pub fn entry()"));
+    assert!(text.contains("Keep entry pure and fast."));
+    assert!(
+        !dir.path().join("src/.mimori").exists(),
+        "plain subdir workspace_dir must reuse root cache and never create src/.mimori"
+    );
 }

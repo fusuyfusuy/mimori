@@ -23,7 +23,7 @@ async def generate_token(user_id: str) -> str:
     // Slice Python class
     let target_class = format!("{}:AuthManager", file_path.to_str().unwrap());
     let mut cmd1 = Command::cargo_bin("mimori").unwrap();
-    cmd1.arg("slice").arg(&target_class);
+    cmd1.current_dir(dir.path()).arg("slice").arg(&target_class);
     cmd1.assert()
         .success()
         .stdout(predicate::str::contains("class AuthManager"))
@@ -32,7 +32,9 @@ async def generate_token(user_id: str) -> str:
     // Slice Python method inside class
     let target_method = format!("{}:verify_token", file_path.to_str().unwrap());
     let mut cmd2 = Command::cargo_bin("mimori").unwrap();
-    cmd2.arg("slice").arg(&target_method);
+    cmd2.current_dir(dir.path())
+        .arg("slice")
+        .arg(&target_method);
     cmd2.assert()
         .success()
         .stdout(predicate::str::contains(
@@ -45,7 +47,7 @@ async def generate_token(user_id: str) -> str:
     // Slice Python async function
     let target_func = format!("{}:generate_token", file_path.to_str().unwrap());
     let mut cmd3 = Command::cargo_bin("mimori").unwrap();
-    cmd3.arg("slice").arg(&target_func);
+    cmd3.current_dir(dir.path()).arg("slice").arg(&target_func);
     cmd3.assert().success().stdout(predicate::str::contains(
         "async def generate_token(user_id: str) -> str",
     ));
@@ -81,7 +83,7 @@ func (s *Server) Start() error {
     // Slice Go interface
     let target_iface = format!("{}:Handler", file_path.to_str().unwrap());
     let mut cmd1 = Command::cargo_bin("mimori").unwrap();
-    cmd1.arg("slice").arg(&target_iface);
+    cmd1.current_dir(dir.path()).arg("slice").arg(&target_iface);
     cmd1.assert()
         .success()
         .stdout(predicate::str::contains("type Handler interface"))
@@ -90,7 +92,9 @@ func (s *Server) Start() error {
     // Slice Go struct
     let target_struct = format!("{}:Server", file_path.to_str().unwrap());
     let mut cmd2 = Command::cargo_bin("mimori").unwrap();
-    cmd2.arg("slice").arg(&target_struct);
+    cmd2.current_dir(dir.path())
+        .arg("slice")
+        .arg(&target_struct);
     cmd2.assert()
         .success()
         .stdout(predicate::str::contains("type Server struct"))
@@ -99,7 +103,7 @@ func (s *Server) Start() error {
     // Slice Go function
     let target_func = format!("{}:NewServer", file_path.to_str().unwrap());
     let mut cmd3 = Command::cargo_bin("mimori").unwrap();
-    cmd3.arg("slice").arg(&target_func);
+    cmd3.current_dir(dir.path()).arg("slice").arg(&target_func);
     cmd3.assert()
         .success()
         .stdout(predicate::str::contains("func NewServer(port int) *Server"));
@@ -107,7 +111,9 @@ func (s *Server) Start() error {
     // Slice Go method with receiver
     let target_method = format!("{}:Start", file_path.to_str().unwrap());
     let mut cmd4 = Command::cargo_bin("mimori").unwrap();
-    cmd4.arg("slice").arg(&target_method);
+    cmd4.current_dir(dir.path())
+        .arg("slice")
+        .arg(&target_method);
     cmd4.assert()
         .success()
         .stdout(predicate::str::contains("func (s *Server) Start() error"))

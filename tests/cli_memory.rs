@@ -17,7 +17,7 @@ fn test_cli_init_scaffolds_agents_and_mimori() {
 
     assert!(dir.path().join(".mimori").is_dir());
     assert!(dir.path().join(".agents").join("memory.md").is_file());
-    assert!(dir.path().join(".agents").join("decisions.md").is_file());
+    assert!(!dir.path().join(".agents").join("decisions.md").exists());
 
     let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains(".mimori/"));
@@ -83,8 +83,8 @@ fn test_cli_memory_lint_ceiling_breach() {
 
     let mut cmd = Command::cargo_bin("mimori").unwrap();
     cmd.current_dir(dir.path()).arg("memory").arg("lint");
-    cmd.assert().failure().stdout(predicate::str::contains(
-        "MEM_LINT_FAIL: ceiling breached: 32/30 lines; exit 1.",
+    cmd.assert().success().stdout(predicate::str::contains(
+        "MEM_LINT_WARN: debt: 32/30 lines (soft ceiling exceeded); schema: valid; no_strikethrough: ok; exit 0.",
     ));
 }
 
@@ -257,4 +257,111 @@ fn test_cli_memory_lint_asterisk_checkbox_fail() {
         .stdout(predicate::str::contains(
             "completed checkbox '- [x]' forbidden",
         ));
+}
+
+#[test]
+fn test_cli_memory_add_and_safe_resolve() {
+    let dir = tempdir().unwrap();
+    let agents_dir = dir.path().join(".agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+    fs::write(
+        agents_dir.join("memory.md"),
+        "\
+# Project Memory
+
+## KNOWN DEBT (open only — one line per item, delete when done)
+- redis pool one <- 10 max -> shard
+- redis pool two <- 20 max -> shard
+
+## Domain Vocabulary & Gotchas
+",
+    )
+    .unwrap();
+
+    // Add scope+sym anchored gotcha
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "memory",
+            "add",
+            "--section",
+            "gotchas",
+            "--scope",
+            "src/db/",
+            "--sym",
+            "connect",
+            "Keep transactions atomic.",
+        ])
+        .assert()
+        .success();
+
+    let updated = fs::read_to_string(agents_dir.join("memory.md")).unwrap();
+    assert!(updated.contains("@scope: src/db/"));
+    assert!(updated.contains("@sym: connect"));
+    assert!(updated.contains("Keep transactions atomic."));
+
+    // Reject overly short/punctuation-only patterns like "-"
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["memory", "resolve", "-"])
+        .assert()
+        .failure();
+
+    // Reject multi-match without --all
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["memory", "resolve", "redis pool"])
+        .assert()
+        .failure();
+
+    // Both lines still intact
+    let intact = fs::read_to_string(agents_dir.join("memory.md")).unwrap();
+    assert!(intact.contains("redis pool one"));
+    assert!(intact.contains("redis pool two"));
+
+    // Succeed with --all
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["memory", "resolve", "--all", "redis pool"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted 2 lines"));
+}
+
+#[test]
+fn test_cli_debt_sync_preserves_over_30_waivers_and_h1_sections() {
+    let dir = tempdir().unwrap();
+    let agents_dir = dir.path().join(".agents");
+    fs::create_dir_all(&agents_dir).unwrap();
+
+    let mut content = String::from(
+        "# Project Memory\n\n## KNOWN DEBT (open only — one line per item, delete when done)\n",
+    );
+    for i in 0..32 {
+        content.push_str(&format!("- accepted waiver-{i:02} <- reason -> trigger\n"));
+    }
+    content.push_str("\n# Appendix\n- Keep this H1 appendix verbatim.\n");
+    fs::write(agents_dir.join("memory.md"), &content).unwrap();
+
+    Command::cargo_bin("mimori")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["debt", "sync"])
+        .assert()
+        .success();
+
+    let synced = fs::read_to_string(agents_dir.join("memory.md")).unwrap();
+    assert!(
+        synced.contains("waiver-31"),
+        "waiver #32 must never be silently truncated"
+    );
+    assert!(
+        synced.contains("# Appendix"),
+        "trailing H1 section must be preserved"
+    );
+    assert!(synced.contains("Keep this H1 appendix verbatim."));
 }
