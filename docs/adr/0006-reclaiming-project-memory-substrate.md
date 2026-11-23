@@ -1,8 +1,10 @@
 # 6. Reclaiming Project Memory Substrate & Ponytail Debt Engine
 
-- **Status**: Accepted (Amends ADR-0004)
+- **Status**: Amended by [ADR-0007](0007-typed-ast-stratified-ranking-and-jit-memory.md)
 - **Date**: 2026-09-14
 - **Deciders**: Mimori Core Team, Agent Substrate Working Group
+
+> **Amendment Note (ADR-0007)**: Legacy `ponytail:` markers were dropped in favor of Tree-sitter comment AST extraction of `mimodept:` markers; `.agents/decisions.md` scaffolding was retired in favor of indexing `docs/adr/*.md` titles in `mimori dump`; the 30-line debt ceiling was downgraded from a hard CI failure to a non-blocking warning (`MEM_LINT_WARN`/`DEBT_CHECK_WARN`) without truncating waivers; and `@scope:`/`@sym:` JIT memory injection + `mimori memory add` were introduced.
 
 ## Context
 ADR-0004 established `mimori` as a pure code dissection engine by stripping stateful action journaling (`mimori log`), workspace action history (`.mimori/activity.jsonl`), and context snapshot dumping (`mimori dump`). The intention of ADR-0004 was justified: eliminate unbounded file-append mutations, journal rotation logic, and state bloat inside `.mimori/` to respect Unix single-responsibility principles.

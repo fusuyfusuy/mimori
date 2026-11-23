@@ -7,7 +7,10 @@ Autonomous coding agents evaluate declared tool schemas in their environment bef
 By exposing `mimori` as an MCP server with core tools (`mimori_slice`, `mimori_map`, `mimori_find`, `mimori_blast`, `mimori_graph`, and subsequently `mimori_memory` and `mimori_debt`), agents naturally choose structured AST slices and PageRank orientation over brute-force file reads. Furthermore, the persistent MCP daemon maintains a warm in-memory `SymbolGraph` cache across invocations, validating content hashes in <1ms while retaining zero background daemon overhead outside agent sessions.
 
 ## Addendum (2026-09-14, v2.4.0)
-Amended by ADR-0006 to add `mimori_memory` (read, lint, and resolve `.agents/memory.md`) and `mimori_debt` (scan, check, and sync in-code ponytail markers) to the MCP tool registry, giving agents native, non-destructive access to the project memory substrate and debt proof gates.
+Amended by ADR-0006 to add `mimori_memory` and `mimori_debt` to the MCP tool registry, giving agents native, non-destructive access to the project memory substrate and debt gates.
 
 ## Addendum (2026-09-21, v2.4.3)
-Added `mimori_dump` (budget-bounded Turn-0 context snapshot: PageRank map, domain vocabulary and gotchas, active debt) to the registry, and made `numbered` an explicit `mimori_slice` parameter instead of a CLI-only flag. `mimori_map` now treats `scope` as a path filter inside the workspace root resolved from `workspace_dir`; previously `workspace_dir` was also reused as the scope string, which filtered out every symbol.
+Added `mimori_dump` to the registry and made `numbered` an explicit `mimori_slice` parameter.
+
+## Addendum (2026-11-23, ADR-0007)
+Expanded MCP registry to 11 tools (`mimori_slice`, `mimori_dump`, `mimori_map`, `mimori_find`, `mimori_blast`, `mimori_graph`, `mimori_diff`, `mimori_missing`, `mimori_doctor`, `mimori_memory`, `mimori_debt`); added stat-gated LRU graph caching (`ino+size+mtime+ctime` fast check with FNV-1a verification), arbitrary header ordering & bounded Content-Length framing, `mimori_memory(action="add")`, and session-root cache reuse for subdirectory `workspace_dir` scopes.

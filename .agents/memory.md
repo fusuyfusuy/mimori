@@ -1,21 +1,15 @@
 # Project Memory
 
 ## Active Epics & Scale
-- Scale: Baseline architecture initialized.
-- Epic: Whole-Fleet AST Symbol Index & Temporal Churn Analytics (ClickHouse): Export Tree-sitter symbol AST tables across all 116 repos into ClickHouse MergeTree. Enables sub-5ms cross-repo symbol lookups (fleet_find), dead code anti-joins across repositories, and temporal AST mutation churn analysis (predicting regression blast-radii from historical co-mutation git diffs).
+- Mission: Give agents a fast, token-disciplined way to learn the repo they are in (`dump`, `map`, `find`, `slice` + JIT `@scope:`/`@sym:` memory) and trace change impact/blast radii (`blast`, `diff`, `up`/`down`/`uses`, `missing`, `doctor`) — Rust CLI + MCP stdio, 4 languages (Rust, TS/JS, Python, Go), ~20ms warm map, zero daemons.
+- Epic (v3.2.0 shipped): Typed AST symbol flags (`IS_TEST`, `IS_PUBLIC`, `IS_TRAIT_IMPL`, `IS_ATTR_ENTRY`), local receiver-type inference with explicit `blast` honesty warnings, module-stratified public-API map ranking, atomic SQLite cache with stat-gated MCP hot path, and scope-anchored `@scope:`/`@sym:` memory auto-injected into `slice`, `blast`, and `diff`.
 
 ## KNOWN DEBT (open only — one line per item, delete when done)
-# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>
+<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->
 
 ## Domain Vocabulary & Gotchas
-- Symbol: Named code construct (function, struct, method, class, enum, interface, trait, type alias, or top-level variable) declared in source file.
-- Slice: Isolated, token-dense view containing a symbol's exact source body, coordinates, signature, and immediate 1-hop dependencies.
-- Caller: Upstream symbol or function that invokes, references, or depends on a target symbol.
-- Callee: Downstream symbol or function that is invoked or referenced by a target symbol.
-- Blast Radius: Transitive closure of upstream callers and entry points impacted by modification to a target symbol.
-- Map: Hierarchical, ranked structural overview of top-level symbols, modules, and entry points across codebase.
-- Coordinate: Unambiguous path and line identifier targeting a symbol or line range (e.g., `src/auth.rs:login` or `src/auth.rs:#L40-85`).
-- Centrality: Graph-theoretic score measuring symbol's structural importance based on inbound dependency topology (In-Degree PageRank).
-- Gotcha: `.mimori/` is ephemeral cache (gitignored); `.agents/` is living git-tracked domain memory.
-- Gotcha: Mimodept technical debt comments (`# mimodept: <what> <- <ceiling> -> <upgrade_trigger>`) sync deterministically to `.agents/memory.md` with hard 30-item ceiling.
-- Gotcha: Skill spec lives in two tracked copies (`SKILL.md`, `skills/mimori/SKILL.md`) plus the installed copy under `~/configs/agents-config/skills/mimori/`; editing one silently drifts the others.
+- [@scope: src/storage/*] Content-hash invariant: `.mimori/index.db` invalidation is strictly FNV-1a content-hash driven (`PARSER_VERSION` bumps auto-rebuild); `quick_stat_fingerprint` uses POSIX `ino+size+mtime+ctime` as a warm-MCP fast path only.
+- [@scope: src/graph/*] Edge precision invariant: Cross-file untyped `.method()` calls never resolve via unique-global; `blast` emits `unverified_member_calls` warning whenever unresolved member call sites share a method leaf name.
+- [@scope: src/memory/*] Memory substrate invariant: `.mimori/` is ephemeral cache (gitignored); `.agents/memory.md` is git-tracked domain memory with soft 30-line debt ceiling (warn-only in CI) and Tree-sitter AST comment debt extraction.
+- [@scope: src/workspace/*] Confinement invariant: Every CLI, MCP, manifest, and `--scope` path must pass lexical normalization + `confine_path` before touching disk (eliminates symlink escapes and `../` existence oracles).
+- [@scope: SKILL.md, @scope: skills/mimori/SKILL.md] Dual-copy skill invariant: Keep `SKILL.md`, `skills/mimori/SKILL.md`, and `~/configs/agents-config/skills/mimori/SKILL.md` byte-identical when CLI/MCP contracts change.
