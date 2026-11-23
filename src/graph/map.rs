@@ -1,15 +1,14 @@
+use crate::graph::blast::{is_program_entry, is_test_symbol};
 use crate::graph::SymbolGraph;
-use crate::model::Coordinate;
+use crate::model::{Coordinate, Symbol, SymbolKind};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// A symbol as it appears in a map.
-///
-/// Deliberately not `Symbol`: that type carries `body`, so `map --json` used to
-/// serialize the entire source of the repository -- 2.0x the bytes it indexed.
-/// Source is what `slice` is for.
+/// Default symbol cap when `--limit` is omitted (`0` means unlimited).
+pub const DEFAULT_MAP_LIMIT: usize = 30;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapSymbol {
     pub name: String,
@@ -33,25 +32,20 @@ pub struct MapResult {
     pub focus: Option<String>,
     pub modules: Vec<ModuleMap>,
     pub total_symbols: usize,
-    /// Set when `--limit` dropped lower-ranked symbols from the output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated_from: Option<usize>,
-    /// Edge-resolution accounting (P0-2): what the resolver kept vs dropped.
     #[serde(default)]
     pub resolved: usize,
     #[serde(default)]
     pub ambiguous_dropped: usize,
     #[serde(default)]
     pub unresolved: usize,
-    /// Calls skipped as external imports (never resolved locally).
     #[serde(default)]
     pub external: usize,
-    /// PageRank convergence (P1-1): iterations run + whether L1 hit 1e-6.
     #[serde(default)]
     pub pagerank_iters: usize,
     #[serde(default)]
     pub pagerank_converged: bool,
-    /// Coverage honesty (P1-4): indexed vs crawled files + skipped extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_files: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,7 +67,7 @@ impl MapResult {
         }
         out.push_str(&format!("*Total Symbols*: {}", self.total_symbols));
         if let Some(total) = self.truncated_from {
-            out.push_str(&format!(" of {} (--limit)", total));
+            out.push_str(&format!(" of {} (--limit; pass --limit 0 for all)", total));
         }
         out.push_str(&format!(
             "\n*Edges*: {} resolved, {} ambiguous-dropped, {} unresolved, {} external | *PageRank*: {} iters, {}",
@@ -107,10 +101,10 @@ impl MapResult {
         }
 
         for module in &self.modules {
-            out.push_str(&format!("### 📁 `{}`\n", module.file));
+            out.push_str(&format!("### `{}`\n", module.file));
             for s in &module.symbols {
                 out.push_str(&format!(
-                    "- 🔹 **`{}`** ({}) [rank: {:.4}] → L{}-L{}\n",
+                    "- **`{}`** ({}) [rank: {:.4}] -> L{}-L{}\n",
                     s.name, s.kind, s.centrality, s.start_line, s.end_line
                 ));
                 if !s.signature.is_empty() {
@@ -122,6 +116,36 @@ impl MapResult {
 
         out
     }
+
+    /// Compact M2M map format shared with Turn-0 `dump`.
+    pub fn format_compact_markdown(&self) -> String {
+        let mut out = String::new();
+        if let (Some(idx), Some(crawled)) = (self.indexed_files, self.crawled_files) {
+            let pct = idx * 100 / crawled.max(1);
+            out.push_str(&format!(
+                "_Coverage: {idx}/{crawled} files ({pct}%) | Edges: {} resolved, {} external, {} unresolved_\n\n",
+                self.resolved, self.external, self.unresolved
+            ));
+        }
+        if self.modules.is_empty() {
+            out.push_str("No indexed symbols found in workspace.\n\n");
+            return out;
+        }
+        for module in &self.modules {
+            out.push_str(&format!("### `{}`\n", module.file));
+            for s in &module.symbols {
+                out.push_str(&format!(
+                    "- **`{}`** ({}) [rank: {:.4}] -> L{}-L{}\n",
+                    s.name, s.kind, s.centrality, s.start_line, s.end_line
+                ));
+                if !s.signature.is_empty() {
+                    out.push_str(&format!("    `{}`\n", s.signature));
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
 }
 
 pub fn generate_map(
@@ -131,6 +155,103 @@ pub fn generate_map(
     limit: Option<usize>,
 ) -> MapResult {
     generate_map_with_scores(graph, None, scope, focus, limit)
+}
+
+fn scope_targets_tests(scope: Option<&str>) -> bool {
+    let Some(sc) = scope else {
+        return false;
+    };
+    sc.split('/').any(|seg| {
+        matches!(seg, "tests" | "test" | "__tests__" | "spec")
+            || seg.ends_with("_test.go")
+            || seg.ends_with("_test.py")
+            || seg.contains(".test.")
+            || seg.contains(".spec.")
+    })
+}
+
+/// Composite orientation rank used when unseeded/unfocused: elevates program
+/// entry points and public API surfaces while demoting private 1–5 LOC leaf helpers.
+fn orientation_score(graph: &SymbolGraph, idx: usize, sym: &Symbol, pr_score: f64) -> f64 {
+    let mut weight = 1.0;
+    if is_program_entry(sym) {
+        weight *= 2.5;
+    } else if sym.is_public() {
+        weight *= 1.35;
+    }
+    if matches!(
+        sym.kind,
+        SymbolKind::Struct | SymbolKind::Class | SymbolKind::Trait | SymbolKind::Interface
+    ) {
+        weight *= 1.15;
+    }
+    let span = sym.end_line.saturating_sub(sym.start_line) + 1;
+    let out_deg = graph.callees_map.get(&idx).map_or(0, Vec::len);
+    if !sym.is_public() && !is_program_entry(sym) && span <= 5 && out_deg == 0 {
+        weight *= 0.25;
+    }
+    pr_score * weight
+}
+
+/// Coarse module bucket (first 2 path segments for nested files, or file path for shallow files)
+/// used for round-robin stratified coverage across subsystems.
+fn module_bucket(file: &str) -> String {
+    let parts: Vec<&str> = file.split('/').collect();
+    if parts.len() >= 3 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        file.to_string()
+    }
+}
+
+type RankedCandidate<'a> = (usize, &'a Symbol, f64, f64);
+
+fn stratify_selection<'a>(
+    candidates: Vec<RankedCandidate<'a>>,
+    limit: usize,
+) -> Vec<(usize, &'a Symbol, f64)> {
+    let mut buckets: BTreeMap<String, Vec<RankedCandidate<'a>>> = BTreeMap::new();
+    for item in candidates {
+        buckets
+            .entry(module_bucket(&item.1.file))
+            .or_default()
+            .push(item);
+    }
+
+    let mut ranked_buckets: Vec<(f64, String, Vec<RankedCandidate<'a>>)> = buckets
+        .into_iter()
+        .map(|(k, mut list)| {
+            list.sort_by(|(_, a, _, ra), (_, b, _, rb)| {
+                rb.total_cmp(ra)
+                    .then_with(|| a.file.cmp(&b.file))
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            let peak = list.first().map(|x| x.3).unwrap_or(0.0);
+            (peak, k, list)
+        })
+        .collect();
+    ranked_buckets.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut picked: Vec<(usize, &'a Symbol, f64)> = Vec::with_capacity(limit);
+    let mut depth = 0usize;
+    while picked.len() < limit {
+        let mut progressed = false;
+        for (_, _, list) in &ranked_buckets {
+            if let Some(&(idx, sym, pr, _)) = list.get(depth) {
+                picked.push((idx, sym, pr));
+                progressed = true;
+                if picked.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+        depth += 1;
+    }
+    picked
 }
 
 pub fn generate_map_with_scores(
@@ -150,7 +271,7 @@ pub fn generate_map_with_scores(
             .unwrap_or(graph.symbols[idx].centrality)
     };
 
-    let mut selected: Vec<(usize, &crate::model::Symbol, f64)> = graph
+    let scoped: Vec<(usize, &Symbol, f64)> = graph
         .symbols
         .iter()
         .enumerate()
@@ -161,21 +282,67 @@ pub fn generate_map_with_scores(
         .map(|(idx, s)| (idx, s, score_of(idx)))
         .collect();
 
-    selected.sort_by(|(_, a, sa), (_, b, sb)| {
-        sb.total_cmp(sa)
+    let exclude_tests = personalized.is_none() && !scope_targets_tests(clean_scope);
+    let filtered: Vec<(usize, &Symbol, f64)> = if exclude_tests {
+        let prod: Vec<_> = scoped
+            .iter()
+            .copied()
+            .filter(|(_, s, _)| !is_test_symbol(s))
+            .collect();
+        if prod.is_empty() {
+            scoped
+        } else {
+            prod
+        }
+    } else {
+        scoped
+    };
+
+    let total_symbols = filtered.len();
+    let effective_limit = match limit {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_MAP_LIMIT),
+    };
+
+    let mut ranked: Vec<(usize, &Symbol, f64, f64)> = filtered
+        .into_iter()
+        .map(|(idx, s, pr)| {
+            let r = if personalized.is_some() {
+                pr
+            } else {
+                orientation_score(graph, idx, s, pr)
+            };
+            (idx, s, pr, r)
+        })
+        .collect();
+
+    ranked.sort_by(|(_, a, _, ra), (_, b, _, rb)| {
+        rb.total_cmp(ra)
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.start_line.cmp(&b.start_line))
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    let total_symbols = selected.len();
-    let truncated_from = match limit {
-        Some(n) if n < total_symbols => {
-            selected.truncate(n);
-            Some(total_symbols)
-        }
-        _ => None,
-    };
+    let (selected, truncated_from): (Vec<(usize, &Symbol, f64)>, Option<usize>) =
+        match effective_limit {
+            Some(n) if n < total_symbols => {
+                let picked = if personalized.is_none() {
+                    stratify_selection(ranked, n)
+                } else {
+                    ranked
+                        .into_iter()
+                        .take(n)
+                        .map(|(i, s, pr, _)| (i, s, pr))
+                        .collect()
+                };
+                (picked, Some(total_symbols))
+            }
+            _ => (
+                ranked.into_iter().map(|(i, s, pr, _)| (i, s, pr)).collect(),
+                None,
+            ),
+        };
 
     let mut file_groups: BTreeMap<String, Vec<MapSymbol>> = BTreeMap::new();
     for &(_, s, centrality) in &selected {
@@ -206,7 +373,6 @@ pub fn generate_map_with_scores(
         })
         .collect();
 
-    // Rank modules by their strongest symbol with deterministic file tie-break.
     modules.sort_by(|a, b| {
         let max_a = a.symbols.first().map(|s| s.centrality).unwrap_or(0.0);
         let max_b = b.symbols.first().map(|s| s.centrality).unwrap_or(0.0);
@@ -236,21 +402,35 @@ pub fn generate_map_with_scores(
     }
 }
 
-/// Scope matches on path components, so `--scope src` does not also select
-/// `foo/src2/`.
+/// Strict path-component prefix match (no mid-path or basename over-matching).
 fn in_scope(file: &str, scope: &str) -> bool {
-    let scope = scope.trim_start_matches("./").trim_end_matches('/');
+    let scope = scope
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .replace('\\', "/");
     if scope.is_empty() || scope == "." {
         return true;
     }
     let file = file.trim_start_matches("./");
     file == scope
-        || (file.starts_with(scope) && file.as_bytes().get(scope.len()) == Some(&b'/'))
-        || file.split('/').any(|c| c == scope)
+        || (file.len() > scope.len()
+            && file.starts_with(&scope)
+            && file.as_bytes()[scope.len()] == b'/')
 }
 
-/// Compute personalized PageRank scores without cloning or mutating `SymbolGraph`.
-/// Fails closed if `focus` is specified and resolves to zero symbols.
+/// Validate a map `--scope` parameter against workspace root before filtering.
+pub fn validate_map_scope(root: &Path, scope: Option<&str>) -> Result<Option<String>> {
+    match scope {
+        None => Ok(None),
+        Some(raw) => {
+            let parsed = crate::workspace::walker::WorkspaceScope::parse(root, raw, false)?;
+            Ok((!parsed.rel_prefix.is_empty()).then_some(parsed.rel_prefix))
+        }
+    }
+}
+
+/// Compute personalized PageRank scores without cloning `SymbolGraph`.
+/// Fails closed if `focus` is missing or ambiguous.
 pub fn compute_personalized_scores(
     graph: &SymbolGraph,
     focus: Option<&str>,
@@ -261,14 +441,18 @@ pub fn compute_personalized_scores(
 
     if let Some(target) = focus {
         let coord = Coordinate::parse(target)?.normalize_against(cwd);
-        let resolved = graph.resolve_all(&coord);
-        if resolved.is_empty() {
-            anyhow::bail!("{}", graph.format_not_found_error(&coord));
-        }
-        indices.extend(resolved);
+        let idx = graph.resolve_strict(&coord, "map --focus")?;
+        indices.push(idx);
     }
     if let Some(term) = seed {
-        indices.extend(graph.seed_indices(term));
+        let seeded = graph.seed_indices(term);
+        if seeded.is_empty() {
+            eprintln!(
+                "Warning: --seed '{}' matched 0 symbols; using default ranking.",
+                term
+            );
+        }
+        indices.extend(seeded);
     }
 
     indices.sort_unstable();
@@ -287,8 +471,6 @@ pub fn compute_personalized_scores(
     )))
 }
 
-/// Apply `--focus` (personalized PageRank around a symbol) and/or `--seed`
-/// (bias toward symbols matching a term) to the ranking.
 pub fn personalize_map(
     graph: &mut SymbolGraph,
     focus: Option<&str>,
@@ -310,17 +492,14 @@ mod tests {
     use super::*;
     use crate::model::{Symbol, SymbolKind};
 
-    #[test]
-    fn map_header_reports_resolution_convergence_and_coverage() {
-        // P0-2/P1-1/P1-4: the header discloses what the resolver dropped,
-        // the pagerank exit, and the indexed-file ratio.
-        let mut g = SymbolGraph::new(vec![Symbol {
-            name: "a".into(),
+    fn make_sym(file: &str, name: &str) -> Symbol {
+        Symbol {
+            name: name.into(),
             kind: SymbolKind::Function,
-            file: "src/a.rs".into(),
+            file: file.into(),
             start_line: 1,
-            end_line: 1,
-            signature: String::new(),
+            end_line: 10,
+            signature: format!("pub fn {name}()"),
             body: String::new(),
             centrality: 0.0,
             calls: vec![],
@@ -328,7 +507,13 @@ mod tests {
             call_counts: Default::default(),
             member_calls: vec![],
             external_imports: crate::model::symbol::empty_external_imports(),
-        }]);
+            flags: crate::model::symbol_flags::IS_PUBLIC,
+        }
+    }
+
+    #[test]
+    fn map_header_reports_resolution_convergence_and_coverage() {
+        let mut g = SymbolGraph::new(vec![make_sym("src/a.rs", "a")]);
         g.coverage = Some(crate::graph::CoverageStats {
             indexed_files: 1,
             crawled_files: 4,
@@ -340,5 +525,32 @@ mod tests {
         assert!(md.contains("PageRank"), "got: {md}");
         assert!(md.contains("1/4 files indexed"), "got: {md}");
         assert!(md.contains("md×3"), "got: {md}");
+    }
+
+    #[test]
+    fn map_defaults_to_30_and_stratifies_across_modules() {
+        let mut syms = Vec::new();
+        for i in 0..40 {
+            syms.push(make_sym("src/heavy/mod.rs", &format!("heavy_{i}")));
+        }
+        syms.push(make_sym("src/other/entry.rs", "other_entry"));
+        let g = SymbolGraph::new(syms);
+        let map = generate_map(&g, None, None, None);
+        assert_eq!(map.total_symbols, DEFAULT_MAP_LIMIT);
+        assert_eq!(map.truncated_from, Some(41));
+        assert!(
+            map.modules.iter().any(|m| m.file == "src/other/entry.rs"),
+            "stratification must keep src/other/entry.rs visible"
+        );
+        let all = generate_map(&g, None, None, Some(0));
+        assert_eq!(all.total_symbols, 41);
+        assert_eq!(all.truncated_from, None);
+    }
+
+    #[test]
+    fn in_scope_does_not_overmatch_basenames_in_other_dirs() {
+        assert!(in_scope("src/graph/mod.rs", "src/graph"));
+        assert!(!in_scope("src/graph/mod.rs", "mod.rs"));
+        assert!(!in_scope("src/graph_extra/mod.rs", "src/graph"));
     }
 }

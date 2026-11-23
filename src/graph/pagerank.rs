@@ -28,7 +28,7 @@ pub fn compute_in_degree_pagerank(
 }
 
 /// Weighted variant: `edge_weights[(u, v)]` is the sublinear multiplicity
-/// weight of the u→v edge; missing entries weigh 1.0 (unweighted legacy).
+/// weight of the u->v edge; missing entries weigh 1.0.
 pub fn compute_weighted_pagerank(
     symbols: &mut [Symbol],
     callers_map: &HashMap<usize, Vec<usize>>,
@@ -49,9 +49,7 @@ pub fn compute_weighted_pagerank(
     stats
 }
 
-/// Score-decoupled Weighted PageRank over a flat CSR transition matrix:
-/// returns `(scores, stats)` without mutating `symbols` so personalized MCP
-/// queries (`--focus` / `--seed`) never have to clone `SymbolGraph`.
+/// Score-decoupled Weighted PageRank over a flat CSR transition matrix.
 pub fn compute_pagerank_scores(
     symbols: &[Symbol],
     callers_map: &HashMap<usize, Vec<usize>>,
@@ -120,7 +118,6 @@ pub fn compute_pagerank_scores(
 
     let edge_w = |u: usize, v: usize| -> f64 { edge_weights.get(&(u, v)).copied().unwrap_or(1.0) };
 
-    // Weighted out-mass per node; unweighted out-degree when no weights.
     let out_weight: Vec<f64> = (0..n)
         .map(|u| match callees_map.get(&u) {
             Some(callees) if !edge_weights.is_empty() => {
@@ -131,10 +128,8 @@ pub fn compute_pagerank_scores(
         })
         .collect();
 
-    // Test callers transfer only `TEST_EDGE_WEIGHT` of their damped walk mass
-    // along outbound call edges; the remaining `(1 - TEST_EDGE_WEIGHT)` returns
-    // to the teleportation distribution so test-only callees are not inflated
-    // and total probability mass stays strictly 1.0 at every iteration.
+    // Test callers retain only `TEST_EDGE_WEIGHT` of their damped walk mass
+    // along outbound call edges; the remainder teleports back to `personalization`.
     let edge_retention = |u: usize| -> f64 {
         if is_test[u] {
             crate::graph::TEST_EDGE_WEIGHT
@@ -143,8 +138,6 @@ pub fn compute_pagerank_scores(
         }
     };
 
-    // Contiguous CSR representation of incoming transitions `(u, trans_prob)`
-    // for cache-local power iteration (2 allocations instead of `V` Vecs).
     let total_edges: usize = callers_map.values().map(|c| c.len()).sum();
     let mut csr_offsets: Vec<usize> = Vec::with_capacity(n + 1);
     let mut csr_edges: Vec<(u32, f64)> = Vec::with_capacity(total_edges);
@@ -162,21 +155,15 @@ pub fn compute_pagerank_scores(
         csr_offsets.push(csr_edges.len());
     }
 
-    // Precompute per-node teleport leak weight: 1.0 for dangling nodes,
-    // `(1 - TEST_EDGE_WEIGHT)` for non-dangling test nodes, 0.0 otherwise.
-    let leak_factor: Vec<f64> = (0..n)
-        .map(|u| {
-            if out_weight[u] == 0.0 {
+    let leak_nodes: Vec<(usize, f64)> = (0..n)
+        .filter_map(|u| {
+            let f = if out_weight[u] == 0.0 {
                 1.0
             } else {
                 1.0 - edge_retention(u)
-            }
+            };
+            (f > 0.0).then_some((u, f))
         })
-        .collect();
-    let leak_nodes: Vec<(usize, f64)> = leak_factor
-        .into_iter()
-        .enumerate()
-        .filter(|&(_, f)| f > 0.0)
         .collect();
 
     let mut stats = PagerankStats {
@@ -193,7 +180,6 @@ pub fn compute_pagerank_scores(
             for &(u, trans_prob) in &csr_edges[start..end] {
                 in_sum += scores[u as usize] * trans_prob;
             }
-
             next_scores[v] = (1.0 - damping) * personalization[v]
                 + damping * (in_sum + leaked_sum * personalization[v]);
         }

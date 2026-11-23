@@ -1,9 +1,9 @@
 use crate::graph::SymbolGraph;
-use crate::model::Coordinate;
-use crate::model::Symbol;
-use anyhow::{bail, Result};
+use crate::model::{Coordinate, Symbol, SymbolKind};
+use crate::workspace::walker::MAX_INDEX_FILE_BYTES;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
@@ -16,13 +16,8 @@ pub struct BlastNode {
     pub depth: usize,
     pub is_entry_point: bool,
     pub is_test: bool,
-    /// Set for downstream traversals when the node calls nothing tracked.
-    /// Upstream traversals leave it false and use `is_entry_point` instead.
     #[serde(default)]
     pub is_sink: bool,
-    /// Weakest tier: reached via a non-call mention (property read, type
-    /// ref, arg/template identifier), not a call edge. Never traversed
-    /// further, never an entry point.
     #[serde(default)]
     pub is_value_use: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -36,17 +31,19 @@ pub struct BlastResult {
     pub affected: Vec<BlastNode>,
     pub entry_points: Vec<String>,
     pub test_suites: Vec<String>,
-    /// `up` (callers) or `down` (callees). Defaults to `up` so cached JSON
-    /// without the key still loads.
     #[serde(default = "default_blast_direction")]
     pub direction: String,
-    /// Direct mentioners of the target (upstream only): value uses that no
-    /// call edge reaches. Call edge wins on overlap — anything already in
-    /// `affected` is excluded here.
     #[serde(default)]
     pub value_uses: Vec<BlastNode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub literal_test_mentions: Vec<String>,
+    /// Honesty warning emitted when querying a method whose leaf name has
+    /// unresolved cross-file untyped `.method()` call sites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_member_calls: Option<String>,
+    /// JIT scoped memory notes anchored to the target file or symbol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_notes: Vec<String>,
 }
 
 fn default_blast_direction() -> String {
@@ -68,6 +65,19 @@ impl BlastResult {
             self.affected.len()
         ));
         out.push_str(&format!("{}\n\n", super::COUNT_LEGEND));
+
+        if let Some(warn) = &self.unverified_member_calls {
+            out.push_str(&format!("> {}\n\n", warn));
+        }
+
+        if !self.memory_notes.is_empty() {
+            out.push_str("### Scoped Memory\n");
+            for note in &self.memory_notes {
+                out.push_str(&format!("- {}\n", note));
+            }
+            out.push('\n');
+        }
+
         if self.affected.is_empty() && self.value_uses.is_empty() {
             if self.direction == "down" {
                 out.push_str("No downstream callees reached. This symbol is a leaf or calls nothing tracked.\n");
@@ -81,26 +91,26 @@ impl BlastResult {
 
         if !self.entry_points.is_empty() {
             if self.direction == "down" {
-                out.push_str("### 🛑 Boundary Sinks\n");
+                out.push_str("### Boundary Sinks\n");
             } else {
-                out.push_str("### 🚪 Affected Entry Points\n");
+                out.push_str("### Affected Entry Points\n");
             }
             for ep in &self.entry_points {
-                out.push_str(&format!("- 🎯 `{}`\n", ep));
+                out.push_str(&format!("- `{}`\n", ep));
             }
             out.push('\n');
         }
 
         if !self.test_suites.is_empty() {
-            out.push_str("### 🧪 Affected Test Suites\n");
+            out.push_str("### Affected Test Suites\n");
             for ts in &self.test_suites {
-                out.push_str(&format!("- 🧪 `{}`\n", ts));
+                out.push_str(&format!("- `{}`\n", ts));
             }
             out.push('\n');
         }
 
         if !self.affected.is_empty() {
-            out.push_str("### 🌊 Transitive Call Tree\n");
+            out.push_str("### Transitive Call Tree\n");
             for node in &self.affected {
                 let indent = "  ".repeat(node.depth);
                 let tag = if node.is_entry_point {
@@ -120,7 +130,7 @@ impl BlastResult {
                     format!(" [calls @ {}]", formatted.join(", "))
                 };
                 out.push_str(&format!(
-                    "{}- (d={}) **`{}`** ({}) → `{}`{}{}\n",
+                    "{}- (d={}) **`{}`** ({}) -> `{}`{}{}\n",
                     indent, node.depth, node.name, node.kind, node.coordinate, call_at, tag
                 ));
             }
@@ -128,10 +138,10 @@ impl BlastResult {
         out.push('\n');
 
         if !self.value_uses.is_empty() {
-            out.push_str("### 📎 Value Uses (mentions — weakest tier, not traversed)\n");
+            out.push_str("### Value Uses (mentions — weakest tier, not traversed)\n");
             for node in &self.value_uses {
                 out.push_str(&format!(
-                    "- **`{}`** ({}) → `{}` [Value Use]\n",
+                    "- **`{}`** ({}) -> `{}` [Value Use]\n",
                     node.name, node.kind, node.coordinate
                 ));
             }
@@ -139,14 +149,29 @@ impl BlastResult {
         }
 
         if !self.literal_test_mentions.is_empty() {
-            out.push_str("### 🔍 Literal / Source-Inspection Test Mentions\n");
+            out.push_str("### Literal / Source-Inspection Test Mentions\n");
             for m in &self.literal_test_mentions {
-                out.push_str(&format!("- 🔍 `{}`\n", m));
+                out.push_str(&format!("- `{}`\n", m));
             }
             out.push('\n');
         }
 
         out
+    }
+
+    /// Files touched by this blast result (for scoping `--with-sinks` sweeps).
+    pub fn cone_files(&self, target_file: Option<&str>) -> HashSet<String> {
+        let mut files = HashSet::new();
+        if let Some(f) = target_file {
+            files.insert(f.to_string());
+        }
+        for n in &self.affected {
+            files.insert(n.file.clone());
+        }
+        for n in &self.value_uses {
+            files.insert(n.file.clone());
+        }
+        files
     }
 }
 
@@ -158,12 +183,6 @@ pub fn calculate_blast_radius(
     traverse(graph, coord, depth_limit, Traversal::Upstream)
 }
 
-/// Transitive downstream impact: everything `target` calls, directly or
-/// transitively, up to `depth_limit`. Answers "is this safe to delete / what
-/// does this pull in?" — the mirror of `calculate_blast_radius`.
-///
-/// `entry_points` here reports reached *sinks* (symbols with no tracked
-/// callees) so callers can still eyeball the boundary of the cone.
 pub fn calculate_downstream_blast(
     graph: &SymbolGraph,
     coord: &Coordinate,
@@ -181,24 +200,25 @@ enum Traversal {
 const GENERIC_LEAF_NAMES: &[&str] = &[
     "new", "from", "default", "into", "try_from", "try_into", "with", "drop", "next", "read",
     "write", "open", "close", "load", "save", "init", "build", "parse", "run", "get", "set", "len",
-    "is_empty", "clone", "fmt", "eq", "cmp", "hash", "deref", "index", "add", "sub",
+    "is_empty", "clone", "fmt", "eq", "cmp", "hash", "deref", "index", "add", "sub", "main",
+    "test", "tests", "error", "result", "value", "data", "item", "name", "path", "file", "line",
+    "args", "root", "node", "state", "count", "check", "start", "stop",
 ];
 
-fn is_generic_leaf_ident(leaf: &str, full_name: &str) -> bool {
-    let is_qualified = full_name.contains("::") || full_name.contains('.');
-    is_qualified && (leaf.len() < 4 || GENERIC_LEAF_NAMES.contains(&leaf))
+fn is_generic_leaf_ident(leaf: &str) -> bool {
+    leaf.len() < 4 || GENERIC_LEAF_NAMES.contains(&leaf)
 }
 
 struct FileLineCache<'a> {
     root: Option<&'a Path>,
-    files: std::collections::HashMap<&'a str, Vec<String>>,
+    files: HashMap<&'a str, Vec<String>>,
 }
 
 impl<'a> FileLineCache<'a> {
     fn new(root: Option<&'a Path>) -> Self {
         Self {
             root,
-            files: std::collections::HashMap::new(),
+            files: HashMap::new(),
         }
     }
 
@@ -221,6 +241,9 @@ impl<'a> FileLineCache<'a> {
             else {
                 return Vec::new();
             };
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_INDEX_FILE_BYTES) {
+                return Vec::new();
+            }
             std::fs::read_to_string(path)
                 .map(|s| s.lines().map(str::to_string).collect())
                 .unwrap_or_default()
@@ -239,25 +262,22 @@ impl<'a> FileLineCache<'a> {
     }
 }
 
-fn traverse(
-    graph: &SymbolGraph,
-    coord: &Coordinate,
+struct BfsOutput {
+    affected: Vec<BlastNode>,
+    entry_points: Vec<String>,
+    test_suites: Vec<String>,
+    visited: HashSet<usize>,
+}
+
+fn run_bfs<'a>(
+    graph: &'a SymbolGraph,
+    seed_indices: &[usize],
+    exclude_set: &HashSet<usize>,
     depth_limit: usize,
     direction: Traversal,
-) -> Result<BlastResult> {
-    // P0: upstream blasts on a class fold in its constructor's callers, so
-    // `new X(...)` sites seed the transitive cone.
-    let indices = match direction {
-        Traversal::Upstream => graph.resolve_upstream_targets(coord),
-        Traversal::Downstream => graph.resolve_all(coord),
-    };
-    if indices.is_empty() {
-        bail!("Target {}", graph.format_not_found_error(coord));
-    }
-
-    let mut file_cache = FileLineCache::new(graph.root.as_deref());
-
-    let call_target_names: Vec<&str> = indices
+    file_cache: &mut FileLineCache<'a>,
+) -> BfsOutput {
+    let mut call_target_names: Vec<&str> = seed_indices
         .iter()
         .map(|&i| {
             let name = graph.symbols[i].name.as_str();
@@ -265,26 +285,14 @@ fn traverse(
         })
         .filter(|s| !s.is_empty())
         .collect();
-
-    let literal_seed_names: Vec<&str> = indices
-        .iter()
-        .filter_map(|&i| {
-            let full = graph.symbols[i].name.as_str();
-            let leaf = full.rsplit([':', '.']).next().unwrap_or(full);
-            if is_generic_leaf_ident(leaf, full) {
-                None
-            } else {
-                Some(leaf)
-            }
-        })
-        .collect();
+    call_target_names.sort_unstable();
+    call_target_names.dedup();
 
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
-
-    for &idx in &indices {
+    for &idx in seed_indices {
         visited.insert(idx);
-        queue.push_back((idx, 0));
+        queue.push_back((idx, 0usize));
     }
 
     let mut affected = Vec::new();
@@ -297,67 +305,127 @@ fn traverse(
         if curr_depth >= depth_limit {
             continue;
         }
-
         let neighbors = match direction {
             Traversal::Upstream => graph.callers_map.get(&curr_idx),
             Traversal::Downstream => graph.callees_map.get(&curr_idx),
         };
+        let Some(next) = neighbors else {
+            continue;
+        };
 
-        if let Some(next) = neighbors {
-            for &next_idx in next {
-                if !visited.contains(&next_idx) {
-                    visited.insert(next_idx);
-                    let sym = &graph.symbols[next_idx];
-                    let next_depth = curr_depth + 1;
+        for &next_idx in next {
+            let sym = &graph.symbols[next_idx];
+            let (is_ep, is_sk) = match direction {
+                Traversal::Upstream => (is_entry_point(graph, next_idx, sym), false),
+                Traversal::Downstream => (false, is_sink(graph, next_idx)),
+            };
+            let is_test = is_test_symbol(sym);
 
-                    let (is_ep, is_sk) = match direction {
-                        Traversal::Upstream => (is_entry_point(graph, next_idx, sym), false),
-                        Traversal::Downstream => (false, is_sink(graph, next_idx)),
-                    };
-                    let is_test = is_test_symbol(sym);
-
+            if exclude_set.contains(&next_idx) {
+                if next_idx != curr_idx {
                     if (is_ep || is_sk) && seen_entry_indices.insert(next_idx) {
                         entry_points.push(sym.coordinate());
                     }
                     if is_test && seen_test_suites.insert(sym.file.clone()) {
                         test_suites.push(sym.file.clone());
                     }
-
-                    let call_lines = if direction == Traversal::Upstream && next_depth == 1 {
-                        find_call_site_lines(&mut file_cache, sym, &call_target_names)
-                    } else {
-                        Vec::new()
-                    };
-
-                    affected.push(BlastNode {
-                        name: sym.name.clone(),
-                        kind: sym.kind.as_str().to_string(),
-                        file: sym.file.clone(),
-                        coordinate: sym.coordinate(),
-                        depth: next_depth,
-                        is_entry_point: is_ep,
-                        is_test,
-                        is_sink: is_sk,
-                        is_value_use: false,
-                        call_lines,
-                    });
-
-                    queue.push_back((next_idx, next_depth));
                 }
+                continue;
             }
+
+            if !visited.insert(next_idx) {
+                continue;
+            }
+            let next_depth = curr_depth + 1;
+            if (is_ep || is_sk) && seen_entry_indices.insert(next_idx) {
+                entry_points.push(sym.coordinate());
+            }
+            if is_test && seen_test_suites.insert(sym.file.clone()) {
+                test_suites.push(sym.file.clone());
+            }
+
+            let call_lines = if direction == Traversal::Upstream && next_depth == 1 {
+                find_call_site_lines(file_cache, sym, &call_target_names)
+            } else {
+                Vec::new()
+            };
+
+            affected.push(BlastNode {
+                name: sym.name.clone(),
+                kind: sym.kind.as_str().to_string(),
+                file: sym.file.clone(),
+                coordinate: sym.coordinate(),
+                depth: next_depth,
+                is_entry_point: is_ep,
+                is_test,
+                is_sink: is_sk,
+                is_value_use: false,
+                call_lines,
+            });
+            queue.push_back((next_idx, next_depth));
         }
     }
 
-    // Weakest tier (upstream only): direct mentioners of the seed targets.
-    // Never traversed, never entry points; anything the call closure
-    // already reached stays a call row (call wins).
+    BfsOutput {
+        affected,
+        entry_points,
+        test_suites,
+        visited,
+    }
+}
+
+fn build_unverified_member_warning(graph: &SymbolGraph, seed_indices: &[usize]) -> Option<String> {
+    for &idx in seed_indices {
+        let sym = &graph.symbols[idx];
+        if sym.kind != SymbolKind::Method {
+            continue;
+        }
+        let leaf = sym.name.rsplit([':', '.']).next().unwrap_or(&sym.name);
+        if let Some(&count) = graph.unresolved_member_calls.get(leaf) {
+            if count > 0 {
+                return Some(format!(
+                    "Warning: {} unresolved cross-file `.{}()` call site(s) exist in workspace (untyped receiver calls are not linked statically); verify with: `rg -n \"\\.{}\\(\"`",
+                    count, leaf, leaf
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn traverse(
+    graph: &SymbolGraph,
+    coord: &Coordinate,
+    depth_limit: usize,
+    direction: Traversal,
+) -> Result<BlastResult> {
+    let indices = match direction {
+        Traversal::Upstream => graph.resolve_strict_upstream(coord, "blast")?,
+        Traversal::Downstream => vec![graph.resolve_strict(coord, "blast --down")?],
+    };
+
+    let mut file_cache = FileLineCache::new(graph.root.as_deref());
+    let empty_exclude = HashSet::new();
+    let mut bfs = run_bfs(
+        graph,
+        &indices,
+        &empty_exclude,
+        depth_limit,
+        direction,
+        &mut file_cache,
+    );
+
     const MAX_VALUE_USES: usize = 100;
     let mut value_uses = Vec::new();
     let mut literal_test_mentions = Vec::new();
+    let mut unverified_member_calls = None;
+
     if direction == Traversal::Upstream {
+        unverified_member_calls = build_unverified_member_warning(graph, &indices);
+
         'seeds: for &seed in &indices {
             for m_idx in graph.mentioner_indices(seed) {
-                if !visited.insert(m_idx) {
+                if !bfs.visited.insert(m_idx) {
                     continue;
                 }
                 let sym = &graph.symbols[m_idx];
@@ -378,28 +446,57 @@ fn traverse(
                 }
             }
         }
-        literal_test_mentions =
-            collect_literal_test_mentions(graph, &mut file_cache, &visited, &literal_seed_names);
+
+        let literal_seed_names: Vec<&str> = indices
+            .iter()
+            .filter_map(|&i| {
+                let full = graph.symbols[i].name.as_str();
+                let leaf = full.rsplit([':', '.']).next().unwrap_or(full);
+                (!is_generic_leaf_ident(leaf)).then_some(leaf)
+            })
+            .collect();
+        literal_test_mentions = collect_literal_test_mentions(
+            graph,
+            &mut file_cache,
+            &bfs.visited,
+            &literal_seed_names,
+        );
     }
+
+    let memory_notes = graph
+        .root
+        .as_deref()
+        .map(|r| {
+            let files: Vec<&str> = indices
+                .iter()
+                .map(|&i| graph.symbols[i].file.as_str())
+                .collect();
+            let syms: Vec<&str> = indices
+                .iter()
+                .map(|&i| graph.symbols[i].name.as_str())
+                .collect();
+            crate::memory::MemoryLedger::scoped_notes_for_workspace(r, &files, &syms)
+        })
+        .unwrap_or_default();
 
     Ok(BlastResult {
         target: coord.to_string(),
         depth_limit,
-        affected,
-        entry_points,
-        test_suites,
+        affected: bfs.affected,
+        entry_points: bfs.entry_points,
+        test_suites: bfs.test_suites,
         direction: match direction {
             Traversal::Upstream => "up".to_string(),
             Traversal::Downstream => "down".to_string(),
         },
         value_uses,
         literal_test_mentions,
+        unverified_member_calls,
+        memory_notes,
     })
 }
 
-/// Multi-source upstream BFS for `mimori diff`: computes the combined upstream
-/// blast cone for `mutated_indices` in a single `O(V + E)` pass instead of
-/// running `|M|` full graph traversals.
+/// Multi-source upstream BFS for `mimori diff`.
 pub(crate) fn traverse_multi_upstream(
     graph: &SymbolGraph,
     mutated_indices: &[usize],
@@ -411,147 +508,49 @@ pub(crate) fn traverse_multi_upstream(
 
     let mut file_cache = FileLineCache::new(graph.root.as_deref());
     let mutated_set: HashSet<usize> = mutated_indices.iter().copied().collect();
+    let seed_indices = graph.expand_upstream_indices(mutated_indices);
 
-    // Expand class/struct seeds to include constructor callers (`new X(...)`),
-    // matching `resolve_upstream_targets`.
-    let mut seed_indices: Vec<usize> = Vec::new();
-    let mut seen_seeds: HashSet<usize> = HashSet::new();
-    for &idx in mutated_indices {
-        if seen_seeds.insert(idx) {
-            seed_indices.push(idx);
-        }
-        let sym = &graph.symbols[idx];
-        if matches!(
-            sym.kind,
-            crate::model::SymbolKind::Class | crate::model::SymbolKind::Struct
-        ) {
-            for sep in [".", "::"] {
-                let ctor = format!("{}{sep}constructor", sym.name);
-                if let Some(c_idxs) = graph.name_to_indices.get(&ctor) {
-                    for &c_idx in c_idxs {
-                        if graph.symbols[c_idx].file == sym.file && seen_seeds.insert(c_idx) {
-                            seed_indices.push(c_idx);
-                        }
-                    }
-                }
-            }
+    let mut bfs = run_bfs(
+        graph,
+        &seed_indices,
+        &mutated_set,
+        depth_limit,
+        Traversal::Upstream,
+        &mut file_cache,
+    );
+
+    bfs.affected.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| a.coordinate.cmp(&b.coordinate))
+    });
+
+    for &seed in &seed_indices {
+        for m_idx in graph.mentioner_indices(seed) {
+            bfs.visited.insert(m_idx);
         }
     }
-
-    let mut call_target_names: Vec<&str> = seed_indices
-        .iter()
-        .map(|&i| {
-            let name = graph.symbols[i].name.as_str();
-            name.rsplit([':', '.']).next().unwrap_or(name)
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-    call_target_names.sort_unstable();
-    call_target_names.dedup();
 
     let mut literal_seed_names: Vec<&str> = seed_indices
         .iter()
         .filter_map(|&i| {
             let full = graph.symbols[i].name.as_str();
             let leaf = full.rsplit([':', '.']).next().unwrap_or(full);
-            if is_generic_leaf_ident(leaf, full) {
-                None
-            } else {
-                Some(leaf)
-            }
+            (!is_generic_leaf_ident(leaf)).then_some(leaf)
         })
         .collect();
     literal_seed_names.sort_unstable();
     literal_seed_names.dedup();
 
-    let mut queue = VecDeque::new();
-    let mut visited: HashSet<usize> = HashSet::new();
-    for &idx in &seed_indices {
-        visited.insert(idx);
-        queue.push_back((idx, 0usize));
-    }
-
-    let mut affected = Vec::new();
-    let mut entry_points = Vec::new();
-    let mut seen_entry_indices = HashSet::new();
-    let mut test_suites = Vec::new();
-    let mut seen_test_suites = HashSet::new();
-
-    while let Some((curr_idx, curr_depth)) = queue.pop_front() {
-        if curr_depth >= depth_limit {
-            continue;
-        }
-        let Some(callers) = graph.callers_map.get(&curr_idx) else {
-            continue;
-        };
-        for &next_idx in callers {
-            let sym = &graph.symbols[next_idx];
-            let is_ep = is_entry_point(graph, next_idx, sym);
-            let is_test = is_test_symbol(sym);
-
-            // If one mutated symbol calls another mutated symbol, record any
-            // entry-point / test-suite status just like per-symbol blast did,
-            // while keeping mutated symbols out of `affected`.
-            if mutated_set.contains(&next_idx) {
-                if next_idx != curr_idx {
-                    if is_ep && seen_entry_indices.insert(next_idx) {
-                        entry_points.push(sym.coordinate());
-                    }
-                    if is_test && seen_test_suites.insert(sym.file.clone()) {
-                        test_suites.push(sym.file.clone());
-                    }
-                }
-                continue;
-            }
-
-            if !visited.insert(next_idx) {
-                continue;
-            }
-            let next_depth = curr_depth + 1;
-            if is_ep && seen_entry_indices.insert(next_idx) {
-                entry_points.push(sym.coordinate());
-            }
-            if is_test && seen_test_suites.insert(sym.file.clone()) {
-                test_suites.push(sym.file.clone());
-            }
-            let call_lines = if next_depth == 1 {
-                find_call_site_lines(&mut file_cache, sym, &call_target_names)
-            } else {
-                Vec::new()
-            };
-            affected.push(BlastNode {
-                name: sym.name.clone(),
-                kind: sym.kind.as_str().to_string(),
-                file: sym.file.clone(),
-                coordinate: sym.coordinate(),
-                depth: next_depth,
-                is_entry_point: is_ep,
-                is_test,
-                is_sink: false,
-                is_value_use: false,
-                call_lines,
-            });
-            queue.push_back((next_idx, next_depth));
-        }
-    }
-
-    affected.sort_by(|a, b| {
-        a.depth
-            .cmp(&b.depth)
-            .then_with(|| a.coordinate.cmp(&b.coordinate))
-    });
-
-    // Mark mentioners as visited before scanning literal test mentions,
-    // matching `traverse`.
-    for &seed in &seed_indices {
-        for m_idx in graph.mentioner_indices(seed) {
-            visited.insert(m_idx);
-        }
-    }
     let literal_test_mentions =
-        collect_literal_test_mentions(graph, &mut file_cache, &visited, &literal_seed_names);
+        collect_literal_test_mentions(graph, &mut file_cache, &bfs.visited, &literal_seed_names);
 
-    (affected, entry_points, test_suites, literal_test_mentions)
+    (
+        bfs.affected,
+        bfs.entry_points,
+        bfs.test_suites,
+        literal_test_mentions,
+    )
 }
 
 fn find_call_site_lines<'a>(
@@ -667,12 +666,6 @@ fn collect_literal_test_mentions<'a>(
     out
 }
 
-/// An entry point is a symbol nothing else calls -- which is what the graph
-/// already knows -- or a program entry by name.
-///
-/// The previous rule matched any name starting with `get_`, `post_` or
-/// `handle_`, and any file whose path contained `main.`, `index.` or `app.`,
-/// so every getter in the codebase was reported as an affected entry point.
 pub(crate) fn is_entry_point(graph: &SymbolGraph, idx: usize, sym: &Symbol) -> bool {
     if is_program_entry(sym) {
         return true;
@@ -685,24 +678,21 @@ pub(crate) fn is_entry_point(graph: &SymbolGraph, idx: usize, sym: &Symbol) -> b
         .get(&idx)
         .is_none_or(|callers| callers.is_empty());
 
-    let is_exported = sym.signature.starts_with("pub ")
+    let leaf = sym.name.rsplit([':', '.']).next().unwrap_or(&sym.name);
+    let is_exported = sym.is_public()
+        || sym.signature.starts_with("pub ")
         || sym.signature.starts_with("pub(")
         || sym.signature.starts_with("export ")
-        || (sym.file.ends_with(".go") && sym.name.chars().next().is_some_and(|c| c.is_uppercase()))
-        || (sym.file.ends_with(".py") && !sym.name.starts_with('_'));
+        || (sym.file.ends_with(".go") && leaf.chars().next().is_some_and(|c| c.is_uppercase()))
+        || (sym.file.ends_with(".py") && !leaf.starts_with('_'));
 
     has_no_callers && is_exported
 }
 
-/// A program entry by name (`main`). Narrower than `is_entry_point`, which
-/// treats every uncalled symbol as an entry — that would exclude the exact
-/// isolated symbols doctor wants to flag.
 pub(crate) fn is_program_entry(sym: &Symbol) -> bool {
     sym.name == "main" || sym.name.ends_with("::main")
 }
 
-/// A sink is a symbol that calls nothing tracked — the downstream mirror of
-/// an entry point. Used to mark the boundary of a downstream blast cone.
 pub(crate) fn is_sink(graph: &SymbolGraph, idx: usize) -> bool {
     graph
         .callees_map
@@ -710,12 +700,12 @@ pub(crate) fn is_sink(graph: &SymbolGraph, idx: usize) -> bool {
         .is_none_or(|callees| callees.is_empty())
 }
 
-/// Test detection on real conventions, matched against path components and
-/// filename suffixes.
-///
-/// The previous rule was `name.contains("test") || file.contains("test")`,
-/// which classified `latest`, `contest` and `attestation` as tests.
+/// AST-first test detection (`symbol_flags::IS_TEST`), falling back to path
+/// components, filename suffixes, and test-function naming conventions.
 pub(crate) fn is_test_symbol(sym: &Symbol) -> bool {
+    if sym.is_test_flag() {
+        return true;
+    }
     const TEST_DIRS: &[&str] = &["tests", "test", "__tests__", "spec", "__mocks__"];
     const TEST_SUFFIXES: &[&str] = &[
         "_test.go",
@@ -731,7 +721,6 @@ pub(crate) fn is_test_symbol(sym: &Symbol) -> bool {
     ];
 
     let path = Path::new(&sym.file);
-
     if path
         .components()
         .any(|c| matches!(c, Component::Normal(n) if TEST_DIRS.iter().any(|d| OsStr::new(d) == n)))
@@ -766,49 +755,57 @@ pub fn parse_sink_list(raw: Option<&str>) -> Vec<String> {
     }
 }
 
-/// Case-sensitive substring sweep over indexed files, one hit per matching
-/// line, capped so a noisy sink (e.g. `console.`) can't flood the context.
-pub fn sweep_literal_sinks(root: &Path, graph: &SymbolGraph, sinks: &[String]) -> Vec<String> {
+/// Case-sensitive substring sweep over blast-cone files (or indexed files when
+/// `cone_files` is `None`/empty). Returns `(hits, truncated)` with clean JSON data.
+pub fn sweep_literal_sinks(
+    root: &Path,
+    graph: &SymbolGraph,
+    sinks: &[String],
+    cone_files: Option<&HashSet<String>>,
+) -> (Vec<String>, bool) {
     if sinks.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     const CAP: usize = 100;
-    let files: Vec<&str> = if !graph.indexed_files.is_empty() {
-        graph.indexed_files.iter().map(String::as_str).collect()
-    } else {
-        let mut f: Vec<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
-        f.sort_unstable();
-        f.dedup();
-        f
+    let mut files: Vec<&str> = match cone_files {
+        Some(cone) if !cone.is_empty() => cone.iter().map(String::as_str).collect(),
+        _ if !graph.indexed_files.is_empty() => {
+            graph.indexed_files.iter().map(String::as_str).collect()
+        }
+        _ => graph.symbols.iter().map(|s| s.file.as_str()).collect(),
     };
+    files.sort_unstable();
+    files.dedup();
+
     let mut hits = Vec::new();
+    let mut truncated = false;
     'files: for rel in files {
         let Ok(confined) = crate::workspace::walker::confine_to_workspace(root, Path::new(rel))
         else {
             continue;
         };
+        if std::fs::metadata(&confined).is_ok_and(|m| m.len() > MAX_INDEX_FILE_BYTES) {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(confined) else {
             continue;
         };
         for (idx, line) in content.lines().enumerate() {
             if sinks.iter().any(|s| line.contains(s)) {
-                hits.push(format!("{}:#L{}: {}", rel, idx + 1, line.trim()));
                 if hits.len() >= CAP {
-                    hits.push(format!(
-                        "… capped at {} hits; refine --with-sinks or use rg.",
-                        CAP
-                    ));
+                    truncated = true;
                     break 'files;
                 }
+                hits.push(format!("{}:#L{}: {}", rel, idx + 1, line.trim()));
             }
         }
     }
-    hits
+    (hits, truncated)
 }
 
-pub fn format_sink_hits(sinks: &[String], hits: &[String]) -> String {
+pub fn format_sink_hits(sinks: &[String], hits: &[String], truncated: bool) -> String {
     let mut out = format!(
-        "\n### 🔍 Literal sink hits (`--with-sinks {}`)\n\n",
+        "\n### Literal sink hits (`--with-sinks {}`)\n\n",
         sinks.join(",")
     );
     if hits.is_empty() {
@@ -817,6 +814,9 @@ pub fn format_sink_hits(sinks: &[String], hits: &[String]) -> String {
         for h in hits {
             out.push_str(&format!("- `{}`\n", h));
         }
+        if truncated {
+            out.push_str("\n_Capped at 100 hits; refine --with-sinks or use rg._\n");
+        }
     }
     out
 }
@@ -824,7 +824,7 @@ pub fn format_sink_hits(sinks: &[String], hits: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SymbolKind;
+    use crate::model::{symbol_flags, SymbolKind};
 
     fn s(file: &str, name: &str) -> Symbol {
         Symbol {
@@ -841,6 +841,7 @@ mod tests {
             call_counts: Default::default(),
             member_calls: vec![],
             external_imports: crate::model::symbol::empty_external_imports(),
+            flags: 0,
         }
     }
 
@@ -855,8 +856,6 @@ mod tests {
 
     #[test]
     fn downstream_blast_follows_callees_transitively() {
-        use crate::graph::SymbolGraph;
-        use crate::model::Coordinate;
         let g = SymbolGraph::new(vec![
             sr("src/a.rs", "top", &["mid"]),
             sr("src/a.rs", "mid", &["leaf"]),
@@ -866,25 +865,49 @@ mod tests {
         let res = calculate_downstream_blast(&g, &coord, 3).unwrap();
         assert_eq!(res.direction, "down");
         let names: Vec<&str> = res.affected.iter().map(|n| n.name.as_str()).collect();
-        assert!(names.contains(&"mid"), "expected mid in {:?}", names);
-        assert!(names.contains(&"leaf"), "expected leaf in {:?}", names);
-        // Upstream from the leaf mirrors back up.
+        assert!(names.contains(&"mid"));
+        assert!(names.contains(&"leaf"));
+
         let coord = Coordinate::parse("src/a.rs:leaf").unwrap();
         let up = calculate_blast_radius(&g, &coord, 3).unwrap();
         assert_eq!(up.direction, "up");
         let names: Vec<&str> = up.affected.iter().map(|n| n.name.as_str()).collect();
-        assert!(names.contains(&"mid"), "expected mid in {:?}", names);
+        assert!(names.contains(&"mid"));
     }
 
     #[test]
-    fn test_detection_uses_conventions_not_substrings() {
+    fn blast_emits_honesty_warning_for_unresolved_cross_file_methods() {
+        let mut m = s("src/db.rs", "Database::save_rows");
+        m.kind = SymbolKind::Method;
+        let mut caller = sr("src/app.rs", "run_app", &["save_rows"]);
+        caller.member_calls = vec!["save_rows".to_string()];
+        let g = SymbolGraph::new(vec![m, caller]);
+        let res = calculate_blast_radius(
+            &g,
+            &Coordinate::parse("src/db.rs:Database::save_rows").unwrap(),
+            3,
+        )
+        .unwrap();
+        assert!(
+            res.unverified_member_calls
+                .as_deref()
+                .is_some_and(|w| w.contains("1 unresolved cross-file `.save_rows()`")),
+            "expected honesty warning, got: {:?}",
+            res.unverified_member_calls
+        );
+    }
+
+    #[test]
+    fn test_detection_respects_ast_flag_and_conventions() {
+        let mut flagged = s("src/lib.rs", "helper_inside_cfg_test");
+        flagged.flags = symbol_flags::IS_TEST;
+        assert!(is_test_symbol(&flagged));
         assert!(is_test_symbol(&s("tests/cli_map.rs", "anything")));
         assert!(is_test_symbol(&s("src/__tests__/a.ts", "anything")));
         assert!(is_test_symbol(&s("pkg/server_test.go", "TestServe")));
         assert!(is_test_symbol(&s("src/a.spec.ts", "anything")));
         assert!(is_test_symbol(&s("src/lib.rs", "test_parses_input")));
 
-        // Regression M13: these are not tests.
         assert!(!is_test_symbol(&s("src/latest.rs", "latest_version")));
         assert!(!is_test_symbol(&s("src/contest.rs", "run_contest")));
         assert!(!is_test_symbol(&s("src/auth.rs", "attestation")));
