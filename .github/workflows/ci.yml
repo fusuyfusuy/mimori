@@ -11,19 +11,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
+      - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  determinism:
+  determinism-and-self-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build
-      - name: byte-identical map gate
-        run: >
-          ./target/debug/mimori map > /tmp/map_a.md &&
-          ./target/debug/mimori map > /tmp/map_b.md &&
-          diff /tmp/map_a.md /tmp/map_b.md &&
-          echo "determinism gate: maps identical"
+      - name: byte-identical markdown and JSON determinism gate
+        run: |
+          set -euo pipefail
+          for cmd in \
+            "map" \
+            "map --json" \
+            "slice src/graph/mod.rs:SymbolGraph::new --json" \
+            "dump --budget 1500 --json" \
+            "doctor --json"
+          do
+            ./target/debug/mimori $cmd > /tmp/det_a.out
+            ./target/debug/mimori $cmd > /tmp/det_b.out
+            diff -u /tmp/det_a.out /tmp/det_b.out
+          done
+          echo "determinism gate: all markdown and JSON outputs byte-identical"
+      - name: self-hosted memory lint and debt check
+        run: |
+          ./target/debug/mimori memory lint
+          ./target/debug/mimori debt check
