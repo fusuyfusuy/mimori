@@ -1,9 +1,9 @@
 [package]
 name = "mimori"
-version = "3.1.1"
+version = "3.2.0"
 edition = "2021"
 authors = ["mimori team"]
-description = "High-performance AST code-intelligence and symbol-graph CLI"
+description = "Fast in-repo AST navigation, blast-radius analysis, and JIT agent memory CLI/MCP"
 license = "MIT"
 repository = "https://github.com/fusuyfusuy/mimori"
 
