@@ -29,6 +29,30 @@ Measured on this repository (`51` source files, `843` symbols, `v3.2.0` release 
 | Orient across core modules + ADRs + gotchas + debt | **~1,493 tok** (`dump --budget 1500`) | Manual tree + manifests + docs | ~22 ms |
 | Upstream impact of `MemoryLedger::lint` (entry points + tests + warning) | **~422 tok** (`blast -d 2`) | Multi-hop manual `rg` | ~23 ms |
 
+### End-to-End 3-Arm Agent Benchmark (`Dokploy` Monorepo)
+
+Measured end-to-end on real [Dokploy Issue #6096](https://github.com/Dokploy/dokploy/issues/6096) (zero filenames in prompt; pinned at pre-fix commit `e193834bb`, `1,168` indexed TS/TSX/JS/JSX files, `11,732` symbols; `mimori` cold index `568 ms`, warm query `169 ms`). Three isolated agents ran the identical task on the same model (`gemini-4-neon-xhigh`, zero timeouts, verified `0` `mimori` calls in Arms B & C). All three arms produced the **exact same byte-for-byte upstream fix** (`879d5c74a`, `100/100` rubric), isolating pure efficiency:
+
+| Metric | **Arm A (`mimori + rg`)** | **Arm B (`no-mimori surgical`)** | **Arm C (`default unsteered`)** | **A vs. B** | **A vs. C** |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Upstream Fix & Rubric** | Exact (`100/100`) | Exact (`100/100`) | Exact (`100/100`) | Tied | Tied |
+| **Time to First Edit** | **326 s** (5m 26s) | 407 s (6m 47s) | 424 s (7m 04s) | **−19.9%** | **−23.1%** |
+| **Total Wall-Clock Time** | **477.8 s** (7m 58s) | 575.7 s (9m 36s) | 493.0 s (8m 13s) | **−17.0%** | **−3.1%** |
+| **LLM Turns** | **18** | 18 | 22 | 0.0% | **−18.2%** |
+| **Total Tool Calls** | 60 (`16` mimori, `9` read) | 64 (`0` mimori, `33` read) | 58 (`0` mimori, `31` read) | **−6.2%** | +3.4% |
+| **`read_file` Calls** | **9** | 33 | 31 | **−72.7%** | **−71.0%** |
+| **Distinct Files Opened** | **6** | 16 | 23 | **−62.5%** | **−73.9%** |
+| **Raw Lines Read (`read_file`)** | **1,099** | 3,068 | 4,210 | **−64.2%** | **−73.9%** |
+| **Uncached Input Tokens** | **130,697** | 157,462 | 157,290 | **−17.0%** | **−16.9%** |
+| **Cache-Read Tokens** | 1,444,019 | 1,316,084 | 1,821,924 | +9.7% | **−20.7%** |
+| **Output Tokens (incl. thinking)** | **48,205** | 58,024 | 54,142 | **−16.9%** | **−11.0%** |
+| **↳ Thinking Tokens** | **26,622** | 37,847 | 30,395 | **−29.7%** | **−12.4%** |
+| **Billable Tokens (`in + out`)** | **178,902** | 215,486 | 211,432 | **−17.0%** | **−15.4%** |
+| **Peak Single-Turn Context** | **143,680** | 155,429 | 153,168 | **−7.6%** | **−6.2%** |
+| **Est. API Cost** *(ref. rates)* | **$0.83** | $0.94 | $0.97 | **−12.3%** | **−14.5%** |
+
+*Notes: Reference cost weighted at `$1.25/M` uncached input, `$0.125/M` cache-read, `$10/M` output. All three arms also ran ~13–14 custom Python scripts to exhaustively audit all 68 Drizzle schema tables for the issue's sibling-query deliverable; on the pure orientation + root-cause + caller blast-radius phase, Arm A reached the exact function, callers, and `#4256` precedent in **26 seconds (2 turns)**.*
+
 ---
 
 ## See It in Action
