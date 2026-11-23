@@ -1,14 +1,18 @@
 use super::ledger::{
-    classify_memory_heading, confine_agents_path, update_code_fence, MemoryLedger, MemorySection,
-    MAX_DEBT_CEILING,
+    classify_memory_heading, confine_agents_path, update_code_fence, FenceState, MemoryLedger,
+    MemorySection, MAX_DEBT_CEILING,
 };
-use anyhow::Result;
-use ignore::WalkBuilder;
+use crate::workspace::walker::{is_disallowed_workspace_root, WorkspaceScope};
+use anyhow::{bail, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use tree_sitter::{Language, Node, Parser};
+
+const MAX_DEBT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_AST_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InCodeMarker {
@@ -22,98 +26,105 @@ pub struct InCodeMarker {
     pub raw: String,
 }
 
-pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InCodeMarker> {
-    if !line.as_bytes().windows(8).any(|w| {
-        w.eq_ignore_ascii_case(b"mimodept")
-            || w.eq_ignore_ascii_case(b"mimodebt")
-            || w.eq_ignore_ascii_case(b"ponytail")
-    }) {
+#[derive(Clone, Copy)]
+enum CommentStyle {
+    TreeSitter(TsLang),
+    HashLine,
+    SqlDash,
+    CStyle,
+}
+
+#[derive(Clone, Copy)]
+enum TsLang {
+    Rust,
+    TypeScript,
+    Tsx,
+    Python,
+    Go,
+}
+
+fn comment_style_for(path: &Path) -> Option<CommentStyle> {
+    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if fname.eq_ignore_ascii_case("dockerfile") || fname.starts_with("Dockerfile.") {
+        return Some(CommentStyle::HashLine);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => Some(CommentStyle::TreeSitter(TsLang::Rust)),
+        "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => {
+            Some(CommentStyle::TreeSitter(TsLang::TypeScript))
+        }
+        "tsx" | "jsx" => Some(CommentStyle::TreeSitter(TsLang::Tsx)),
+        "py" => Some(CommentStyle::TreeSitter(TsLang::Python)),
+        "go" => Some(CommentStyle::TreeSitter(TsLang::Go)),
+        "sql" => Some(CommentStyle::SqlDash),
+        "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "ini" | "conf" | "mk" | "pyi" => {
+            Some(CommentStyle::HashLine)
+        }
+        "css" | "scss" | "c" | "h" | "cc" | "cpp" | "hpp" | "java" | "kt" | "swift" => {
+            Some(CommentStyle::CStyle)
+        }
+        _ => None,
+    }
+}
+
+fn ts_language(lang: TsLang) -> Language {
+    match lang {
+        TsLang::Rust => tree_sitter_rust::LANGUAGE.into(),
+        TsLang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        TsLang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        TsLang::Python => tree_sitter_python::LANGUAGE.into(),
+        TsLang::Go => tree_sitter_go::LANGUAGE.into(),
+    }
+}
+
+fn has_marker_keyword(text: &str) -> bool {
+    text.as_bytes()
+        .windows(8)
+        .any(|w| w.eq_ignore_ascii_case(b"mimodept") || w.eq_ignore_ascii_case(b"mimodebt"))
+}
+
+/// Extract a marker payload from the body of a real comment line.
+/// Drops legacy `ponytail:`; supports `mimodept:` (and typo `mimodebt:`).
+fn parse_marker_from_comment_text(
+    comment_line: &str,
+    is_block_comment: bool,
+    file: &str,
+    line_no: usize,
+    raw_line: &str,
+) -> Option<InCodeMarker> {
+    if !has_marker_keyword(comment_line) {
         return None;
     }
 
-    let bytes = line.as_bytes();
-    let is_rust = file.ends_with(".rs");
-    let prefixes = [
-        "# mimodept:",
-        "// mimodept:",
-        "/* mimodept:",
-        "-- mimodept:",
-        "# mimodebt:",
-        "// mimodebt:",
-        "/* mimodebt:",
-        "-- mimodebt:",
-        "# ponytail:",
-        "// ponytail:",
-        "/* ponytail:",
-        "-- ponytail:",
-    ];
-
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
-    let mut in_backtick = false;
-    let mut escaped = false;
-
-    let mut found_pos: Option<(usize, &str)> = None;
-
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if escaped {
-            escaped = false;
-            i += 1;
+    let bytes = comment_line.as_bytes();
+    let mut payload_start = None;
+    for i in 0..bytes.len() {
+        let prefix_len = if bytes[i..].len() >= 9
+            && (bytes[i..i + 9].eq_ignore_ascii_case(b"mimodept:")
+                || bytes[i..i + 9].eq_ignore_ascii_case(b"mimodebt:"))
+        {
+            9
+        } else {
             continue;
+        };
+        let boundary_ok =
+            i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'/' | b'*' | b'#' | b'-');
+        if boundary_ok {
+            payload_start = Some(i + prefix_len);
+            break;
         }
-
-        if b == b'\\' {
-            escaped = true;
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' && !in_single_quote && !in_backtick {
-            in_double_quote = !in_double_quote;
-            i += 1;
-            continue;
-        }
-
-        // In Rust, single quotes are char literals (never multiline or containing comments) or lifetimes ('a).
-        // Avoid letting lifetimes like 'a toggle in_single_quote.
-        if !is_rust && b == b'\'' && !in_double_quote && !in_backtick {
-            in_single_quote = !in_single_quote;
-            i += 1;
-            continue;
-        }
-
-        if b == b'`' && !in_double_quote && !in_single_quote {
-            in_backtick = !in_backtick;
-            i += 1;
-            continue;
-        }
-
-        if !in_double_quote && !in_single_quote && !in_backtick {
-            for prefix in &prefixes {
-                if bytes[i..].len() >= prefix.len()
-                    && bytes[i..i + prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-                {
-                    found_pos = Some((i, *prefix));
-                    break;
-                }
-            }
-            if found_pos.is_some() {
-                break;
-            }
-        }
-
-        i += 1;
     }
 
-    let (pos, prefix) = found_pos?;
-    let start = pos + prefix.len();
-    let mut slice = &line[start..];
-
-    if let Some(end_idx) = slice.rfind("*/") {
-        slice = &slice[..end_idx];
+    let start = payload_start?;
+    let mut slice = &comment_line[start..];
+    if is_block_comment {
+        if let Some(end_idx) = slice.rfind("*/") {
+            slice = &slice[..end_idx];
+        }
     }
     let slice = slice.trim();
 
@@ -126,7 +137,7 @@ pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InC
             trigger: String::new(),
             valid_trigger: false,
             error_reason: Some("missing '<-' separator".into()),
-            raw: line.to_string(),
+            raw: raw_line.to_string(),
         });
     };
 
@@ -134,23 +145,22 @@ pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InC
     let rest = &slice[left_idx + 2..];
 
     let Some(right_idx) = rest.find("->") else {
-        let ceiling = rest.trim();
         return Some(InCodeMarker {
             file: file.to_string(),
             line: line_no,
             what: what.to_string(),
-            ceiling: ceiling.to_string(),
+            ceiling: rest.trim().to_string(),
             trigger: String::new(),
             valid_trigger: false,
             error_reason: Some("missing '->' trigger separator".into()),
-            raw: line.to_string(),
+            raw: raw_line.to_string(),
         });
     };
 
     let ceiling = rest[..right_idx].trim();
     let trigger = rest[right_idx + 2..].trim();
 
-    let (valid, error_reason) = if what.is_empty() {
+    let (valid_trigger, error_reason) = if what.is_empty() {
         (false, Some("empty 'what'".into()))
     } else if ceiling.is_empty() {
         (false, Some("empty 'ceiling'".into()))
@@ -166,46 +176,133 @@ pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InC
         what: what.to_string(),
         ceiling: ceiling.to_string(),
         trigger: trigger.to_string(),
-        valid_trigger: valid,
+        valid_trigger,
         error_reason,
-        raw: line.to_string(),
+        raw: raw_line.to_string(),
     })
 }
 
-pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> {
-    if crate::workspace::walker::is_disallowed_workspace_root(root) {
+fn collect_ts_comments(
+    node: Node,
+    source: &str,
+    lines: &[&str],
+    file: &str,
+    depth: usize,
+    out: &mut Vec<InCodeMarker>,
+) {
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
+    let kind = node.kind();
+    if kind == "line_comment" || kind == "block_comment" || kind == "comment" {
+        if let Ok(text) = node.utf8_text(source.as_bytes()) {
+            if has_marker_keyword(text) {
+                let is_block = text.starts_with("/*");
+                let start_row = node.start_position().row;
+                for (offset, seg) in text.lines().enumerate() {
+                    let line_no = start_row + offset + 1;
+                    let raw = lines.get(start_row + offset).copied().unwrap_or(seg);
+                    if let Some(m) =
+                        parse_marker_from_comment_text(seg, is_block, file, line_no, raw)
+                    {
+                        out.push(m);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ts_comments(child, source, lines, file, depth + 1, out);
+    }
+}
+
+fn scan_content_markers(content: &str, file: &str, style: CommentStyle) -> Vec<InCodeMarker> {
+    if !has_marker_keyword(content) {
         return Vec::new();
     }
-    let scan_root = match scope {
-        Some(s) => {
-            let joined = root.join(s);
-            let Ok(canon_root) = root.canonicalize() else {
-                return Vec::new();
-            };
-            let Ok(canon_joined) = joined.canonicalize() else {
-                return Vec::new();
-            };
-            if !canon_joined.starts_with(&canon_root) {
+    let lines: Vec<&str> = content.lines().collect();
+    match style {
+        CommentStyle::TreeSitter(lang) => {
+            let mut parser = Parser::new();
+            if parser.set_language(&ts_language(lang)).is_err() {
                 return Vec::new();
             }
-            joined
+            let Some(tree) = parser.parse(content, None) else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            collect_ts_comments(tree.root_node(), content, &lines, file, 0, &mut out);
+            out
         }
-        None => root.to_path_buf(),
-    };
-    if !scan_root.exists() {
-        return Vec::new();
+        CommentStyle::HashLine => scan_line_prefix_comments(&lines, file, "#", false),
+        CommentStyle::SqlDash => scan_line_prefix_comments(&lines, file, "--", false),
+        CommentStyle::CStyle => {
+            let mut out = scan_line_prefix_comments(&lines, file, "//", false);
+            out.extend(scan_line_prefix_comments(&lines, file, "/*", true));
+            out
+        }
     }
+}
 
-    let mut builder = WalkBuilder::new(&scan_root);
-    builder
-        .hidden(false)
-        .follow_links(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".mimoriignore");
-    if scan_root != root {
-        let root_ignore = root.join(".mimoriignore");
+fn scan_line_prefix_comments(
+    lines: &[&str],
+    file: &str,
+    prefix: &str,
+    is_block: bool,
+) -> Vec<InCodeMarker> {
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if let Some(m) = parse_marker_from_comment_text(rest, is_block, file, idx + 1, line) {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// Public single-line helper preserved for callers/tests inspecting comment lines directly.
+pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InCodeMarker> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("/*") {
+        parse_marker_from_comment_text(rest, true, file, line_no, line)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("//")
+        .or_else(|| trimmed.strip_prefix('#'))
+        .or_else(|| trimmed.strip_prefix("--"))
+    {
+        parse_marker_from_comment_text(rest, false, file, line_no, line)
+    } else {
+        None
+    }
+}
+
+pub fn scan_debt_markers_checked(
+    root: &Path,
+    scope: Option<&str>,
+) -> Result<(Vec<InCodeMarker>, Vec<String>)> {
+    if is_disallowed_workspace_root(root) {
+        bail!(
+            "Refusing to scan debt in home or system directory '{}'",
+            root.display()
+        );
+    }
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let scan_root = match scope {
+        Some(sc) => {
+            let parsed = WorkspaceScope::parse(&canon_root, sc, true)?;
+            parsed.canon_path.unwrap_or_else(|| canon_root.clone())
+        }
+        None => canon_root.clone(),
+    };
+
+    let mut builder = crate::workspace::walker::walk_builder(&scan_root);
+    builder.hidden(false).follow_links(false);
+    if scan_root != canon_root {
+        let root_ignore = canon_root.join(".mimoriignore");
         if root_ignore.is_file() {
             let _ = builder.add_ignore(root_ignore);
         }
@@ -217,11 +314,18 @@ pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> 
             continue;
         }
         let path = entry.path();
-        let Ok(rel) = path.strip_prefix(root) else {
+        let Ok(rel) = path.strip_prefix(&canon_root) else {
             continue;
         };
-        let rel_str = rel.to_string_lossy();
-        if rel_str.ends_with(".md") || rel_str.ends_with(".markdown") {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("md")
+                    || ext.eq_ignore_ascii_case("markdown")
+                    || ext.eq_ignore_ascii_case("mdx")
+            })
+        {
             continue;
         }
         let is_ignored_dir = crate::workspace::walker::is_ignored_rel(rel)
@@ -231,33 +335,58 @@ pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> 
         if is_ignored_dir {
             continue;
         }
-        files.push((path.to_path_buf(), rel_str.to_string()));
+        let Some(style) = comment_style_for(path) else {
+            continue;
+        };
+        let rel_str = crate::workspace::walker::normalize_rel_str(rel);
+        files.push((path.to_path_buf(), rel_str, style));
     }
 
-    let mut markers: Vec<InCodeMarker> = files
+    enum FileScan {
+        Ok(Vec<InCodeMarker>),
+        Err(String),
+    }
+
+    let results: Vec<FileScan> = files
         .into_par_iter()
-        .flat_map(|(full_path, rel_path)| {
-            let Ok(content) = fs::read_to_string(&full_path) else {
-                return Vec::new();
+        .map(|(full_path, rel_path, style)| {
+            let Ok(meta) = fs::metadata(&full_path) else {
+                return FileScan::Err(format!("{}: cannot stat", rel_path));
             };
-            let mut file_markers = Vec::new();
-            for (line_idx, line) in content.lines().enumerate() {
-                if let Some(marker) = parse_mimodept_line(line, &rel_path, line_idx + 1) {
-                    file_markers.push(marker);
-                }
+            if meta.len() > MAX_DEBT_FILE_BYTES {
+                return FileScan::Err(format!("{}: exceeds 8 MiB scan cap", rel_path));
             }
-            file_markers
+            match fs::read_to_string(&full_path) {
+                Ok(content) => FileScan::Ok(scan_content_markers(&content, &rel_path, style)),
+                Err(e) => FileScan::Err(format!("{}: {}", rel_path, e)),
+            }
         })
         .collect();
 
+    let mut markers = Vec::new();
+    let mut read_errors = Vec::new();
+    for res in results {
+        match res {
+            FileScan::Ok(ms) => markers.extend(ms),
+            FileScan::Err(e) => read_errors.push(e),
+        }
+    }
+
     markers.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
-    markers
+    read_errors.sort();
+    Ok((markers, read_errors))
 }
 
-pub fn list_debt(root: &Path, scope: Option<&str>) -> (Vec<InCodeMarker>, String) {
-    let markers = scan_debt_markers(root, scope);
-    if markers.is_empty() {
-        return (markers, "DEBT_SCAN: 0 markers found; exit 0.".to_string());
+pub fn scan_debt_markers(root: &Path, scope: Option<&str>) -> Vec<InCodeMarker> {
+    scan_debt_markers_checked(root, scope)
+        .map(|(m, _)| m)
+        .unwrap_or_default()
+}
+
+pub fn list_debt(root: &Path, scope: Option<&str>) -> Result<(Vec<InCodeMarker>, String)> {
+    let (markers, read_errors) = scan_debt_markers_checked(root, scope)?;
+    if markers.is_empty() && read_errors.is_empty() {
+        return Ok((markers, "DEBT_SCAN: 0 markers found; exit 0.".to_string()));
     }
 
     let mut unique_files = HashSet::new();
@@ -286,9 +415,11 @@ pub fn list_debt(root: &Path, scope: Option<&str>) -> (Vec<InCodeMarker>, String
             ));
         }
     }
+    for err in &read_errors {
+        lines.push(format!("- WARN (unreadable): {}", err));
+    }
 
-    let output = lines.join("\n");
-    (markers, output)
+    Ok((markers, lines.join("\n")))
 }
 
 fn strip_accepted_prefix(what: &str) -> &str {
@@ -320,16 +451,13 @@ fn normalize_debt_key(what: &str, ceiling: &str, trigger: &str) -> String {
 }
 
 pub fn check_debt(root: &Path) -> (bool, String) {
-    if crate::workspace::walker::is_disallowed_workspace_root(root) {
-        return (
-            false,
-            format!(
-                "DEBT_CHECK_FAIL: Refusing to check debt in home or system directory '{}'; exit 1.",
-                root.display()
-            ),
-        );
-    }
-    let markers = scan_debt_markers(root, None);
+    let (markers, read_errors) = match scan_debt_markers_checked(root, None) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return (false, format!("DEBT_CHECK_FAIL: {}; exit 1.", e));
+        }
+    };
+
     let total_markers = markers.len();
     let valid_markers: Vec<_> = markers.iter().filter(|m| m.valid_trigger).collect();
     let valid_count = valid_markers.len();
@@ -339,49 +467,71 @@ pub fn check_debt(root: &Path) -> (bool, String) {
         .map(|m| normalize_debt_key(&m.what, &m.ceiling, &m.trigger))
         .collect();
 
-    let manual_count = if let Ok(ledger) = MemoryLedger::load(root) {
-        let mut seen_manual = HashSet::new();
-        ledger
-            .debt_items
-            .iter()
-            .filter(|d| d.is_accepted)
-            .filter(|d| {
-                let key = normalize_debt_key(&d.what, &d.why, &d.trigger);
-                !valid_keys.contains(&key) && seen_manual.insert(key)
-            })
-            .count()
-    } else {
-        0
+    let manual_count = match confine_agents_path(root, ".agents/memory.md") {
+        Ok(mem_path) if mem_path.exists() => match MemoryLedger::load(root) {
+            Ok(ledger) => {
+                let mut seen_manual = HashSet::new();
+                ledger
+                    .debt_items
+                    .iter()
+                    .filter(|d| d.is_accepted)
+                    .filter(|d| {
+                        let key = normalize_debt_key(&d.what, &d.why, &d.trigger);
+                        !valid_keys.contains(&key) && seen_manual.insert(key)
+                    })
+                    .count()
+            }
+            Err(e) => {
+                return (
+                    false,
+                    format!("DEBT_CHECK_FAIL: load .agents/memory.md: {}; exit 1.", e),
+                );
+            }
+        },
+        Ok(_) => 0,
+        Err(e) => {
+            return (false, format!("DEBT_CHECK_FAIL: {}; exit 1.", e));
+        }
     };
 
-    let total_debt = valid_count + manual_count;
+    let total_debt = valid_keys.len() + manual_count;
     let ceiling_breached = total_debt > MAX_DEBT_CEILING;
     let has_invalid_triggers = valid_count < total_markers;
-
-    let passed = !ceiling_breached && !has_invalid_triggers;
+    let passed = !has_invalid_triggers && read_errors.is_empty();
 
     let output = if passed {
-        format!(
-            "DEBT_CHECK: markers: {}; valid_triggers: {}/{}; ceiling: {}/{}; exit 0.",
-            total_markers, valid_count, total_markers, total_debt, MAX_DEBT_CEILING
-        )
+        if ceiling_breached {
+            format!(
+                "DEBT_CHECK_WARN: markers: {}; valid_triggers: {}/{}; soft ceiling exceeded: {}/{}; exit 0.",
+                total_markers, valid_count, total_markers, total_debt, MAX_DEBT_CEILING
+            )
+        } else {
+            format!(
+                "DEBT_CHECK: markers: {}; valid_triggers: {}/{}; ceiling: {}/{}; exit 0.",
+                total_markers, valid_count, total_markers, total_debt, MAX_DEBT_CEILING
+            )
+        }
     } else {
         let mut reasons = Vec::new();
         if has_invalid_triggers {
-            let first_fail = markers.iter().find(|m| !m.valid_trigger).unwrap();
-            let reason = first_fail
-                .error_reason
-                .as_deref()
-                .unwrap_or("missing trigger");
-            reasons.push(format!(
-                "valid_triggers: {}/{} ({}:{} {})",
-                valid_count, total_markers, first_fail.file, first_fail.line, reason
-            ));
+            if let Some(first_fail) = markers.iter().find(|m| !m.valid_trigger) {
+                let reason = first_fail
+                    .error_reason
+                    .as_deref()
+                    .unwrap_or("missing trigger");
+                reasons.push(format!(
+                    "valid_triggers: {}/{} ({}:{} {})",
+                    valid_count, total_markers, first_fail.file, first_fail.line, reason
+                ));
+            }
+        }
+        if !read_errors.is_empty() {
+            reasons.push(format!("unreadable files: {}", read_errors.join(", ")));
         }
         if ceiling_breached {
             reasons.push(format!(
-                "ceiling breached: {}/{}; markers: {}; manual: {}",
-                total_debt, MAX_DEBT_CEILING, valid_count, manual_count
+                "soft ceiling exceeded: {}/{}",
+                total_debt, MAX_DEBT_CEILING
             ));
         }
         format!(
@@ -395,13 +545,13 @@ pub fn check_debt(root: &Path) -> (bool, String) {
 }
 
 pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
-    if crate::workspace::walker::is_disallowed_workspace_root(root) {
-        anyhow::bail!(
-            "Refusing to sync debt in home or system directory '{}'",
-            root.display()
+    let (markers, read_errors) = scan_debt_markers_checked(root, None)?;
+    if !read_errors.is_empty() {
+        bail!(
+            "Refusing to sync debt with unreadable source files: {}",
+            read_errors.join(", ")
         );
     }
-    let markers = scan_debt_markers(root, None);
 
     let valid_markers: Vec<_> = markers.iter().filter(|m| m.valid_trigger).collect();
 
@@ -411,30 +561,32 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
     }
 
     let ledger = MemoryLedger::load(root)?;
+    if ledger.debt_heading_count > 1 {
+        bail!(
+            "Refusing to sync debt: .agents/memory.md contains {} debt headings; consolidate to one `## KNOWN DEBT` section",
+            ledger.debt_heading_count
+        );
+    }
+
+    let valid_keys: HashSet<String> = valid_markers
+        .iter()
+        .map(|m| normalize_debt_key(&m.what, &m.ceiling, &m.trigger))
+        .collect();
+
     let mut manual_items: Vec<String> = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
 
     for item in &ledger.debt_items {
-        if item.is_accepted
-            && !valid_markers
-                .iter()
-                .any(|m| m.what == item.what && m.ceiling == item.why && m.trigger == item.trigger)
-        {
-            let key = normalize_debt_key(&item.what, &item.why, &item.trigger);
-            if seen_keys.insert(key) {
-                manual_items.push(format!(
-                    "- {} <- {} -> {}",
-                    item.what, item.why, item.trigger
-                ));
-            }
+        let key = normalize_debt_key(&item.what, &item.why, &item.trigger);
+        if item.is_accepted && !valid_keys.contains(&key) && seen_keys.insert(key) {
+            manual_items.push(format!(
+                "- {} <- {} -> {}",
+                item.what, item.why, item.trigger
+            ));
         }
     }
 
-    let mut combined_lines = Vec::new();
-    for manual in &manual_items {
-        combined_lines.push(manual.clone());
-    }
-
+    let mut combined_lines = manual_items.clone();
     for m in &valid_markers {
         let key = normalize_debt_key(&m.what, &m.ceiling, &m.trigger);
         if seen_keys.insert(key) {
@@ -442,11 +594,9 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         }
     }
 
-    let total_before_ceiling = combined_lines.len();
-    let ceiling_breached = total_before_ceiling > MAX_DEBT_CEILING;
-    if ceiling_breached {
-        combined_lines.truncate(MAX_DEBT_CEILING);
-    }
+    // Never truncate waivers or markers silently — preserve all items and warn above 30.
+    let synced_count = combined_lines.len();
+    let ceiling_breached = synced_count > MAX_DEBT_CEILING;
 
     let pruned: Vec<String> = ledger
         .debt_items
@@ -461,12 +611,11 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
 
     let in_code_count = valid_markers.len();
     let manual_count = manual_items.len();
-    let synced_count = combined_lines.len();
 
     let output = if ceiling_breached {
         format!(
-            "DEBT_SYNC_WARN: ceiling breached: {}/{} lines (truncated to 30); in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
-            total_before_ceiling, MAX_DEBT_CEILING, in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
+            "DEBT_SYNC_WARN: soft ceiling exceeded ({}/{} lines, all preserved); in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
+            synced_count, MAX_DEBT_CEILING, in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
         )
     } else {
         format!(
@@ -495,11 +644,11 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
 
     let mut in_debt_section = false;
     let mut debt_inserted = false;
-    let mut fence_ticks = 0usize;
+    let mut fence = FenceState::default();
 
     for line in lines {
         let trimmed = line.trim();
-        let in_fence = update_code_fence(trimmed, &mut fence_ticks);
+        let in_fence = update_code_fence(line, &mut fence);
 
         if !in_fence {
             if let Some(section) = classify_memory_heading(trimmed) {
@@ -507,7 +656,7 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
                     in_debt_section = true;
                     out.push(line.to_string());
                     out.push(
-                        "# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>"
+                        "<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->"
                             .to_string(),
                     );
                     out.push(String::new());
@@ -526,7 +675,6 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
         }
 
         if in_debt_section {
-            // skip existing debt lines and comments under debt section
             continue;
         }
 
@@ -536,10 +684,7 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
     if !debt_inserted {
         out.push(String::new());
         out.push("## KNOWN DEBT (open only — one line per item, delete when done)".to_string());
-        out.push(
-            "# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>"
-                .to_string(),
-        );
+        out.push("<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->".to_string());
         out.push(String::new());
         for debt in new_debt_lines {
             out.push(debt.clone());
@@ -551,4 +696,60 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
         res.push('\n');
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn treesitter_scanner_ignores_strings_raw_strings_and_ponytail() {
+        let src = r##"
+fn demo() {
+    let s = "// mimodept: fake inside string <- cap -> trigger";
+    let r = r#"// mimodept: fake inside raw string <- cap -> trigger"#;
+    // ponytail: dropped legacy syntax <- cap -> trigger
+    // mimodept: real glob */foo <- cap 1 -> trigger 1
+}
+"##;
+        let found =
+            scan_content_markers(src, "src/demo.rs", CommentStyle::TreeSitter(TsLang::Rust));
+        assert_eq!(found.len(), 1, "got: {found:?}");
+        assert_eq!(found[0].what, "real glob */foo");
+        assert!(found[0].valid_trigger);
+    }
+
+    #[test]
+    fn treesitter_python_ignores_docstrings_and_extracts_comments() {
+        let src = r##"
+def demo():
+    """
+    # mimodept: fake inside docstring <- cap -> trigger
+    """
+    x = "# mimodept: fake inside string <- cap -> trigger"
+    # mimodept: real py debt <- cap 2 -> trigger 2
+    return x
+"##;
+        let found = scan_content_markers(src, "app.py", CommentStyle::TreeSitter(TsLang::Python));
+        assert_eq!(found.len(), 1, "got: {found:?}");
+        assert_eq!(found[0].what, "real py debt");
+    }
+
+    #[test]
+    fn replace_debt_section_preserves_trailing_h1_appendix() {
+        let md = "\
+# Project Memory
+
+## KNOWN DEBT (open only)
+- old <- a -> b
+
+# Appendix
+Keep this safe.
+";
+        let out = replace_debt_section(md, &["- new <- c -> d".to_string()]);
+        assert!(out.contains("- new <- c -> d"));
+        assert!(!out.contains("- old <- a -> b"));
+        assert!(out.contains("# Appendix"));
+        assert!(out.contains("Keep this safe."));
+    }
 }
