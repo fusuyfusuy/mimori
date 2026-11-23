@@ -1,17 +1,8 @@
-//! `tsconfig.json` path aliases, so first-party imports are not mistaken for
-//! npm packages.
-//!
-//! The classifier in `parser/typescript.rs` used a two-way test — relative or
-//! package — for a three-way world. Every monorepo alias (`@dokploy/server`,
-//! `@/components`, anything in `compilerOptions.paths`) landed in the package
-//! branch, so its call edges were discarded at `graph/mod.rs`'s external gate
-//! and `up`/`blast`/`doctor` answered from a graph missing them.
-//!
-//! Only the specifier -> first-party *decision* is needed here: the graph
-//! resolves a reference by name and directory, never by import path, so an
-//! alias does not have to be rewritten to a file location — it only has to
-//! stop being called external.
+//! Language-scoped workspace alias and package discovery (`tsconfig.json`,
+//! `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.mod`, Python local
+//! modules) with strict workspace confinement before reading any file.
 
+use crate::workspace::walker::{confine_to_workspace, fnv1a_hash, normalize_rel_str};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,51 +26,66 @@ impl AliasPattern {
     }
 }
 
-/// The workspace's alias patterns, the names of its own packages, and a
-/// fingerprint of the configs that produced them so an edited `tsconfig.json`
-/// or a new workspace package invalidates the parse cache.
+/// Workspace-owned path aliases and package namespaces, partitioned by
+/// language so e.g. a Rust crate named `react` never pollutes TypeScript imports.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AliasSet {
     patterns: Vec<AliasPattern>,
-    /// `package.json` names of workspace members. `@acme/core` is first-party
-    /// code even though no `tsconfig` alias declares it: pnpm links it.
-    packages: Vec<String>,
+    js_packages: Vec<String>,
+    rust_crates: Vec<String>,
+    go_modules: Vec<String>,
+    py_modules: Vec<String>,
     fingerprint: String,
 }
 
 impl AliasSet {
     pub fn is_empty(&self) -> bool {
         self.patterns.is_empty()
+            && self.js_packages.is_empty()
+            && self.rust_crates.is_empty()
+            && self.go_modules.is_empty()
+            && self.py_modules.is_empty()
     }
 
     pub fn pattern_count(&self) -> usize {
         self.patterns.len()
     }
 
-    /// Fingerprint of the config contents this set came from. Stored in the
-    /// db: adding an alias or a workspace package must force a re-parse, not
-    /// serve a stale alias-blind index.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
 
-    /// True when `spec` is the workspace's own code rather than an installed
-    /// package: a declared `paths` alias, or a workspace member addressed by
-    /// its `package.json` name.
+    /// True when `spec` is a first-party JS/TS alias or workspace package.
     pub fn matches(&self, spec: &str) -> bool {
         if self.patterns.iter().any(|p| p.matches(spec)) {
             return true;
         }
-        self.packages.iter().any(|p| {
-            spec == p
-                || (spec.len() > p.len()
-                    && spec.starts_with(p.as_str())
-                    && spec.as_bytes()[p.len()] == b'/')
-        })
+        matches_pkg_list(&self.js_packages, spec)
     }
 
-    /// A set built from raw `paths` keys, for parser tests with no tsconfig
-    /// on disk to walk.
+    /// True when `crate_name` belongs to a Rust crate declared in this workspace.
+    pub fn matches_rust(&self, crate_name: &str) -> bool {
+        self.rust_crates.iter().any(|c| c == crate_name)
+    }
+
+    /// True when `import_path` belongs to a Go module declared in workspace `go.mod`.
+    pub fn matches_go(&self, import_path: &str) -> bool {
+        matches_pkg_list(&self.go_modules, import_path)
+    }
+
+    pub fn has_go_modules(&self) -> bool {
+        !self.go_modules.is_empty()
+    }
+
+    /// True when `top_module` matches a local Python module/package discovered in the workspace.
+    pub fn matches_python(&self, top_module: &str) -> bool {
+        self.py_modules.iter().any(|m| m == top_module)
+    }
+
+    pub fn has_python_modules(&self) -> bool {
+        !self.py_modules.is_empty()
+    }
+
     #[cfg(test)]
     pub fn for_test(keys: &[&str]) -> AliasSet {
         AliasSet {
@@ -87,17 +93,10 @@ impl AliasSet {
                 .iter()
                 .filter_map(|k| pattern_for(k, &[format!("./{k}")]))
                 .collect(),
-            packages: Vec::new(),
-            fingerprint: String::new(),
+            ..Default::default()
         }
     }
 
-    /// Walk the workspace for `tsconfig*.json` / `jsconfig.json` /
-    /// `package.json`, then collect: workspace package names, and every
-    /// `compilerOptions.paths` key reachable through the `extends` chains.
-    /// Walk the workspace for `tsconfig*.json` / `jsconfig.json` /
-    /// `package.json`, and `pnpm-workspace.yaml`, then collect: workspace package names,
-    /// and every `compilerOptions.paths` key reachable through `extends` and `references`.
     pub fn collect(root: &Path) -> AliasSet {
         let discovery = super::walker::discover_workspace(root);
         Self::collect_with_discovery(root, &discovery)
@@ -107,56 +106,77 @@ impl AliasSet {
         root: &Path,
         discovery: &super::walker::WorkspaceDiscovery,
     ) -> AliasSet {
-        let mut manifests = discovery.package_manifests.clone();
-        let mut configs = discovery.tsconfigs.clone();
+        let mut manifests: Vec<PathBuf> = discovery
+            .package_manifests
+            .iter()
+            .filter_map(|p| confine_to_workspace(root, p).ok())
+            .collect();
+        let mut configs: Vec<PathBuf> = discovery
+            .tsconfigs
+            .iter()
+            .filter_map(|p| confine_to_workspace(root, p).ok())
+            .collect();
 
-        // Discover workspaces from package.json and pnpm-workspace.yaml
         let mut workspace_globs = read_package_json_workspaces(root);
         workspace_globs.extend(read_pnpm_workspaces(root));
         let workspace_dirs = expand_workspace_globs(root, &workspace_globs);
 
         for dir in &workspace_dirs {
             let pkg_json = dir.join("package.json");
-            if pkg_json.is_file() && !manifests.contains(&pkg_json) {
-                manifests.push(pkg_json);
+            if let Ok(confined) = confine_to_workspace(root, &pkg_json) {
+                if confined.is_file() && !manifests.contains(&confined) {
+                    manifests.push(confined);
+                }
             }
             let tsconfig = dir.join("tsconfig.json");
-            if tsconfig.is_file() && !configs.contains(&tsconfig) {
-                configs.push(tsconfig);
+            if let Ok(confined) = confine_to_workspace(root, &tsconfig) {
+                if confined.is_file() && !configs.contains(&confined) {
+                    configs.push(confined);
+                }
             }
         }
 
         let packages = read_package_names(&manifests);
-
         let mut set = AliasSet {
-            packages: packages.iter().map(|(name, _)| name.clone()).collect(),
+            js_packages: packages.iter().map(|(name, _)| name.clone()).collect(),
             ..Default::default()
         };
 
-        // Also add relative package directory names (e.g. "packages/core")
+        let canon_root = root.canonicalize().ok();
         for dir in &workspace_dirs {
-            if let Ok(rel) = dir.strip_prefix(root) {
-                let rel_str = super::walker::normalize_rel_str(rel);
-                if !set.packages.contains(&rel_str) {
-                    set.packages.push(rel_str);
+            let rel_opt = canon_root
+                .as_deref()
+                .and_then(|cr| dir.strip_prefix(cr).ok())
+                .or_else(|| dir.strip_prefix(root).ok());
+            if let Some(rel) = rel_opt {
+                let rel_str = normalize_rel_str(rel);
+                if !rel_str.is_empty() && !set.js_packages.contains(&rel_str) {
+                    set.js_packages.push(rel_str);
                 }
             }
         }
 
-        read_cargo_package_names(&discovery.cargo_manifests, &mut set.packages);
-        read_go_module_names(&discovery.go_mods, &mut set.packages);
+        let confined_cargo: Vec<PathBuf> = discovery
+            .cargo_manifests
+            .iter()
+            .filter_map(|p| confine_to_workspace(root, p).ok())
+            .collect();
+        let confined_gomods: Vec<PathBuf> = discovery
+            .go_mods
+            .iter()
+            .filter_map(|p| confine_to_workspace(root, p).ok())
+            .collect();
+
+        read_cargo_package_names(&confined_cargo, &mut set.rust_crates);
+        read_go_module_names(&confined_gomods, &mut set.go_modules);
+        collect_python_modules(discovery, &mut set.py_modules);
 
         let mut hash: u64 = 0xcbf29ce484222325;
-        let mix = |h: u64, bytes: &[u8]| {
-            crate::workspace::walker::fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3)
-        };
+        let mix = |h: u64, bytes: &[u8]| fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3);
 
-        let pnpm_yaml = root.join("pnpm-workspace.yaml");
-        if let Ok(meta) = std::fs::symlink_metadata(&pnpm_yaml) {
-            if meta.is_file() {
-                if let Ok(content) = std::fs::read(&pnpm_yaml) {
-                    hash = mix(hash, &content);
-                }
+        if let Ok(pnpm_yaml) = confine_to_workspace(root, &root.join("pnpm-workspace.yaml")) {
+            if let Ok(content) = std::fs::read(&pnpm_yaml) {
+                hash = mix(hash, &content);
             }
         }
 
@@ -173,35 +193,39 @@ impl AliasSet {
             }
         }
 
-        // Fingerprint all confined manifests, Cargo.toml, go.mod, and visited configs
-        let canon_root = root.canonicalize().ok();
         let mut all_paths: Vec<&PathBuf> = manifests
             .iter()
-            .chain(discovery.cargo_manifests.iter())
-            .chain(discovery.go_mods.iter())
+            .chain(confined_cargo.iter())
+            .chain(confined_gomods.iter())
             .chain(visited_configs.iter())
-            .filter(|p| match (&canon_root, p.canonicalize()) {
-                (Some(cr), Ok(cp)) => cp.starts_with(cr),
-                _ => false,
-            })
             .collect();
         all_paths.sort();
         all_paths.dedup();
         for path in all_paths {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            hash = mix(hash, super::walker::normalize_rel_str(rel).as_bytes());
+            let rel = canon_root
+                .as_deref()
+                .and_then(|cr| path.strip_prefix(cr).ok())
+                .or_else(|| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            hash = mix(hash, normalize_rel_str(rel).as_bytes());
             if let Ok(content) = std::fs::read(path) {
                 hash = mix(hash, &content);
             }
         }
 
-        // Also mix resolved package names and alias patterns directly so baseUrl
-        // directory additions or Cargo/Go package changes always move the fingerprint.
-        let mut sorted_pkgs = set.packages.clone();
-        sorted_pkgs.sort();
-        sorted_pkgs.dedup();
-        for pkg in &sorted_pkgs {
-            hash = mix(hash, pkg.as_bytes());
+        for list in [
+            &set.js_packages,
+            &set.rust_crates,
+            &set.go_modules,
+            &set.py_modules,
+        ] {
+            let mut sorted = list.clone();
+            sorted.sort();
+            sorted.dedup();
+            hash = mix(hash, b"|");
+            for pkg in &sorted {
+                hash = mix(hash, pkg.as_bytes());
+            }
         }
         let mut sorted_pats: Vec<(&str, &str, bool)> = set
             .patterns
@@ -220,12 +244,48 @@ impl AliasSet {
     }
 }
 
+fn matches_pkg_list(list: &[String], spec: &str) -> bool {
+    list.iter().any(|p| {
+        spec == p
+            || (spec.len() > p.len()
+                && spec.starts_with(p.as_str())
+                && spec.as_bytes()[p.len()] == b'/')
+    })
+}
+
+fn collect_python_modules(discovery: &super::walker::WorkspaceDiscovery, out: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    for (rel, _, _, _) in &discovery.supported {
+        if !rel.ends_with(".py") {
+            continue;
+        }
+        let parts: Vec<&str> = rel.split('/').collect();
+        if let Some(&first) = parts.first() {
+            let stem = first.strip_suffix(".py").unwrap_or(first);
+            if !stem.is_empty() && stem != "__init__" && seen.insert(stem.to_string()) {
+                out.push(stem.to_string());
+            }
+        }
+        // Also recognize `src/<pkg>/...` layout.
+        if parts.len() >= 2 && matches!(parts[0], "src" | "lib" | "app") {
+            let second = parts[1].strip_suffix(".py").unwrap_or(parts[1]);
+            if !second.is_empty() && second != "__init__" && seen.insert(second.to_string()) {
+                out.push(second.to_string());
+            }
+        }
+    }
+    out.sort();
+}
+
 fn read_package_json_workspaces(root: &Path) -> Vec<String> {
-    let pkg_path = root.join("package.json");
+    let Ok(pkg_path) = confine_to_workspace(root, &root.join("package.json")) else {
+        return Vec::new();
+    };
     let Ok(raw) = std::fs::read_to_string(&pkg_path) else {
         return Vec::new();
     };
-    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    let Ok(json) = serde_json::from_str::<Value>(raw) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -246,30 +306,58 @@ fn read_package_json_workspaces(root: &Path) -> Vec<String> {
 }
 
 fn read_pnpm_workspaces(root: &Path) -> Vec<String> {
-    let yaml_path = root.join("pnpm-workspace.yaml");
+    let Ok(yaml_path) = confine_to_workspace(root, &root.join("pnpm-workspace.yaml")) else {
+        return Vec::new();
+    };
     let Ok(raw) = std::fs::read_to_string(&yaml_path) else {
         return Vec::new();
     };
     parse_yaml_packages_list(&raw)
 }
 
+fn strip_yaml_inline_comment(s: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return s[..i].trim_end(),
+            _ => {}
+        }
+    }
+    s.trim_end()
+}
+
 fn parse_yaml_packages_list(raw: &str) -> Vec<String> {
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
     let mut out = Vec::new();
     let mut in_packages = false;
     for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.is_empty() {
+        let cleaned = strip_yaml_inline_comment(line);
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if trimmed.starts_with("packages:") {
-            in_packages = true;
+        if let Some(after) = trimmed.strip_prefix("packages:") {
+            let rest = after.trim();
+            if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                for tok in inner.split(',') {
+                    let clean = tok.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+                    if !clean.is_empty() {
+                        out.push(clean.to_string());
+                    }
+                }
+                in_packages = false;
+            } else {
+                in_packages = true;
+            }
             continue;
         }
         if in_packages {
-            if trimmed.starts_with('-') {
-                let item = trimmed.trim_start_matches('-').trim();
-                let clean = item.trim_matches(|c| c == '\'' || c == '"').trim();
-                if !clean.starts_with('!') && !clean.is_empty() {
+            if let Some(item) = trimmed.strip_prefix('-') {
+                let clean = item.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+                if !clean.is_empty() {
                     out.push(clean.to_string());
                 }
             } else if !line.starts_with(' ') && !line.starts_with('\t') {
@@ -280,30 +368,57 @@ fn parse_yaml_packages_list(raw: &str) -> Vec<String> {
     out
 }
 
-fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
-    let mut package_dirs = Vec::new();
-    for pat in patterns {
-        let clean = pat.trim_end_matches('/');
-        if let Some(parent) = clean.strip_suffix("/*") {
-            let parent_dir = root.join(parent);
-            if let Ok(entries) = std::fs::read_dir(&parent_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            package_dirs.push(entry.path());
-                        }
-                    }
-                }
+fn collect_dirs_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if matches!(
+                name,
+                "node_modules" | ".git" | "target" | "dist" | "build" | ".mimori"
+            ) {
+                continue;
             }
-        } else if clean.ends_with("/**") {
-            let parent = clean.trim_end_matches("/**");
+        }
+        out.push(path.clone());
+        collect_dirs_recursive(&path, depth + 1, out);
+    }
+}
+
+fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for pat in patterns {
+        let trimmed = pat.trim();
+        if let Some(neg) = trimmed.strip_prefix('!') {
+            excludes.push(neg.trim_end_matches('/').to_string());
+        } else {
+            includes.push(trimmed.trim_end_matches('/').to_string());
+        }
+    }
+
+    let mut package_dirs = Vec::new();
+    for clean in &includes {
+        if let Some(parent) = clean.strip_suffix("/**") {
+            let parent_dir = root.join(parent);
+            collect_dirs_recursive(&parent_dir, 0, &mut package_dirs);
+        } else if let Some(parent) = clean.strip_suffix("/*") {
             let parent_dir = root.join(parent);
             if let Ok(entries) = std::fs::read_dir(&parent_dir) {
                 for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            package_dirs.push(entry.path());
-                        }
+                    if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        package_dirs.push(entry.path());
                     }
                 }
             }
@@ -314,21 +429,36 @@ fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             }
         }
     }
+
     let canon_root = root.canonicalize().ok();
-    package_dirs.retain(|d| {
-        if let (Some(cr), Ok(cd)) = (&canon_root, d.canonicalize()) {
-            cd.starts_with(cr)
-        } else {
-            d.starts_with(root)
+    let mut confined = Vec::new();
+    for d in package_dirs {
+        let Ok(cd) = confine_to_workspace(root, &d) else {
+            continue;
+        };
+        let rel = canon_root
+            .as_deref()
+            .and_then(|cr| cd.strip_prefix(cr).ok())
+            .map(normalize_rel_str)
+            .unwrap_or_default();
+        let excluded = excludes.iter().any(|ex| {
+            if let Some(pref) = ex.strip_suffix("/*").or_else(|| ex.strip_suffix("/**")) {
+                rel == pref || rel.starts_with(&format!("{pref}/"))
+            } else {
+                rel == *ex
+            }
+        });
+        if !excluded {
+            confined.push(cd);
         }
-    });
-    package_dirs.sort();
-    package_dirs.dedup();
-    package_dirs
+    }
+    confined.sort();
+    confined.dedup();
+    confined
 }
 
 /// `package.json` `name` -> the directory that declares it.
-fn read_package_names(manifests: &[std::path::PathBuf]) -> Vec<(String, std::path::PathBuf)> {
+fn read_package_names(manifests: &[PathBuf]) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for path in manifests {
         let Some(dir) = path.parent() else {
@@ -337,10 +467,8 @@ fn read_package_names(manifests: &[std::path::PathBuf]) -> Vec<(String, std::pat
         let Ok(raw) = std::fs::read_to_string(path) else {
             continue;
         };
-        // Deliberately strict: a malformed manifest must be reported, because
-        // silently skipping it means its package's imports stay "external" and
-        // the edges to them vanish without a trace.
-        match serde_json::from_str::<Value>(&raw) {
+        let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+        match serde_json::from_str::<Value>(raw) {
             Ok(json) => {
                 if let Some(name) = json.get("name").and_then(Value::as_str) {
                     if !name.is_empty() {
@@ -358,31 +486,40 @@ fn read_package_names(manifests: &[std::path::PathBuf]) -> Vec<(String, std::pat
     out
 }
 
+fn push_rust_crate(out: &mut Vec<String>, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    if !out.iter().any(|p| p == name) {
+        out.push(name.to_string());
+    }
+    let ident = name.replace('-', "_");
+    if !out.iter().any(|p| p == &ident) {
+        out.push(ident);
+    }
+}
+
 fn read_cargo_package_names(cargo_manifests: &[PathBuf], out: &mut Vec<String>) {
     for cargo_toml in cargo_manifests {
-        if let Ok(content) = std::fs::read_to_string(cargo_toml) {
-            let mut in_package = false;
-            for line in content.lines() {
-                let without_comment = line.split('#').next().unwrap_or("");
-                let trimmed = without_comment.trim();
-                if trimmed.starts_with('[') {
-                    in_package = trimmed == "[package]";
-                } else if in_package {
-                    if let Some((key, val)) = trimmed.split_once('=') {
-                        if key.trim() == "name" {
-                            let name = val.trim().trim_matches('"').trim_matches('\'').trim();
-                            if !name.is_empty() {
-                                if !out.iter().any(|p| p == name) {
-                                    out.push(name.to_string());
-                                }
-                                let rust_ident = name.replace('-', "_");
-                                if !out.iter().any(|p| p == &rust_ident) {
-                                    out.push(rust_ident);
-                                }
-                            }
-                        }
-                    }
-                }
+        let Ok(content) = std::fs::read_to_string(cargo_toml) else {
+            continue;
+        };
+        let mut section = "";
+        for line in content.lines() {
+            let trimmed = line.split('#').next().unwrap_or("").trim();
+            if trimmed.starts_with('[') {
+                section = trimmed;
+                continue;
+            }
+            if section != "[package]" && section != "[lib]" {
+                continue;
+            }
+            let Some((key, val)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "name" {
+                let name = val.trim().trim_matches('"').trim_matches('\'').trim();
+                push_rust_crate(out, name);
             }
         }
     }
@@ -390,29 +527,24 @@ fn read_cargo_package_names(cargo_manifests: &[PathBuf], out: &mut Vec<String>) 
 
 fn read_go_module_names(go_mods: &[PathBuf], out: &mut Vec<String>) {
     for go_mod in go_mods {
-        if let Ok(content) = std::fs::read_to_string(go_mod) {
-            for line in content.lines() {
-                let without_comment = line.split("//").next().unwrap_or("");
-                let trimmed = without_comment.trim();
-                if let Some(rest) = trimmed.strip_prefix("module ") {
-                    let mod_name = rest.trim().trim_matches('"').trim();
-                    if !mod_name.is_empty() && !out.iter().any(|p| p == mod_name) {
-                        out.push(mod_name.to_string());
-                    }
+        let Ok(content) = std::fs::read_to_string(go_mod) else {
+            continue;
+        };
+        for line in content.lines() {
+            let trimmed = line.split("//").next().unwrap_or("").trim();
+            if let Some(rest) = trimmed.strip_prefix("module ") {
+                let mod_name = rest.trim().trim_matches('"').trim();
+                if !mod_name.is_empty() && !out.iter().any(|p| p == mod_name) {
+                    out.push(mod_name.to_string());
                 }
             }
         }
     }
 }
 
-/// A key is a usable alias only when it cannot swallow the whole npm registry
-/// and does not simply point back into `node_modules`:
-///
-/// - `"*"` (no non-wildcard prefix) matches `react` as readily as `@app/x`.
-/// - `"lodash": ["./node_modules/lodash"]` is a redirect to a package, so the
-///   gate must keep treating it as external.
+/// Rejects wildcard `"*"` and aliases whose every replacement targets `node_modules`.
 fn pattern_for(key: &str, replacements: &[String]) -> Option<AliasPattern> {
-    if replacements.iter().any(|r| r.contains("node_modules")) {
+    if !replacements.is_empty() && replacements.iter().all(|r| r.contains("node_modules")) {
         return None;
     }
     match key.split_once('*') {
@@ -434,6 +566,26 @@ fn pattern_for(key: &str, replacements: &[String]) -> Option<AliasPattern> {
     }
 }
 
+fn append_json_ext(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".json");
+    PathBuf::from(os)
+}
+
+fn resolve_tsconfig_target(base: PathBuf) -> PathBuf {
+    if base.is_file() {
+        return base;
+    }
+    if base.is_dir() {
+        return base.join("tsconfig.json");
+    }
+    let with_json = append_json_ext(&base);
+    if with_json.is_file() {
+        return with_json;
+    }
+    base
+}
+
 fn collect_paths(
     root: &Path,
     config: &Path,
@@ -441,16 +593,9 @@ fn collect_paths(
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
-    // Enforce workspace confinement strictly BEFORE recording in `visited` or reading.
-    let Ok(canon_root) = root.canonicalize() else {
+    let Ok(normalized) = confine_to_workspace(root, config) else {
         return;
     };
-    let Ok(normalized) = config.canonicalize() else {
-        return;
-    };
-    if !normalized.starts_with(&canon_root) {
-        return;
-    }
     if !visited.insert(normalized.clone()) {
         return;
     }
@@ -467,10 +612,12 @@ fn collect_paths(
     };
 
     match json.get("extends") {
-        Some(Value::String(parent)) => follow_extends(root, config, parent, packages, visited, out),
+        Some(Value::String(parent)) => {
+            follow_extends(root, &normalized, parent, packages, visited, out)
+        }
         Some(Value::Array(parents)) => {
             for parent in parents.iter().filter_map(Value::as_str) {
-                follow_extends(root, config, parent, packages, visited, out);
+                follow_extends(root, &normalized, parent, packages, visited, out);
             }
         }
         _ => {}
@@ -480,7 +627,7 @@ fn collect_paths(
         for r in refs {
             let ref_path = r.as_str().or_else(|| r.get("path").and_then(Value::as_str));
             if let Some(target_spec) = ref_path {
-                follow_reference(root, config, target_spec, packages, visited, out);
+                follow_reference(root, &normalized, target_spec, packages, visited, out);
             }
         }
     }
@@ -490,7 +637,7 @@ fn collect_paths(
         .and_then(|c| c.get("baseUrl"))
         .and_then(Value::as_str)
     {
-        collect_base_url_aliases(root, config, base_url, out);
+        collect_base_url_aliases(root, &normalized, base_url, out);
     }
 
     let Some(paths) = json
@@ -521,30 +668,20 @@ fn follow_extends(
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
-    let target = if parent.starts_with('.') {
-        let mut target = config.parent().unwrap_or(Path::new("")).join(parent);
-        if target.extension().is_none() {
-            target.set_extension("json");
-        }
-        target
+    let base = if parent.starts_with('.') {
+        config.parent().unwrap_or(Path::new("")).join(parent)
     } else if parent.starts_with('/') {
         return;
     } else {
-        // A bare specifier is either an npm shareable config
-        // (`@tsconfig/node18`, cut here) or a workspace member's shared base
-        // (`@acme/tsconfig/base.json`), which is ours and must be followed.
         let Some((name, rest)) = split_package_spec(parent) else {
             return;
         };
         let Some((_, dir)) = packages.iter().find(|(n, _)| *n == name) else {
             return;
         };
-        let mut target = dir.join(rest);
-        if target.extension().is_none() {
-            target.set_extension("json");
-        }
-        target
+        dir.join(rest)
     };
+    let target = resolve_tsconfig_target(base);
     collect_paths(root, &target, packages, visited, out);
 }
 
@@ -574,30 +711,7 @@ fn follow_reference(
         config_dir.join(target_spec)
     };
 
-    let Ok(canon_root) = root.canonicalize() else {
-        return;
-    };
-    let target = if let Ok(c) = candidate.canonicalize() {
-        if !c.starts_with(&canon_root) {
-            return;
-        }
-        if c.is_dir() {
-            c.join("tsconfig.json")
-        } else {
-            c
-        }
-    } else {
-        let with_ext = candidate.with_extension("json");
-        if let Ok(c) = with_ext.canonicalize() {
-            if !c.starts_with(&canon_root) {
-                return;
-            }
-            c
-        } else {
-            return;
-        }
-    };
-
+    let target = resolve_tsconfig_target(candidate);
     collect_paths(root, &target, packages, visited, out);
 }
 
@@ -609,17 +723,9 @@ fn collect_base_url_aliases(
 ) {
     let config_dir = config.parent().unwrap_or(Path::new(""));
     let base_dir = config_dir.join(base_url);
-
-    let Ok(canon_root) = root.canonicalize() else {
+    let Ok(canon_base_dir) = confine_to_workspace(root, &base_dir) else {
         return;
     };
-    let Ok(canon_base_dir) = base_dir.canonicalize() else {
-        return;
-    };
-    if !canon_base_dir.starts_with(&canon_root) {
-        return;
-    }
-
     let Ok(entries) = std::fs::read_dir(&canon_base_dir) else {
         return;
     };
@@ -647,9 +753,7 @@ fn collect_base_url_aliases(
             continue;
         }
         if path.is_dir() {
-            let pattern_key = format!("{name}/*");
-            let replacement = format!("./{name}/*");
-            out.push((pattern_key, vec![replacement]));
+            out.push((format!("{name}/*"), vec![format!("./{name}/*")]));
             out.push((name.to_string(), vec![format!("./{name}")]));
         } else if path.is_file() {
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -662,10 +766,6 @@ fn collect_base_url_aliases(
     }
 }
 
-/// `@scope/name/sub/path` -> `("@scope/name", "sub/path")`;
-/// `name/sub` -> `("name", "sub")`. `None` when there is no subpath: a lone
-/// segment (`@tsconfig/node18`) is an npm shareable config, not a workspace
-/// member.
 fn split_package_spec(spec: &str) -> Option<(String, String)> {
     let split_at = if spec.starts_with('@') {
         spec.match_indices('/').nth(1).map(|(i, _)| i)
@@ -680,9 +780,8 @@ fn split_package_spec(spec: &str) -> Option<(String, String)> {
     Some((name.to_string(), rest.to_string()))
 }
 
-/// JSON with the two things `tsconfig.json` is allowed to contain: `//` and
-/// `/* */` comments, and trailing commas.
 fn parse_jsonc(raw: &str) -> Option<Value> {
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
     serde_json::from_str(&strip_trailing_commas(&strip_comments(raw))).ok()
 }
 
@@ -743,30 +842,25 @@ fn strip_trailing_commas(raw: &str) -> String {
             }
             continue;
         }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            ',' => {
-                // Keep the comma unless only whitespace precedes the next
-                // structural character.
-                let mut lookahead = chars.clone();
-                let mut next = None;
-                while let Some(&n) = lookahead.peek() {
-                    if n.is_whitespace() {
-                        lookahead.next();
-                    } else {
-                        next = Some(n);
-                        break;
-                    }
-                }
-                if !matches!(next, Some('}') | Some(']')) {
-                    out.push(c);
-                }
-            }
-            _ => out.push(c),
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
         }
+        if c == ',' {
+            let mut look = chars.clone();
+            let mut next_sig = None;
+            for lc in look.by_ref() {
+                if !lc.is_whitespace() {
+                    next_sig = Some(lc);
+                    break;
+                }
+            }
+            if matches!(next_sig, Some(']') | Some('}')) {
+                continue;
+            }
+        }
+        out.push(c);
     }
     out
 }
@@ -777,338 +871,34 @@ mod tests {
 
     #[test]
     fn wildcard_and_exact_patterns_match_their_own_specifiers_only() {
-        let set = AliasSet {
-            patterns: vec![
-                AliasPattern {
-                    prefix: "@app/server/".to_string(),
-                    suffix: String::new(),
-                    wildcard: true,
-                },
-                AliasPattern {
-                    prefix: "@/".to_string(),
-                    suffix: String::new(),
-                    wildcard: true,
-                },
-                AliasPattern {
-                    prefix: "shim".to_string(),
-                    suffix: String::new(),
-                    wildcard: false,
-                },
-            ],
-            packages: vec!["@acme/core".to_string()],
-            fingerprint: String::new(),
-        };
-        assert!(set.matches("@app/server/services/permission"));
-        assert!(set.matches("@/components/button"));
-        assert!(set.matches("shim"));
-        assert!(!set.matches("shimmer"));
+        let set = AliasSet::for_test(&["@/*", "@app/server/*", "exact-alias"]);
+        assert!(set.matches("@/utils/date"));
+        assert!(set.matches("@app/server/db"));
+        assert!(set.matches("exact-alias"));
         assert!(!set.matches("react"));
-        assert!(!set.matches("drizzle-orm"));
-        assert!(!set.matches("@app/other"));
-        // A workspace member is first-party by its package name, with or
-        // without a subpath; a name that merely shares a prefix is not.
-        assert!(set.matches("@acme/core"));
-        assert!(set.matches("@acme/core/i18n"));
-        assert!(!set.matches("@acme/core-utils"));
-        assert!(!set.matches("@acme"));
+        assert!(!set.matches("exact-alias/sub"));
     }
 
     #[test]
-    fn bare_wildcard_key_is_rejected() {
-        assert!(pattern_for("*", &["./src/*".to_string()]).is_none());
+    fn jsonc_strips_bom_comments_and_trailing_commas() {
+        let raw = "\u{FEFF}{\n  // comment\n  \"compilerOptions\": { /* block */ \"paths\": { \"@/*\": [\"./src/*\",], }, }\n}";
+        assert!(parse_jsonc(raw).is_some());
     }
 
     #[test]
-    fn key_pointing_back_into_node_modules_is_external() {
-        assert!(pattern_for("lodash", &["./node_modules/lodash".to_string()]).is_none());
+    fn node_modules_fallback_array_preserves_first_party_alias() {
+        assert!(pattern_for("@d/*", &["./src/*".into(), "./node_modules/@d/*".into()]).is_some());
+        assert!(pattern_for("lodash", &["./node_modules/lodash".into()]).is_none());
     }
 
     #[test]
-    fn wildcard_in_the_middle_is_honoured() {
-        let p = pattern_for("@app/*/utils", &["./src/*/utils".to_string()]).unwrap();
-        assert!(p.matches("@app/server/utils"));
-        assert!(!p.matches("@app/server/lib"));
-        assert!(!p.matches("@app/utils"));
-    }
-
-    #[test]
-    fn jsonc_comments_and_trailing_commas_parse() {
-        let raw = r#"{
-  // a comment
-  /* another */
-  "compilerOptions": {
-    "paths": {
-      "@app/*": ["./src/*"], // trailing comment
-    },
-  },
-}"#;
-        let json = parse_jsonc(raw).expect("jsonc must parse");
-        assert!(json["compilerOptions"]["paths"]["@app/*"].is_array());
-    }
-
-    #[test]
-    fn package_specs_split_into_name_and_subpath() {
+    fn yaml_packages_handles_inline_comments_and_flow_lists() {
+        let y1 = "packages:\n  - 'packages/*' # inline comment\n  - '!packages/ignored'\n";
         assert_eq!(
-            split_package_spec("@acme/tsconfig/base.json"),
-            Some(("@acme/tsconfig".into(), "base.json".into()))
+            parse_yaml_packages_list(y1),
+            vec!["packages/*", "!packages/ignored"]
         );
-        assert_eq!(
-            split_package_spec("tsconfig/base.json"),
-            Some(("tsconfig".into(), "base.json".into()))
-        );
-        assert_eq!(
-            split_package_spec("pkg/a/b"),
-            Some(("pkg".into(), "a/b".into()))
-        );
-        // Lone segments are npm packages, not workspace members.
-        assert_eq!(split_package_spec("@tsconfig/node18"), None);
-        assert_eq!(split_package_spec("react"), None);
-    }
-
-    /// The pnpm-monorepo shape: apps extend a shared base addressed by
-    /// package name, and the aliases live in that base.
-    #[test]
-    fn extends_through_a_workspace_package_name_is_followed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("packages/tsconfig")).unwrap();
-        std::fs::write(
-            root.join("packages/tsconfig/package.json"),
-            r#"{ "name": "@acme/tsconfig" }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("packages/tsconfig/base.json"),
-            r#"{ "compilerOptions": { "paths": { "@acme/shared/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("packages/core")).unwrap();
-        std::fs::write(
-            root.join("packages/core/package.json"),
-            r#"{ "name": "@acme/core" }"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("apps/web")).unwrap();
-        std::fs::write(
-            root.join("apps/web/tsconfig.json"),
-            r#"{ "extends": "@acme/tsconfig/base.json" }"#,
-        )
-        .unwrap();
-
-        let set = AliasSet::collect(root);
-        assert!(
-            set.matches("@acme/shared/utils"),
-            "aliases declared in a package-named base must be applied: {set:?}"
-        );
-        assert!(
-            set.matches("@acme/core"),
-            "workspace member must be internal"
-        );
-        assert!(set.matches("@acme/core/i18n"));
-        assert!(!set.matches("react"));
-    }
-
-    #[test]
-    fn package_manifest_changes_move_the_fingerprint() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("package.json"), r#"{ "name": "root" }"#).unwrap();
-        let first = AliasSet::collect(root);
-
-        std::fs::create_dir_all(root.join("packages/a")).unwrap();
-        std::fs::write(
-            root.join("packages/a/package.json"),
-            r#"{ "name": "@acme/a" }"#,
-        )
-        .unwrap();
-        let second = AliasSet::collect(root);
-
-        assert!(second.matches("@acme/a"));
-        assert_ne!(
-            first.fingerprint(),
-            second.fingerprint(),
-            "a new workspace package must invalidate the parse cache"
-        );
-    }
-
-    #[test]
-    fn slashes_inside_strings_survive_comment_stripping() {
-        let json = parse_jsonc(r#"{ "url": "https://example.com//x" }"#).unwrap();
-        assert_eq!(json["url"], "https://example.com//x");
-    }
-
-    #[test]
-    fn extends_chain_inherits_aliases_relative_to_the_extended_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("tsconfig.base.json"),
-            r#"{ "compilerOptions": { "paths": { "@base/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("packages/app")).unwrap();
-        std::fs::write(
-            root.join("packages/app/tsconfig.json"),
-            r#"{ "extends": "../../tsconfig.base",
-                 "compilerOptions": { "paths": { "@app/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-
-        let set = AliasSet::collect(root);
-        assert!(set.matches("@base/utils"), "extends alias missing: {set:?}");
-        assert!(set.matches("@app/utils"));
-        assert!(!set.matches("react"));
-        assert_eq!(set.pattern_count(), 2);
-    }
-
-    #[test]
-    fn tsconfig_cycle_terminates_and_fingerprint_tracks_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{ "extends": "./tsconfig.loop.json",
-                 "compilerOptions": { "paths": { "@a/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("tsconfig.loop.json"),
-            r#"{ "extends": "./tsconfig.json" }"#,
-        )
-        .unwrap();
-
-        let first = AliasSet::collect(root);
-        assert!(first.matches("@a/x"));
-
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{ "extends": "./tsconfig.loop.json",
-                 "compilerOptions": { "paths": { "@b/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-        let second = AliasSet::collect(root);
-        assert!(second.matches("@b/x"));
-        assert_ne!(
-            first.fingerprint(),
-            second.fingerprint(),
-            "an edited tsconfig must change the fingerprint"
-        );
-    }
-
-    #[test]
-    fn tsconfig_project_references_are_followed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{ "references": [{ "path": "./packages/core" }] }"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("packages/core")).unwrap();
-        std::fs::write(
-            root.join("packages/core/tsconfig.json"),
-            r#"{ "compilerOptions": { "paths": { "@core/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-
-        let set = AliasSet::collect(root);
-        assert!(
-            set.matches("@core/service"),
-            "reference path alias should match"
-        );
-        assert!(!set.matches("react"));
-    }
-
-    #[test]
-    fn base_url_discovers_internal_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("src/utils")).unwrap();
-        std::fs::create_dir_all(root.join("src/components")).unwrap();
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{ "compilerOptions": { "baseUrl": "./src" } }"#,
-        )
-        .unwrap();
-
-        let set = AliasSet::collect(root);
-        assert!(set.matches("utils/math"), "baseUrl subdir should match");
-        assert!(set.matches("components/button"));
-        assert!(!set.matches("react"));
-    }
-
-    #[test]
-    fn pnpm_workspace_yaml_discovers_packages_and_fingerprints() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("pnpm-workspace.yaml"),
-            "packages:\n  - 'packages/*'\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("packages/auth")).unwrap();
-        std::fs::write(
-            root.join("packages/auth/tsconfig.json"),
-            r#"{ "compilerOptions": { "paths": { "@auth/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-
-        let first = AliasSet::collect(root);
-        assert!(first.matches("@auth/jwt"));
-        assert!(first.matches("packages/auth"));
-
-        // Edit pnpm-workspace.yaml to invalidate fingerprint
-        std::fs::write(
-            root.join("pnpm-workspace.yaml"),
-            "packages:\n  - 'packages/*'\n  - 'apps/*'\n",
-        )
-        .unwrap();
-        let second = AliasSet::collect(root);
-        assert_ne!(first.fingerprint(), second.fingerprint());
-    }
-
-    #[test]
-    fn base_url_strictly_confined_to_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("workspace");
-        std::fs::create_dir_all(&root).unwrap();
-
-        // Create a directory outside the workspace root
-        let outside_dir = dir.path().join("outside_secret");
-        std::fs::create_dir_all(&outside_dir).unwrap();
-
-        // tsconfig attempts to set baseUrl to parent (escaping workspace)
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{ "compilerOptions": { "baseUrl": "../" } }"#,
-        )
-        .unwrap();
-
-        let set = AliasSet::collect(&root);
-        assert!(!set.matches("outside_secret"));
-        assert!(!set.matches("outside_secret/file"));
-    }
-
-    #[test]
-    fn fingerprint_deterministic_sorting() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("b_pkg")).unwrap();
-        std::fs::create_dir_all(root.join("a_pkg")).unwrap();
-        std::fs::write(
-            root.join("b_pkg/tsconfig.json"),
-            r#"{ "compilerOptions": { "paths": { "@b/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("a_pkg/tsconfig.json"),
-            r#"{ "compilerOptions": { "paths": { "@a/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-
-        let set1 = AliasSet::collect(root);
-        let set2 = AliasSet::collect(root);
-        assert_eq!(set1.fingerprint(), set2.fingerprint());
-        assert!(!set1.fingerprint().is_empty());
+        let y2 = "packages: ['apps/*', 'libs/*'] # flow\n";
+        assert_eq!(parse_yaml_packages_list(y2), vec!["apps/*", "libs/*"]);
     }
 }

@@ -1,3 +1,4 @@
+pub mod common;
 pub mod go;
 pub mod lang;
 pub mod python;
@@ -14,7 +15,9 @@ use std::path::Path;
 
 pub fn parse_file(path: &Path, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
     let lang = Language::from_path(path);
-    let file_str = path.to_str().unwrap_or("");
+    let Some(file_str) = path.to_str() else {
+        bail!("Non-UTF8 file path cannot be indexed: {}", path.display());
+    };
 
     match lang {
         Language::Rust => rust::parse_rust(file_str, content, aliases),
@@ -22,8 +25,8 @@ pub fn parse_file(path: &Path, content: &str, aliases: &AliasSet) -> Result<Vec<
             typescript::parse_typescript(file_str, content, false, aliases)
         }
         Language::TSX => typescript::parse_typescript(file_str, content, true, aliases),
-        Language::Python => python::parse_python(file_str, content),
-        Language::Go => go::parse_go(file_str, content),
+        Language::Python => python::parse_python(file_str, content, aliases),
+        Language::Go => go::parse_go(file_str, content, aliases),
         Language::Unknown => bail!("Unsupported language for file: {}", path.display()),
     }
 }
@@ -66,6 +69,15 @@ pub(crate) fn spec_to_module_hint(spec: &str) -> String {
     s.to_string()
 }
 
+pub(crate) fn format_hinted_call(hint: &str, name: &str) -> String {
+    let hint = hint.trim();
+    if hint.is_empty() {
+        name.to_string()
+    } else {
+        format!("{hint}:{name}")
+    }
+}
+
 pub(crate) fn apply_import_aliases(
     symbols: &mut [Symbol],
     aliases: &HashMap<String, (String, String)>,
@@ -78,12 +90,20 @@ pub(crate) fn apply_import_aliases(
             if s.member_calls.contains(call) {
                 continue;
             }
-            if let Some((hint, exported)) = aliases.get(call.as_str()) {
-                let rewritten = format!("{hint}:{exported}");
+            let rewritten = if let Some((hint, exported)) = aliases.get(call.as_str()) {
+                Some(format_hinted_call(hint, exported))
+            } else if let Some((head, tail)) = call.split_once("::") {
+                aliases.get(head).map(|(hint, exported)| {
+                    format_hinted_call(hint, &format!("{exported}::{tail}"))
+                })
+            } else {
+                None
+            };
+            if let Some(new_call) = rewritten {
                 if let Some(cnt) = s.call_counts.remove(call.as_str()) {
-                    *s.call_counts.entry(rewritten.clone()).or_insert(0) += cnt;
+                    *s.call_counts.entry(new_call.clone()).or_insert(0) += cnt;
                 }
-                *call = rewritten;
+                *call = new_call;
             }
         }
         let mut seen_calls = HashSet::with_capacity(s.calls.len());

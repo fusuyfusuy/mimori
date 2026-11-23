@@ -2,18 +2,13 @@ use anyhow::{bail, Context, Result};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-/// File extensions that make a `:`-prefix recognizable as a path rather than
+/// File extensions that make a `:`/`#`-prefix recognizable as a path rather than
 /// the first segment of a qualified symbol name.
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go",
 ];
 
 /// A parsed target coordinate.
-///
-/// Parsing used to be four separate `split_once(':')` calls, which read
-/// `Store::save` as file `"Store"` plus name `":save"`. That matched nothing,
-/// and only resolved at all because the caller fell through to a bare-name
-/// search -- so the exact-coordinate path was dead for every qualified symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Coordinate {
     /// `path/file.rs:#L10-50`
@@ -22,7 +17,7 @@ pub enum Coordinate {
         start: usize,
         end: usize,
     },
-    /// `path/file.rs:symbol`
+    /// `path/file.rs:symbol` or `path/file.rs#symbol`
     Symbol { file: PathBuf, name: String },
     /// `symbol` or `Type::method`
     Bare { name: String },
@@ -32,16 +27,20 @@ impl Coordinate {
     pub fn parse(raw: &str) -> Result<Self> {
         let mut raw = raw.trim();
         if let Some(idx) = raw.rfind(" (L") {
-            if raw.ends_with(')') {
-                raw = raw[..idx].trim();
+            let inner = &raw[idx + 2..];
+            if let Some(body) = inner.strip_suffix(')') {
+                if looks_like_line_range_token(body) {
+                    raw = raw[..idx].trim();
+                }
             }
         }
         if raw.is_empty() {
             bail!("Empty coordinate.");
         }
 
-        if let Some(idx) = raw.find(":#L") {
-            let file = raw[..idx].to_string();
+        // Case-insensitive `:#L` / `:#l` line range (works for any file extension, e.g. Cargo.toml:#L1-2).
+        if let Some(idx) = find_colon_hash_line(raw) {
+            let file = &raw[..idx];
             if file.is_empty() {
                 bail!("Line coordinate '{}' has no file part.", raw);
             }
@@ -53,30 +52,40 @@ impl Coordinate {
             });
         }
 
-        // Split on the first ':' only when what precedes it looks like a path.
-        // Otherwise the whole string is a name, which keeps `Store::save` intact.
-        // On Windows, absolute paths start with a drive letter (`C:\...` or `C:/...`).
-        let split_idx = if raw.len() >= 3
-            && raw.as_bytes()[0].is_ascii_alphabetic()
-            && raw.as_bytes()[1] == b':'
-            && (raw.as_bytes()[2] == b'\\' || raw.as_bytes()[2] == b'/')
-        {
-            raw[2..].find(':').map(|i| i + 2)
-        } else {
-            raw.find(':')
-        };
-
+        // Split on the first ':' (after optional Windows drive letter `C:\` / `C:/`).
+        let split_idx = find_path_colon(raw);
         if let Some(idx) = split_idx {
             let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
-            if !head.contains('#') && looks_like_path(head) {
+            let tail_is_line_spec = tail.starts_with('#')
+                || tail
+                    .strip_prefix(['L', 'l'])
+                    .is_some_and(starts_with_digit_line_spec);
+            if looks_like_path(head) || (tail_is_line_spec && looks_like_any_file(head)) {
                 return parse_colon_tail(raw, head, tail);
             }
         }
 
-        if let Some(idx) = raw.find('#') {
+        // Split on the last '#' to support `file.rs#Symbol`, `file.rs#L10-20`, and `Cargo.toml#L1-2`,
+        // while tolerating directories containing '#' (e.g. `dir#1/b.rs#foo`).
+        if let Some(idx) = raw.rfind('#') {
             let (head, tail) = (&raw[..idx], &raw[idx + 1..]);
-            if looks_like_path(head) {
-                return parse_hash_tail(raw, head, tail);
+            if tail.is_empty() && looks_like_any_file(head) {
+                bail!("Coordinate '{}' has an empty '#' anchor.", raw);
+            }
+            let looks_like_line_anchor = tail
+                .strip_prefix(['L', 'l'])
+                .is_some_and(starts_with_digit_line_spec)
+                || starts_with_digit_line_spec(tail);
+            if looks_like_line_anchor && looks_like_any_file(head) {
+                return parse_hash_line(raw, head, tail);
+            }
+            if looks_like_path(head) && !tail.is_empty() {
+                // Reject obvious malformed line specs like `a.rs#Lxx`? Wait: `Lxx` could be a symbol name,
+                // whereas `a.rs:#Lxx` was already caught by `parse_colon_tail` -> `parse_hash_tail`.
+                return Ok(Coordinate::Symbol {
+                    file: PathBuf::from(head),
+                    name: tail.to_string(),
+                });
             }
         }
 
@@ -89,8 +98,6 @@ impl Coordinate {
     /// so an absolute target and a relative one resolve identically.
     pub fn normalize_against(self, root: &Path) -> Self {
         match self {
-            // A line range is read straight off disk and never looked up in the
-            // index, so the path stays exactly as the user gave it.
             lines @ Coordinate::Lines { .. } => lines,
             Coordinate::Symbol { file, name } => Coordinate::Symbol {
                 file: relativize(&file, root),
@@ -114,8 +121,6 @@ impl Coordinate {
         }
     }
 
-    /// The directory to start searching for the workspace root from, when the
-    /// coordinate carries an absolute path.
     pub fn absolute_parent(&self) -> Option<PathBuf> {
         let file = self.file()?;
         if !file.is_absolute() {
@@ -137,15 +142,60 @@ impl fmt::Display for Coordinate {
     }
 }
 
+fn find_colon_hash_line(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] == b':' && bytes[i + 1] == b'#' && matches!(bytes[i + 2], b'L' | b'l') {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_path_colon(raw: &str) -> Option<usize> {
+    if raw.len() >= 3
+        && raw.as_bytes()[0].is_ascii_alphabetic()
+        && raw.as_bytes()[1] == b':'
+        && (raw.as_bytes()[2] == b'\\' || raw.as_bytes()[2] == b'/')
+    {
+        raw[2..].find(':').map(|i| i + 2)
+    } else {
+        raw.find(':')
+    }
+}
+
+fn starts_with_digit_line_spec(s: &str) -> bool {
+    !s.is_empty() && s.as_bytes()[0].is_ascii_digit()
+}
+
+fn looks_like_line_range_token(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(['L', 'l']) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    match rest.split_once('-') {
+        Some((a, b)) => {
+            let b = b.strip_prefix(['L', 'l']).unwrap_or(b);
+            !a.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && !b.is_empty()
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
+        None => rest.bytes().all(|c| c.is_ascii_digit()),
+    }
+}
+
 fn parse_colon_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
     if tail.is_empty() {
         bail!("Coordinate '{}' names a file but no symbol.", raw);
     }
     if let Some(hash_tail) = tail.strip_prefix('#') {
-        return parse_hash_tail(raw, head, hash_tail);
+        return parse_hash_line(raw, head, hash_tail);
     }
-    if let Some(rest) = tail.strip_prefix('L') {
-        if rest.contains('-') && rest.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+    if let Some(rest) = tail.strip_prefix(['L', 'l']) {
+        if starts_with_digit_line_spec(rest) {
             let (start, end) = parse_line_range(rest)?;
             return Ok(Coordinate::Lines {
                 file: PathBuf::from(head),
@@ -160,7 +210,7 @@ fn parse_colon_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
     })
 }
 
-fn parse_hash_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
+fn parse_hash_line(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
     if head.is_empty() {
         bail!("Line coordinate '{}' has no file part.", raw);
     }
@@ -177,20 +227,24 @@ fn parse_hash_tail(raw: &str, head: &str, tail: &str) -> Result<Coordinate> {
 }
 
 fn parse_line_range(range: &str) -> Result<(usize, usize)> {
-    match range.split_once('-') {
+    let (start, end) = match range.split_once('-') {
         Some((s, e)) => {
             let e = e.trim();
             let e = e.strip_prefix(['L', 'l']).unwrap_or(e);
-            Ok((
-                s.trim().parse().context("Invalid start line")?,
-                e.trim().parse().context("Invalid end line")?,
-            ))
+            (
+                s.trim().parse::<usize>().context("Invalid start line")?,
+                e.trim().parse::<usize>().context("Invalid end line")?,
+            )
         }
         None => {
             let n: usize = range.trim().parse().context("Invalid line number")?;
-            Ok((n, n))
+            (n, n)
         }
+    };
+    if start == 0 || end == 0 {
+        bail!("Line numbers must be >= 1 (got '{}').", range);
     }
+    Ok((start, end))
 }
 
 fn looks_like_path(head: &str) -> bool {
@@ -203,9 +257,15 @@ fn looks_like_path(head: &str) -> bool {
         .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
 }
 
+fn looks_like_any_file(head: &str) -> bool {
+    if head.is_empty() {
+        return false;
+    }
+    head.contains('/') || head.contains('\\') || Path::new(head).extension().is_some()
+}
+
 /// Strip the workspace root and any `./` noise, leaving the form stored in the
-/// index. A path outside the root is returned unchanged so it can still match
-/// by suffix or basename.
+/// index.
 fn relativize(file: &Path, root: &Path) -> PathBuf {
     let stripped = file.strip_prefix(root).unwrap_or(file);
     let mut parts: Vec<Component<'_>> = Vec::new();
@@ -236,7 +296,6 @@ mod tests {
 
     #[test]
     fn qualified_names_are_not_mistaken_for_paths() {
-        // Regression P17: split_once(':') read this as file "Store", name ":save".
         assert_eq!(
             Coordinate::parse("Store::save").unwrap(),
             Coordinate::Bare {
@@ -265,6 +324,62 @@ mod tests {
             Coordinate::Symbol {
                 file: "a.rs".into(),
                 name: "handler".into()
+            }
+        );
+    }
+
+    #[test]
+    fn hash_symbol_and_special_paths_parse_cleanly() {
+        assert_eq!(
+            Coordinate::parse("src/lib.rs#Phase").unwrap(),
+            Coordinate::Symbol {
+                file: "src/lib.rs".into(),
+                name: "Phase".into()
+            }
+        );
+        assert_eq!(
+            Coordinate::parse("dir#1/b.rs:target").unwrap(),
+            Coordinate::Symbol {
+                file: "dir#1/b.rs".into(),
+                name: "target".into()
+            }
+        );
+        assert_eq!(
+            Coordinate::parse("Cargo.toml#L1-2").unwrap(),
+            Coordinate::Lines {
+                file: "Cargo.toml".into(),
+                start: 1,
+                end: 2
+            }
+        );
+        assert_eq!(
+            Coordinate::parse("Cargo.toml:#l1-2").unwrap(),
+            Coordinate::Lines {
+                file: "Cargo.toml".into(),
+                start: 1,
+                end: 2
+            }
+        );
+        assert_eq!(
+            Coordinate::parse("a.rs:L5").unwrap(),
+            Coordinate::Lines {
+                file: "a.rs".into(),
+                start: 5,
+                end: 5
+            }
+        );
+        assert_eq!(
+            Coordinate::parse("a.rs:foo (Linux)").unwrap(),
+            Coordinate::Symbol {
+                file: "a.rs".into(),
+                name: "foo (Linux)".into()
+            }
+        );
+        assert_eq!(
+            Coordinate::parse("a.rs:foo (L10-L20)").unwrap(),
+            Coordinate::Symbol {
+                file: "a.rs".into(),
+                name: "foo".into()
             }
         );
     }
@@ -319,5 +434,8 @@ mod tests {
         assert!(Coordinate::parse("").is_err());
         assert!(Coordinate::parse("a.rs:").is_err());
         assert!(Coordinate::parse("a.rs:#Lxx").is_err());
+        assert!(Coordinate::parse("a.rs:#L0").is_err());
+        assert!(Coordinate::parse("a.rs:#L0-0").is_err());
+        assert!(Coordinate::parse("a.rs#L0-5").is_err());
     }
 }

@@ -6,23 +6,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// One source file as found on disk: its path relative to the workspace root,
-/// its mtime, a content hash, and the content itself.
-///
-/// The hash is what decides whether a reparse is needed. mtime is carried only
-/// so it can be recorded; it is never trusted for invalidation, because any
-/// operation that preserves mtime while changing content (`cp -p`, `touch -r`,
-/// `rsync -t`) would otherwise leave the index permanently stale.
-pub struct FileScan {
-    pub rel: PathBuf,
-    pub mtime: i64,
-    pub hash: String,
-    pub content: String,
-}
+/// Maximum file size indexed or scanned (16 MiB) to prevent OOM on giant blobs.
+pub const MAX_INDEX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Directory names never indexed, matched as whole path components relative to
-/// the workspace root. Substring matching on the absolute path would exclude an
-/// entire repository that merely lives under e.g. `~/build/`.
+/// the workspace root.
 const IGNORED_DIRS: &[&str] = &[
     "target",
     "node_modules",
@@ -37,8 +25,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go",
 ];
 
-/// Coverage accounting (P1-4): what the walker crawled vs indexed, so a zero
-/// that means "none indexed" never presents as "none exists".
+/// Coverage accounting: what the walker crawled vs indexed.
 #[derive(Debug, Clone, Default)]
 pub struct ScanStats {
     pub indexed_files: usize,
@@ -50,8 +37,8 @@ pub struct ScanStats {
 /// workspace manifest/config paths without redundant directory walks.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceDiscovery {
-    /// `(normalized_rel, full_path, mtime)` sorted deterministically by `normalized_rel`.
-    pub supported: Vec<(String, PathBuf, i64)>,
+    /// `(normalized_rel, full_path, mtime, size_bytes)` sorted deterministically by `normalized_rel`.
+    pub supported: Vec<(String, PathBuf, i64, u64)>,
     pub package_manifests: Vec<PathBuf>,
     pub tsconfigs: Vec<PathBuf>,
     pub cargo_manifests: Vec<PathBuf>,
@@ -59,8 +46,7 @@ pub struct WorkspaceDiscovery {
     pub stats: ScanStats,
 }
 
-/// Hashed file entry produced by `hash_discovered_files`: carries `content`
-/// only when `retain_content` requested it (e.g., stale/new files).
+/// Hashed file entry produced by `hash_discovered_files`.
 pub struct HashedFile {
     pub rel: String,
     pub full: PathBuf,
@@ -68,41 +54,99 @@ pub struct HashedFile {
     pub hash: String,
 }
 
-/// Walk the workspace, then read and hash every supported file in parallel.
-///
-/// Reading every file on every run is what makes hash-based invalidation
-/// possible: a content change cannot be detected without reading the content.
-/// Parsing, which dominates the cost, still runs only on files whose hash moved.
-pub fn scan_workspace(root: &Path) -> Vec<FileScan> {
-    scan_workspace_with_stats(root).0
+/// Symlink handling policy for `confine_path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymlinkPolicy {
+    /// Allow symlinks whose canonical target stays within the workspace root.
+    AllowWithinWorkspace,
+    /// Forbid symlinks anywhere along the path from workspace root to candidate.
+    Forbid,
 }
 
-pub fn scan_workspace_with_stats(root: &Path) -> (Vec<FileScan>, ScanStats) {
-    let discovery = discover_workspace(root);
-    let scans: Vec<FileScan> = discovery
-        .supported
-        .into_par_iter()
-        .filter_map(|(rel, full, mtime)| {
-            let bytes = fs::read(&full).ok()?;
-            let hash = format!("{:x}", fnv1a_hash(&bytes));
-            let content = String::from_utf8_lossy(&bytes).into_owned();
-            Some(FileScan {
-                rel: PathBuf::from(rel),
-                mtime,
-                hash,
-                content,
-            })
+/// Validated, workspace-confined `--scope` prefix and optional canonical directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceScope {
+    /// Normalized workspace-relative prefix (forward slashes, no leading/trailing `/`).
+    /// Empty string means whole workspace (`.`).
+    pub rel_prefix: String,
+    /// Canonical filesystem path when the scope resolves to an existing file/directory.
+    pub canon_path: Option<PathBuf>,
+}
+
+impl WorkspaceScope {
+    /// Parse and validate a user-supplied `--scope` string against `workspace_root`.
+    /// Rejects empty strings, absolute paths, `..` traversal, and escaping symlinks.
+    pub fn parse(workspace_root: &Path, raw: &str, require_exists: bool) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("Scope cannot be empty.");
+        }
+        let normalized_sep = trimmed.replace('\\', "/");
+        if normalized_sep.starts_with('/')
+            || Path::new(trimmed).is_absolute()
+            || (normalized_sep.len() >= 2
+                && normalized_sep.as_bytes()[0].is_ascii_alphabetic()
+                && normalized_sep.as_bytes()[1] == b':')
+        {
+            bail!("Scope escapes workspace: {}", raw);
+        }
+
+        let mut parts: Vec<&str> = Vec::new();
+        for seg in normalized_sep.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => bail!("Scope escapes workspace: {}", raw),
+                other => parts.push(other),
+            }
+        }
+
+        let canon_root = workspace_root
+            .canonicalize()
+            .with_context(|| format!("Invalid workspace root '{}'", workspace_root.display()))?;
+
+        if parts.is_empty() {
+            return Ok(Self {
+                rel_prefix: String::new(),
+                canon_path: Some(canon_root),
+            });
+        }
+
+        let rel_prefix = parts.join("/");
+        let candidate = canon_root.join(&rel_prefix);
+        let canon_path = if candidate.exists() || candidate.symlink_metadata().is_ok() {
+            Some(confine_path(
+                &canon_root,
+                Path::new(&rel_prefix),
+                SymlinkPolicy::AllowWithinWorkspace,
+            )?)
+        } else if require_exists {
+            bail!("Scope path '{}' does not exist in workspace.", raw);
+        } else {
+            None
+        };
+
+        Ok(Self {
+            rel_prefix,
+            canon_path,
         })
-        .collect();
-    let mut stats = discovery.stats;
-    stats.indexed_files = scans.len();
-    (scans, stats)
+    }
+
+    /// True if `rel` (workspace-relative forward-slash path) is inside this scope
+    /// on a strict path-component boundary.
+    pub fn matches_rel(&self, rel: &str) -> bool {
+        if self.rel_prefix.is_empty() {
+            return true;
+        }
+        let norm = rel.strip_prefix("./").unwrap_or(rel);
+        norm == self.rel_prefix
+            || norm
+                .strip_prefix(&self.rel_prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
 }
 
 /// Hash all discovered source files in parallel, dropping file byte buffers
 /// immediately so clean workspaces retain zero source contents in heap memory.
-/// Files failing transient reads (`!NotFound`) are reported in the second tuple
-/// item so callers do not mistakenly purge their cached symbols.
 pub fn hash_discovered_files(
     discovery: &WorkspaceDiscovery,
 ) -> (Vec<HashedFile>, Vec<String>, usize) {
@@ -115,18 +159,26 @@ pub fn hash_discovered_files(
     let outcomes: Vec<ReadOutcome> = discovery
         .supported
         .par_iter()
-        .map(|(rel, full, mtime)| match fs::read(full) {
-            Ok(bytes) => {
-                let hash = format!("{:x}", fnv1a_hash(&bytes));
-                ReadOutcome::Hashed(HashedFile {
-                    rel: rel.clone(),
-                    full: full.clone(),
-                    mtime: *mtime,
-                    hash,
-                })
+        .map(|(rel, full, mtime, size)| {
+            if *size > MAX_INDEX_FILE_BYTES {
+                return ReadOutcome::TransientErr(rel.clone());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Gone,
-            Err(_) => ReadOutcome::TransientErr(rel.clone()),
+            match fs::read(full) {
+                Ok(bytes) => {
+                    if bytes.len() as u64 > MAX_INDEX_FILE_BYTES {
+                        return ReadOutcome::TransientErr(rel.clone());
+                    }
+                    let hash = format!("{:x}", fnv1a_hash(&bytes));
+                    ReadOutcome::Hashed(HashedFile {
+                        rel: rel.clone(),
+                        full: full.clone(),
+                        mtime: *mtime,
+                        hash,
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Gone,
+                Err(_) => ReadOutcome::TransientErr(rel.clone()),
+            }
         })
         .collect();
 
@@ -170,6 +222,11 @@ pub fn discover_workspace(root: &Path) -> WorkspaceDiscovery {
             if !canon_target.starts_with(cr) || !canon_target.is_file() {
                 continue;
             }
+            if let Ok(target_rel) = canon_target.strip_prefix(cr) {
+                if is_ignored_rel(target_rel) {
+                    continue;
+                }
+            }
         } else if !ft.is_file() {
             continue;
         }
@@ -211,9 +268,10 @@ pub fn discover_workspace(root: &Path) -> WorkspaceDiscovery {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
         let rel_norm = normalize_rel_str(rel_path);
-        supported.push((rel_norm, path.to_path_buf(), mtime));
+        supported.push((rel_norm, path.to_path_buf(), mtime, size));
     }
 
     supported.sort_by(|a, b| a.0.cmp(&b.0));
@@ -258,14 +316,12 @@ pub fn has_supported_extension(path: &Path) -> bool {
         .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext))
 }
 
-/// True when any component of the workspace-relative path is an ignored
-/// directory name.
-/// The one walk configuration for every discovery pass, so `tsconfig`
-/// discovery cannot drift from source discovery on ignore rules.
-fn walk_builder(root: &Path) -> WalkBuilder {
+/// Shared walk configuration honoring `.gitignore` (even outside `.git`) and `.mimoriignore`.
+pub fn walk_builder(root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
+        .require_git(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -273,42 +329,7 @@ fn walk_builder(root: &Path) -> WalkBuilder {
     builder
 }
 
-/// Workspace-owned configs that can declare `compilerOptions.paths`.
-/// `node_modules` configs are ignored by the walker: a dependency's aliases
-/// say nothing about this workspace's own imports.
-pub fn discover_tsconfigs(root: &Path) -> Vec<PathBuf> {
-    discover_named(root, |name| {
-        name == "jsconfig.json" || (name.starts_with("tsconfig") && name.ends_with(".json"))
-    })
-}
-
-/// Workspace-owned package manifests. Their `name` fields are how a pnpm /
-/// Turborepo / Nx workspace addresses its own packages (`@acme/core`), which
-/// is first-party code that no `tsconfig` alias has to declare.
-pub fn discover_package_manifests(root: &Path) -> Vec<PathBuf> {
-    discover_named(root, |name| name == "package.json")
-}
-
-fn discover_named(root: &Path, accept: impl Fn(&str) -> bool) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for entry in walk_builder(root).build().flatten() {
-        let path = entry.path();
-        if !path.is_file() || is_ignored_rel(path.strip_prefix(root).unwrap_or(path)) {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if accept(name) {
-            out.push(path.to_path_buf());
-        }
-    }
-    out.sort();
-    out
-}
-
-/// True when any component of the workspace-relative path is an ignored
-/// directory name.
+/// True when any component of the workspace-relative path is an ignored directory name.
 pub fn is_ignored_rel(rel: &Path) -> bool {
     rel.components().any(|c| match c {
         Component::Normal(name) => IGNORED_DIRS.iter().any(|d| OsStr::new(d) == name),
@@ -325,20 +346,12 @@ pub fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Find the workspace root for a target.
-///
-/// 1. Walk up from the target's directory for a `.mimori`, then a VCS root.
-/// 2. Otherwise, if the cwd contains the target, use the cwd.
-/// 3. Otherwise fall back to the target's own directory.
-///
-/// The previous rule was step 3 unconditionally, so an absolute coordinate
-/// inside a repository silently indexed only that one directory -- hiding
-/// callers elsewhere and writing a stray SQLite index into a source folder.
-/// Step 3 survives only for a target that lies outside any known workspace.
+/// Find the workspace root starting from `target_dir` (if provided) or `cwd`.
+/// Prioritizes VCS root (`.git`, `.hg`) then `.mimori`. Never adopts an
+/// out-of-workspace root on CLI commands (callers pass `None` to anchor to `cwd`).
 pub fn find_workspace_root(target_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     let start_dir = target_dir.unwrap_or(cwd);
 
-    // Prioritize VCS root (.git, .hg) first so a stray nested .mimori directory never hijacks the workspace.
     for marker in [".git", ".hg", ".mimori"] {
         let mut dir = Some(start_dir);
         while let Some(d) = dir {
@@ -411,6 +424,7 @@ pub fn is_system_directory(path: &Path) -> bool {
         "/dev",
         "/boot",
         "/root",
+        "/run",
         "/var/log",
         "/var/lib",
         "/var/run",
@@ -419,6 +433,9 @@ pub fn is_system_directory(path: &Path) -> bool {
         "/var/lock",
         "/var/backups",
         "/var/db",
+        "/System",
+        "/Library",
+        "/Volumes",
     ];
     let matches_sys = |p: &Path| {
         EXACT_CONTAINERS.iter().any(|&c| p == Path::new(c))
@@ -441,25 +458,71 @@ pub fn is_disallowed_workspace_root(path: &Path) -> bool {
         || same_dir_or_canon(path, &std::env::temp_dir())
 }
 
-pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
+/// Lexically collapse `.` and `..` without touching disk, so escaping relative
+/// paths are caught BEFORE `canonicalize()` (eliminating existence oracles).
+pub fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    out.push(comp);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Confine `candidate` strictly within `workspace_root` under `policy`.
+/// Lexical `..` normalization runs before `canonicalize()` so missing outside
+/// paths return `"Path escapes workspace"` instead of leaking OS `ENOENT`.
+pub fn confine_path(
+    workspace_root: &Path,
+    candidate: &Path,
+    policy: SymlinkPolicy,
+) -> Result<PathBuf> {
     let canon_root = workspace_root
         .canonicalize()
         .with_context(|| format!("Invalid workspace root '{}'", workspace_root.display()))?;
 
-    let target = if candidate.is_absolute() {
+    let raw_target = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        workspace_root.join(candidate)
+        canon_root.join(candidate)
     };
+    let lexical = normalize_lexical(&raw_target);
+    if !lexical.starts_with(&canon_root) {
+        bail!("Path escapes workspace: {}", candidate.display());
+    }
 
-    let canon_candidate = match target.canonicalize() {
-        Ok(c) => c,
-        Err(e) => {
-            if target.is_absolute() && !target.starts_with(&canon_root) {
-                bail!("Path escapes workspace: {}", candidate.display());
+    if policy == SymlinkPolicy::Forbid {
+        if let Ok(rel) = lexical.strip_prefix(&canon_root) {
+            let mut cur = canon_root.clone();
+            for comp in rel.components() {
+                cur.push(comp);
+                if let Ok(meta) = fs::symlink_metadata(&cur) {
+                    if meta.file_type().is_symlink() {
+                        bail!(
+                            "Path escapes workspace (symlink forbidden): {}",
+                            candidate.display()
+                        );
+                    }
+                }
             }
-            bail!("Cannot resolve path '{}': {}", candidate.display(), e);
         }
+    }
+
+    let canon_candidate = match raw_target.canonicalize() {
+        Ok(c) => c,
+        Err(e) => bail!("Cannot resolve path '{}': {}", candidate.display(), e),
     };
 
     if canon_candidate.starts_with(&canon_root) {
@@ -467,6 +530,14 @@ pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<P
     } else {
         bail!("Path escapes workspace: {}", candidate.display());
     }
+}
+
+pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
+    confine_path(
+        workspace_root,
+        candidate,
+        SymlinkPolicy::AllowWithinWorkspace,
+    )
 }
 
 #[cfg(test)]
@@ -478,10 +549,6 @@ mod tests {
         assert!(is_ignored_rel(Path::new("target/debug/x.rs")));
         assert!(is_ignored_rel(Path::new("a/node_modules/b/c.js")));
         assert!(is_ignored_rel(Path::new(".mimori/index.rs")));
-
-        // Regression M14: a repo living under a path containing an ignored name
-        // must still be indexed. These are workspace-relative, so the parent
-        // directory never appears here.
         assert!(!is_ignored_rel(Path::new("src/lib.rs")));
         assert!(!is_ignored_rel(Path::new("src/building/mod.rs")));
         assert!(!is_ignored_rel(Path::new("src/targeting.rs")));
@@ -503,8 +570,6 @@ mod tests {
         let nested = root.join("src").join("deep");
         fs::create_dir_all(&nested).unwrap();
         fs::create_dir_all(root.join(".mimori")).unwrap();
-
-        // Regression M5: this used to return `nested` itself.
         assert_eq!(
             find_workspace_root(Some(&nested), Path::new("/nowhere")),
             root
@@ -517,40 +582,34 @@ mod tests {
         let cwd = tmp.path().canonicalize().unwrap();
         let nested = cwd.join("src").join("deep");
         fs::create_dir_all(&nested).unwrap();
-
-        // Regression M5: this used to return `nested`, indexing one directory.
         assert_eq!(find_workspace_root(Some(&nested), &cwd), cwd);
     }
 
     #[test]
-    fn scan_stats_report_indexed_vs_crawled() {
-        // P1-4: unindexed extensions are disclosed, not silent.
+    fn discovery_stats_report_indexed_vs_crawled() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::write(root.join("a.rs"), "fn a() {}").unwrap();
         fs::write(root.join("b.md"), "# docs").unwrap();
         fs::write(root.join("c.json"), "{}").unwrap();
-        let (scans, stats) = scan_workspace_with_stats(root);
-        assert_eq!(scans.len(), 1);
-        assert_eq!(stats.indexed_files, 1);
-        assert_eq!(stats.crawled_files, 3);
-        assert!(stats.unindexed_exts.iter().any(|e| e.starts_with("md")));
-        assert!(stats.unindexed_exts.iter().any(|e| e.starts_with("json")));
-    }
-
-    #[test]
-    fn a_target_outside_any_workspace_roots_at_its_own_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let loose = tmp.path().canonicalize().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-
-        // Pointing at a loose file from an unrelated cwd must still work.
-        assert_eq!(find_workspace_root(Some(&loose), elsewhere.path()), loose);
+        let disc = discover_workspace(root);
+        assert_eq!(disc.supported.len(), 1);
+        assert_eq!(disc.stats.indexed_files, 1);
+        assert_eq!(disc.stats.crawled_files, 3);
+        assert!(disc
+            .stats
+            .unindexed_exts
+            .iter()
+            .any(|e| e.starts_with("md")));
+        assert!(disc
+            .stats
+            .unindexed_exts
+            .iter()
+            .any(|e| e.starts_with("json")));
     }
 
     #[test]
     fn hash_distinguishes_same_length_content() {
-        // Same byte length, different content: the case mtime+size cannot catch.
         assert_ne!(
             fnv1a_hash(b"pub fn aaa() {}"),
             fnv1a_hash(b"pub fn bbb() {}")
@@ -563,6 +622,8 @@ mod tests {
         assert!(is_disallowed_workspace_root(Path::new("/home")));
         assert!(is_disallowed_workspace_root(Path::new("/etc")));
         assert!(is_disallowed_workspace_root(Path::new("/usr")));
+        assert!(is_disallowed_workspace_root(Path::new("/run")));
+        assert!(is_disallowed_workspace_root(Path::new("/var/run")));
 
         if let Ok(home) = std::env::var("HOME") {
             if !home.is_empty() {
@@ -570,6 +631,34 @@ mod tests {
                 assert!(is_disallowed_workspace_root(Path::new(&home)));
             }
         }
+    }
+
+    #[test]
+    fn confine_path_eliminates_relative_existence_oracle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let err = confine_to_workspace(&ws, Path::new("../nonexistent_secret_999.txt"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn workspace_scope_rejects_escapes_and_matches_prefixes_strictly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        assert!(WorkspaceScope::parse(ws, "../..", false).is_err());
+        assert!(WorkspaceScope::parse(ws, "/", false).is_err());
+        assert!(WorkspaceScope::parse(ws, "", false).is_err());
+
+        let sc = WorkspaceScope::parse(ws, "src/graph", false).unwrap();
+        assert!(sc.matches_rel("src/graph/mod.rs"));
+        assert!(!sc.matches_rel("src/graph_extra/mod.rs"));
+        assert!(!sc.matches_rel("other/src/graph/mod.rs"));
+
+        let dot = WorkspaceScope::parse(ws, ".", false).unwrap();
+        assert!(dot.matches_rel("anything/at/all.rs"));
     }
 
     #[test]

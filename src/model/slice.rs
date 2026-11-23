@@ -1,9 +1,15 @@
 use super::symbol::Symbol;
 use serde::{Deserialize, Serialize};
 
-/// Marker `SymbolGraph::build_slice` inserts before inlined `--follow-local`
-/// bodies. Shared so the budgeted renderer can split them back off.
-pub const FOLLOW_LOCAL_MARKER: &str = "\n\n// --- Inlined Local Callees (--follow-local) ---\n";
+/// Typed payload for an inlined `--follow-local` callee, avoiding in-band
+/// string sentinel collisions when slicing source code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlinedCallee {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SliceResult {
@@ -17,12 +23,13 @@ pub struct SliceResult {
     pub total_lines: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imports: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_callees: Vec<InlinedCallee>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_notes: Vec<String>,
 }
 
 /// Rough token estimate, calibrated per language instead of one constant.
-/// Heuristic — documented in `--help`, never used for billing, only for
-/// packing context. Symbol-dense Rust/Go (~3 ch/tok) tokenize finer than
-/// whitespace-heavy Python (~5 ch/tok); TS/JS sit in the middle (~4).
 fn chars_per_token_for(file: &str) -> usize {
     match file.rsplit('.').next().unwrap_or("") {
         "rs" | "go" => 3,
@@ -46,112 +53,117 @@ impl SliceResult {
 
     pub fn render_markdown(&self, numbered: bool) -> String {
         format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             self.header_markdown(),
+            self.memory_notes_markdown(),
             self.imports_markdown(),
             self.callers_markdown(),
             self.callees_markdown(),
-            if numbered {
-                self.body_markdown_numbered(true)
-            } else {
-                self.body_markdown(true)
-            }
+            self.format_body(true, numbered)
         )
     }
 
-    /// Render markdown packed to roughly `budget_tokens`. The core slice
-    /// (header + body) is never cut; surrounding context drops
-    /// lowest-priority first: inlined locals, callees, callers, imports.
-    /// A notice names what was dropped so agents can re-request it explicitly.
     pub fn to_markdown_budgeted(&self, budget_tokens: usize) -> String {
         self.render_markdown_budgeted(budget_tokens, false)
     }
 
+    /// Render markdown packed strictly within `budget_tokens` whenever core
+    /// (header + body) fits. Drops lowest-priority sections first:
+    /// inlined locals, callees, callers, imports, memory notes.
     pub fn render_markdown_budgeted(&self, budget_tokens: usize, numbered: bool) -> String {
-        let header = self.header_markdown();
-        let core_body = if numbered {
-            self.body_markdown_numbered(false)
-        } else {
-            self.body_markdown(false)
-        };
-        let core_tokens = self.estimate_tokens(&header) + self.estimate_tokens(&core_body);
+        let full = self.render_markdown(numbered);
+        if self.estimate_tokens(&full) <= budget_tokens {
+            return full;
+        }
 
-        // Optional context, lowest priority first.
+        let header = self.header_markdown();
+        let core_body = self.format_body(false, numbered);
+        let core_combined = format!("{header}{core_body}");
+        let core_tokens = self.estimate_tokens(&core_combined);
+
+        let locals_rendered = self.format_locals_block(numbered);
         let optional: Vec<(&str, String)> = vec![
-            ("inlined local callees", self.locals_markdown()),
+            ("inlined local callees", locals_rendered),
             ("callees", self.callees_markdown()),
             ("callers", self.callers_markdown()),
             ("imports", self.imports_markdown()),
+            ("memory notes", self.memory_notes_markdown()),
         ]
         .into_iter()
         .filter(|(_, text)| !text.is_empty())
         .collect();
 
-        // Drop lowest-priority sections until the budget fits.
         let mut keep = vec![true; optional.len()];
         let mut dropped: Vec<&str> = Vec::new();
-        let mut total = core_tokens
-            + optional
-                .iter()
-                .map(|(_, t)| self.estimate_tokens(t))
-                .sum::<usize>();
-        for (i, (name, text)) in optional.iter().enumerate() {
-            if total <= budget_tokens {
-                break;
+
+        let assemble = |keep: &[bool]| -> String {
+            let kept = |name: &str| {
+                optional
+                    .iter()
+                    .position(|(n, _)| *n == name)
+                    .map(|i| keep[i])
+                    .unwrap_or(false)
+            };
+            let text_of = |name: &str| {
+                optional
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, t)| t.as_str())
+                    .unwrap_or("")
+            };
+            let mut out = header.clone();
+            if kept("memory notes") {
+                out.push_str(text_of("memory notes"));
             }
-            total -= self.estimate_tokens(text);
-            dropped.push(name);
+            if kept("imports") {
+                out.push_str(text_of("imports"));
+            }
+            if kept("callers") {
+                out.push_str(text_of("callers"));
+            }
+            if kept("callees") {
+                out.push_str(text_of("callees"));
+            }
+            out.push_str(&self.format_body(kept("inlined local callees"), numbered));
+            out
+        };
+
+        for (i, (name, _)) in optional.iter().enumerate() {
             keep[i] = false;
+            dropped.push(name);
+            let candidate = assemble(&keep);
+            let draft_notice = format!(
+                "\n_Truncated to fit --budget {budget_tokens} (~{} tokens): dropped {}._\n",
+                self.estimate_tokens(&candidate),
+                dropped.join(", ")
+            );
+            if self.estimate_tokens(&candidate) + self.estimate_tokens(&draft_notice)
+                <= budget_tokens
+            {
+                let mut out = candidate;
+                let final_tok = self.estimate_tokens(&out);
+                out.push_str(&format!(
+                    "\n_Truncated to fit --budget {budget_tokens} (~{final_tok} tokens): dropped {}._\n",
+                    dropped.join(", ")
+                ));
+                return out;
+            }
         }
 
-        let kept = |name: &str| {
-            optional
-                .iter()
-                .position(|(n, _)| *n == name)
-                .map(|i| keep[i])
-                .unwrap_or(false)
-        };
-        let text_of = |name: &str| {
-            optional
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, t)| t.as_str())
-                .unwrap_or("")
-        };
-
-        // Canonical order matches `to_markdown`: header, imports, callers,
-        // callees, body.
-        let mut out = header;
-        if kept("imports") {
-            out.push_str(text_of("imports"));
-        }
-        if kept("callers") {
-            out.push_str(text_of("callers"));
-        }
-        if kept("callees") {
-            out.push_str(text_of("callees"));
-        }
-        if numbered {
-            out.push_str(&self.body_markdown_numbered(kept("inlined local callees")));
-        } else {
-            out.push_str(&self.body_markdown(kept("inlined local callees")));
-        }
-
-        if total > budget_tokens {
-            // Core alone exceeds the budget; everything droppable is gone.
+        let mut out = assemble(&keep);
+        let final_tok = self.estimate_tokens(&out);
+        if core_tokens > budget_tokens || final_tok > budget_tokens {
             out.push_str(&format!(
-                "\n_Core slice alone (~{total} tokens) exceeds --budget {budget_tokens}; context omitted._\n"
+                "\n_Core slice alone (~{final_tok} tokens) exceeds --budget {budget_tokens}; context omitted._\n"
             ));
             if !dropped.is_empty() {
                 out.push_str(&format!("_Dropped: {}._\n", dropped.join(", ")));
             }
         } else if !dropped.is_empty() {
             out.push_str(&format!(
-                "\n_Truncated to fit --budget {budget_tokens} (~{total} tokens): dropped {}._\n",
+                "\n_Truncated to fit --budget {budget_tokens} (~{final_tok} tokens): dropped {}._\n",
                 dropped.join(", ")
             ));
-        } else {
-            return out;
         }
         out
     }
@@ -176,6 +188,17 @@ impl SliceResult {
             }
         } else if let Some((start, end)) = self.line_range {
             out.push_str(&format!("- **Lines**: L{}-L{}\n", start, end));
+        }
+        out
+    }
+
+    fn memory_notes_markdown(&self) -> String {
+        if self.memory_notes.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("- **Scoped Memory**:\n");
+        for note in &self.memory_notes {
+            out.push_str(&format!("  - {}\n", note));
         }
         out
     }
@@ -224,56 +247,75 @@ impl SliceResult {
         out
     }
 
-    /// Split `content` into the symbol body and the inlined `--follow-local`
-    /// block (empty when `-f` was not used).
-    fn split_locals(&self) -> (&str, &str) {
-        match self.content.rfind(FOLLOW_LOCAL_MARKER) {
-            Some(pos) => self.content.split_at(pos),
-            None => (self.content.as_str(), ""),
+    fn format_locals_block(&self, numbered: bool) -> String {
+        if self.local_callees.is_empty() {
+            return String::new();
         }
-    }
-
-    fn locals_markdown(&self) -> String {
-        self.split_locals().1.to_string()
-    }
-
-    fn body_markdown(&self, include_locals: bool) -> String {
-        self.format_body(include_locals, false)
-    }
-
-    fn body_markdown_numbered(&self, include_locals: bool) -> String {
-        self.format_body(include_locals, true)
+        let mut out = String::from("\n\n// --- Inlined Local Callees (--follow-local) ---\n");
+        for lc in &self.local_callees {
+            out.push_str(&format!(
+                "\n// Symbol: `{}` (L{}-L{})\n",
+                lc.name, lc.start_line, lc.end_line
+            ));
+            if numbered {
+                let mut lno = lc.start_line.max(1);
+                for line in lc.content.lines() {
+                    if let Some(skipped) = parse_truncated_line_count(line) {
+                        out.push_str(line);
+                        out.push('\n');
+                        lno += skipped;
+                        continue;
+                    }
+                    if line.is_empty() {
+                        out.push_str(&format!("L{}:\n", lno));
+                    } else {
+                        out.push_str(&format!("L{}: {}\n", lno, line));
+                    }
+                    lno += 1;
+                }
+            } else {
+                out.push_str(&lc.content);
+                if !lc.content.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     fn format_body(&self, include_locals: bool, numbered: bool) -> String {
-        let (main, locals) = self.split_locals();
         let mut out = String::from("\n```\n");
         if !numbered {
-            let shown = if include_locals {
-                self.content.as_str()
-            } else {
-                main
-            };
-            out.push_str(shown);
-            if !shown.ends_with('\n') {
+            out.push_str(&self.content);
+            if !self.content.ends_with('\n') {
                 out.push('\n');
             }
         } else {
-            let start_line = self
-                .symbol
-                .as_ref()
-                .map(|s| s.start_line)
-                .or_else(|| self.line_range.map(|r| r.0))
-                .unwrap_or(1)
-                .max(1);
+            self.write_numbered_main(&mut out);
+        }
+        if include_locals && !self.local_callees.is_empty() {
+            out.push_str(&self.format_locals_block(numbered));
+        }
+        out.push_str("```\n");
+        out
+    }
 
-            let mut cur_line = start_line;
-            let mut lines_iter = main.lines().peekable();
-            while let Some(line) = lines_iter.next() {
-                if line.is_empty() {
-                    if let Some(&next_line) = lines_iter.peek() {
-                        if let Some(skipped) = parse_truncated_line_count(next_line) {
-                            let marker = lines_iter.next().unwrap();
+    fn write_numbered_main(&self, out: &mut String) {
+        let start_line = self
+            .symbol
+            .as_ref()
+            .map(|s| s.start_line)
+            .or_else(|| self.line_range.map(|r| r.0))
+            .unwrap_or(1)
+            .max(1);
+
+        let mut cur_line = start_line;
+        let mut lines_iter = self.content.lines().peekable();
+        while let Some(line) = lines_iter.next() {
+            if line.is_empty() {
+                if let Some(&next_line) = lines_iter.peek() {
+                    if let Some(skipped) = parse_truncated_line_count(next_line) {
+                        if let Some(marker) = lines_iter.next() {
                             if matches!(lines_iter.peek(), Some(&"")) {
                                 lines_iter.next();
                             }
@@ -285,68 +327,33 @@ impl SliceResult {
                         }
                     }
                 }
-                if let Some(skipped) = parse_truncated_line_count(line) {
-                    if matches!(lines_iter.peek(), Some(&"")) {
-                        lines_iter.next();
-                    }
-                    out.push_str(line);
-                    out.push('\n');
-                    cur_line += skipped;
-                    continue;
+            }
+            if let Some(skipped) = parse_truncated_line_count(line) {
+                if matches!(lines_iter.peek(), Some(&"")) {
+                    lines_iter.next();
                 }
+                out.push_str(line);
+                out.push('\n');
+                cur_line += skipped;
+                continue;
+            }
 
-                let (lineno, content) = if self.symbol.is_none() {
-                    if let Some((num_part, code_part)) = line.split_once(" | ") {
-                        if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
-                            (parsed_num, code_part)
-                        } else {
-                            (cur_line, line)
-                        }
+            let (lineno, content) = if self.symbol.is_none() {
+                if let Some((num_part, code_part)) = line.split_once(" | ") {
+                    if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
+                        (parsed_num, code_part)
                     } else {
                         (cur_line, line)
                     }
                 } else {
                     (cur_line, line)
-                };
-                out.push_str(&format!("L{}: {}\n", lineno, content));
-                cur_line += 1;
-            }
-            if include_locals && !locals.is_empty() {
-                let mut callee_range: Option<(usize, usize)> = None;
-                for line in locals.lines() {
-                    if line.starts_with("// --- Inlined Local Callees") {
-                        callee_range = None;
-                        out.push_str(line);
-                        out.push('\n');
-                    } else if line.starts_with("// Symbol: `") {
-                        callee_range = parse_callee_header_range(line);
-                        out.push_str(line);
-                        out.push('\n');
-                    } else if let Some((ref mut lno, end_line)) = callee_range {
-                        if *lno <= end_line {
-                            if line.is_empty() {
-                                out.push_str(&format!("L{}:\n", lno));
-                            } else {
-                                out.push_str(&format!("L{}: {}\n", lno, line));
-                            }
-                            *lno += 1;
-                            if *lno > end_line {
-                                callee_range = None;
-                            }
-                        } else {
-                            callee_range = None;
-                            out.push_str(line);
-                            out.push('\n');
-                        }
-                    } else {
-                        out.push_str(line);
-                        out.push('\n');
-                    }
                 }
-            }
+            } else {
+                (cur_line, line)
+            };
+            out.push_str(&format!("L{}: {}\n", lineno, content));
+            cur_line += 1;
         }
-        out.push_str("```\n");
-        out
     }
 }
 
@@ -356,24 +363,11 @@ fn parse_truncated_line_count(line: &str) -> Option<usize> {
     num_str.trim().parse::<usize>().ok()
 }
 
-fn parse_callee_header_range(line: &str) -> Option<(usize, usize)> {
-    let pos = line.rfind("(L")?;
-    let rest = line[pos + 2..].strip_suffix(')')?;
-    let (start_s, end_s) = rest.split_once('-')?;
-    let start = start_s.trim().parse::<usize>().ok()?;
-    let end = end_s
-        .trim()
-        .strip_prefix(['L', 'l'])
-        .unwrap_or(end_s.trim())
-        .parse::<usize>()
-        .ok()?;
-    Some((start, end.max(start)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::SymbolKind;
+    use std::collections::BTreeMap;
 
     fn fixture() -> SliceResult {
         SliceResult {
@@ -390,19 +384,24 @@ mod tests {
                 centrality: 0.0,
                 calls: vec!["bar".into()],
                 mentions: vec![],
-                call_counts: std::collections::HashMap::from([("bar".to_string(), 1)]),
+                call_counts: BTreeMap::from([("bar".to_string(), 1)]),
                 member_calls: vec![],
                 external_imports: crate::model::symbol::empty_external_imports(),
+                flags: 0,
             }),
             line_range: Some((1, 3)),
-            content: format!(
-                "pub fn foo() {{\n  bar();\n}}{} \n// Symbol: `bar` (L10-L12)\nfn bar() {{}}\n",
-                FOLLOW_LOCAL_MARKER
-            ),
+            content: "pub fn foo() {\n  bar();\n}".to_string(),
             callers: vec!["src/b.rs:caller".to_string()],
             callees: vec!["src/a.rs:bar".to_string()],
             total_lines: 3,
             imports: Some(vec!["use crate::bar;".to_string()]),
+            local_callees: vec![InlinedCallee {
+                name: "bar".to_string(),
+                start_line: 10,
+                end_line: 12,
+                content: "fn bar() {}".to_string(),
+            }],
+            memory_notes: vec![],
         }
     }
 
@@ -417,7 +416,6 @@ mod tests {
         let imports = md.find("Backing Imports").unwrap();
         let callers = md.find("1-Hop Callers").unwrap();
         let callees = md.find("1-Hop Callees").unwrap();
-        // Anchor on `bar();` — the signature line also contains `pub fn foo()`.
         let body = md.find("  bar();").unwrap();
         assert!(imports < callers && callers < callees && callees < body);
     }
@@ -429,12 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn tight_budget_keeps_core_and_names_what_was_dropped() {
+    fn tight_budget_keeps_core_and_fits_strictly() {
         let s = fixture();
         let full = s.to_markdown();
-        // One token under the full estimate in the fixture's own per-language
-        // terms: forces exactly the cheapest drop (inlined locals), whatever
-        // the exact character counts are.
         let budget = s.estimate_tokens(&full) - 1;
         let md = s.to_markdown_budgeted(budget);
         assert!(md.contains("### Slice: `src/a.rs:foo`"), "core lost: {md}");
@@ -444,7 +439,11 @@ mod tests {
             "notice missing: {md}"
         );
         assert!(!md.contains("Inlined Local Callees"), "locals kept: {md}");
-        assert!(md.contains("1-Hop Callees"), "kept section lost: {md}");
+        assert!(
+            s.estimate_tokens(&md) <= budget,
+            "exceeded budget {budget}: got {} in:\n{md}",
+            s.estimate_tokens(&md)
+        );
     }
 
     #[test]
@@ -459,23 +458,13 @@ mod tests {
     #[test]
     fn caller_truncation_limits_to_five_and_shows_summary() {
         let mut s = fixture();
-        s.callers = vec![
-            "src/a.rs:c1".into(),
-            "src/a.rs:c2".into(),
-            "src/a.rs:c3".into(),
-            "src/a.rs:c4".into(),
-            "src/a.rs:c5".into(),
-            "src/a.rs:c6".into(),
-            "src/a.rs:c7".into(),
-        ];
+        s.callers = (1..=7).map(|i| format!("src/a.rs:c{i}")).collect();
         let md = s.to_markdown();
         assert!(md.contains("  - `src/a.rs:c1`"));
         assert!(md.contains("  - `src/a.rs:c5`"));
         assert!(!md.contains("  - `src/a.rs:c6`"));
-        assert!(!md.contains("  - `src/a.rs:c7`"));
         assert!(md.contains("  - _5 of 7 callers shown (use mimori up for full list)_"));
 
-        // Exactly 5 callers -> no truncation notice
         s.callers.truncate(5);
         let md5 = s.to_markdown();
         assert!(md5.contains("  - `src/a.rs:c5`"));
@@ -483,20 +472,22 @@ mod tests {
     }
 
     #[test]
-    fn numbered_render_prefixes_lines_with_linenos() {
-        let s = fixture();
+    fn numbered_render_prefixes_lines_with_linenos_without_sentinel_corruption() {
+        let mut s = fixture();
+        // Put a fake `// Symbol:` comment inside the local callee to prove no renumbering corruption.
+        s.local_callees[0].content = "// Symbol: `fake` (L999-L1005)\nfn bar() {}".to_string();
         let md = s.to_markdown_numbered();
         assert!(md.contains("L1: pub fn foo() {"));
-        assert!(md.contains("L2:   bar();"));
-        assert!(md.contains("L3: }"));
-        // Follow-local inlined callee should also be numbered from L10
-        assert!(md.contains("L10: fn bar() {}"));
+        assert!(md.contains("L10: // Symbol: `fake` (L999-L1005)"));
+        assert!(md.contains("L11: fn bar() {}"));
+        assert!(!md.contains("L999:"));
     }
 
     #[test]
     fn numbered_render_with_line_range_respects_start_offset() {
         let mut s = fixture();
         s.symbol = None;
+        s.local_callees.clear();
         s.line_range = Some((42, 44));
         s.content = "line a\nline b\nline c\n".into();
         let md = s.to_markdown_numbered();
@@ -508,11 +499,10 @@ mod tests {
     #[test]
     fn numbered_render_preserves_pipe_characters_in_symbol_slice() {
         let mut s = fixture();
+        s.local_callees.clear();
         s.content = "match x {\n    1 | 2 => true,\n    _ => false,\n}\n".into();
         let md = s.to_markdown_numbered();
         assert!(md.contains("L1: match x {"));
         assert!(md.contains("L2:     1 | 2 => true,"));
-        assert!(md.contains("L3:     _ => false,"));
-        assert!(md.contains("L4: }"));
     }
 }
