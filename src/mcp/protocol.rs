@@ -1,9 +1,19 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+fn deserialize_present_id<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    /// `None` when omitted (JSON-RPC notification); `Some(Value::Null)` when
+    /// explicitly `"id": null` (invalid MCP request ID).
+    #[serde(default, deserialize_with = "deserialize_present_id")]
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]

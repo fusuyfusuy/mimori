@@ -1,15 +1,25 @@
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "mimori",
     author = "mimori team",
     version,
-    about = "High-performance AST code-intelligence and symbol-graph CLI"
+    about = "High-performance AST code-intelligence, symbol-graph, and in-repo agent memory CLI"
 )]
 pub struct Cli {
     #[arg(long, global = true, help = "Output structured JSON")]
     pub json: bool,
+
+    #[arg(
+        short = 'w',
+        long = "workspace",
+        global = true,
+        value_name = "DIR",
+        help = "Explicit workspace root directory (defaults to current directory)"
+    )]
+    pub workspace: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -39,6 +49,7 @@ pub enum Commands {
         about = "Display non-call mentioners of a target symbol (property reads, type refs, arg/template mentions)"
     )]
     Uses(TargetArgs),
+
     #[command(about = "Evaluate transitive blast radius of a symbol across entry points")]
     Blast(BlastArgs),
 
@@ -59,7 +70,7 @@ pub enum Commands {
     #[command(about = "Run mimori as a Model Context Protocol (MCP) JSON-RPC server over stdio")]
     Mcp(McpArgs),
 
-    #[command(about = "Read, lint, or resolve project memory (.agents/memory.md)")]
+    #[command(about = "Read, add, lint, or resolve project memory (.agents/memory.md)")]
     Memory(MemoryArgs),
 
     #[command(about = "Scan, check, or sync in-code mimodept technical debt")]
@@ -87,7 +98,7 @@ pub struct SliceArgs {
 
     #[arg(
         long,
-        help = "Token budget for markdown output (heuristic chars/token calibrated per language: 3 for Rust/Go, 4 for TS/JS, 5 for Python; core slice is never cut)"
+        help = "Token budget for markdown output (calibrated per language: 3 chars/tok Rust/Go, 4 TS/JS, 5 Python; core slice is never cut)"
     )]
     pub budget: Option<usize>,
 
@@ -180,7 +191,7 @@ pub struct BlastArgs {
     #[arg(
         long = "with-sinks",
         value_name = "NAMES",
-        help = "Comma-separated literal sink substrings to sweep (e.g. 'console.,logPath,sendNotification'). Graph traversal can't see literals; this runs the rg-equivalent sweep in the same call and appends per-line hits."
+        help = "Comma-separated literal sink substrings to sweep within the blast cone"
     )]
     pub with_sinks: Option<String>,
 }
@@ -196,7 +207,11 @@ pub struct MapArgs {
     #[arg(long, help = "Seed term for personalized ranking")]
     pub seed: Option<String>,
 
-    #[arg(short = 'l', long, help = "Keep only the top N symbols by centrality")]
+    #[arg(
+        short = 'l',
+        long,
+        help = "Keep only the top N symbols (default: 30; pass 0 for all)"
+    )]
     pub limit: Option<usize>,
 }
 
@@ -210,10 +225,7 @@ pub struct MissingArgs {
     #[arg(long, help = "Workspace-relative directory to sweep")]
     pub scope: Option<String>,
 
-    #[arg(
-        long,
-        help = "Only consider files whose content contains this literal (e.g. a lane-defining marker)"
-    )]
+    #[arg(long, help = "Only consider files whose content contains this literal")]
     pub defines: Option<String>,
 }
 
@@ -233,14 +245,7 @@ pub struct DoctorArgs {
 }
 
 #[derive(Args, Debug, Default)]
-pub struct McpArgs {
-    #[arg(
-        short,
-        long,
-        help = "Workspace root directory (defaults to current directory)"
-    )]
-    pub workspace: Option<std::path::PathBuf>,
-}
+pub struct McpArgs {}
 
 #[derive(Args, Debug, Default)]
 pub struct InitArgs {
@@ -265,7 +270,10 @@ pub enum MemoryCommand {
     #[command(about = "Display project memory sections")]
     Show(MemoryShowArgs),
 
-    #[command(about = "Lint .agents/memory.md format and 30-line debt ceiling")]
+    #[command(about = "Append a structured or scope-anchored entry to .agents/memory.md")]
+    Add(MemoryAddArgs),
+
+    #[command(about = "Lint .agents/memory.md format and soft 30-line debt ceiling")]
     Lint,
 
     #[command(about = "Alias for lint")]
@@ -285,9 +293,37 @@ pub struct MemoryShowArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct MemoryAddArgs {
+    #[arg(
+        long,
+        default_value = "gotchas",
+        help = "Target section: epics, debt, vocab, or gotchas"
+    )]
+    pub section: String,
+
+    #[arg(
+        long,
+        help = "Optional @scope: file/directory glob anchor for JIT injection in slice/blast/diff"
+    )]
+    pub scope: Option<String>,
+
+    #[arg(
+        long,
+        help = "Optional @sym: symbol anchor for JIT injection in slice/blast/diff"
+    )]
+    pub sym: Option<String>,
+
+    #[arg(help = "Single-line memory entry text")]
+    pub text: String,
+}
+
+#[derive(Args, Debug)]
 pub struct MemoryResolveArgs {
     #[arg(help = "Case-insensitive substring matching debt item to delete")]
     pub pattern: String,
+
+    #[arg(long, help = "Delete all matching debt items when multiple match")]
+    pub all: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -307,7 +343,7 @@ pub enum DebtCommand {
     #[command(about = "Synchronize in-code markers into .agents/memory.md")]
     Sync,
 
-    #[command(about = "CI validation gate checking markers and 30-line ceiling")]
+    #[command(about = "CI validation gate checking marker syntax and unreadable files")]
     Check,
 }
 
