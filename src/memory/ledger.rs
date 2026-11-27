@@ -1,13 +1,32 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_DEBT_CEILING: usize = 30;
 const MAX_SCOPED_NOTES: usize = 8;
+pub(crate) const MAX_MEMORY_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+const DEFAULT_MEMORY_TEMPLATE: &str = "\
+# Project Memory
+
+## Active Epics & Scale
+- Scale: Baseline architecture initialized.
+
+## KNOWN DEBT (open only — one line per item, delete when done)
+<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->
+
+## Domain Vocabulary & Gotchas
+- [@scope: src/] Terms & empirical gotchas: add scoped notes via `mimori memory add`.
+";
+
+thread_local! {
+    static HELD_LOCK_KEYS: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebtItem {
@@ -142,8 +161,20 @@ fn has_heading_word(heading_lower: &str, words: &[&str]) -> bool {
         .any(|tok| words.contains(&tok))
 }
 
-pub(crate) fn classify_memory_heading(trimmed_line: &str) -> Option<MemorySection> {
-    let trimmed = trimmed_line.trim();
+/// Classify a raw Markdown line as a memory section heading.
+/// Per CommonMark, ATX headings allow at most 3 leading spaces (4+ spaces or
+/// a leading tab is an indented code block and returns `None`).
+pub(crate) fn classify_memory_heading(line: &str) -> Option<MemorySection> {
+    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let rest_line = &line[leading_spaces..];
+    if rest_line.starts_with('\t') {
+        return None;
+    }
+    let trimmed = rest_line.trim_end();
+
     if let Some(rest) = trimmed.strip_prefix("## ") {
         let heading = rest.trim().to_lowercase();
         let has_epic = has_heading_word(&heading, &["epic", "epics"]);
@@ -240,21 +271,11 @@ pub(crate) fn confine_agents_path(workspace_root: &Path, rel: &str) -> Result<Pa
     }
 
     let agents_dir = root.join(".agents");
-    if fs::symlink_metadata(&agents_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        match agents_dir.canonicalize() {
-            Ok(canon_target) if canon_target.starts_with(&canon_root) => {}
-            _ => bail!("Path '{}' escapes workspace root", agents_dir.display()),
-        }
-    }
+    ensure_confined_symlink(&agents_dir, &canon_root)?;
 
     let target = root.join(rel_path);
-    if target != agents_dir
-        && fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink())
-    {
-        match target.canonicalize() {
-            Ok(canon_target) if canon_target.starts_with(&canon_root) => {}
-            _ => bail!("Path '{}' escapes workspace root", target.display()),
-        }
+    if target != agents_dir {
+        ensure_confined_symlink(&target, &canon_root)?;
     }
 
     if let Some(parent) = target.parent().filter(|p| fs::symlink_metadata(p).is_ok()) {
@@ -269,48 +290,403 @@ pub(crate) fn confine_agents_path(workspace_root: &Path, rel: &str) -> Result<Pa
     Ok(target)
 }
 
-struct LockGuard(PathBuf);
+fn ensure_confined_symlink(path: &Path, canon_root: &Path) -> Result<()> {
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(());
+    }
+    match path.canonicalize() {
+        Ok(canon_target) if canon_target.starts_with(canon_root) => Ok(()),
+        _ => bail!("Path '{}' escapes workspace root", path.display()),
+    }
+}
+
+fn read_to_string_bounded(path: &Path, max_bytes: u64) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .with_context(|| format!("read {}", path.display()))?;
+    if buf.len() as u64 > max_bytes {
+        bail!(
+            "File '{}' exceeds maximum allowed size ({} bytes)",
+            path.display(),
+            max_bytes
+        );
+    }
+    String::from_utf8(buf).with_context(|| format!("decode UTF-8 in {}", path.display()))
+}
+
+enum LockGuard {
+    Owned {
+        _file: File,
+        path: PathBuf,
+        key: PathBuf,
+    },
+    Reentrant,
+}
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let LockGuard::Owned { path, key, .. } = self {
+            // Unlink while holding the exclusive OS lock; `_file` drops right after.
+            let _ = fs::remove_file(path);
+            HELD_LOCK_KEYS.with(|set| {
+                set.borrow_mut().remove(key);
+            });
+        }
+    }
+}
+
+fn lock_key_for_dir(dir: &Path) -> PathBuf {
+    dir.canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .join(".memory.lock")
+}
+
+fn is_lock_held(dir: &Path) -> bool {
+    let key = lock_key_for_dir(dir);
+    HELD_LOCK_KEYS.with(|set| set.borrow().contains(&key))
+}
+
+fn reject_symlink_lock(lock_path: &Path) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(lock_path) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Path '{}' is a symlink; refusing to open lock file",
+                lock_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_locked_inode(lock_path: &Path, file: &File) -> Result<bool> {
+    let Ok(path_meta) = fs::symlink_metadata(lock_path) else {
+        return Ok(false);
+    };
+    if path_meta.file_type().is_symlink() {
+        bail!(
+            "Path '{}' is a symlink; refusing to lock",
+            lock_path.display()
+        );
+    }
+    let file_meta = file
+        .metadata()
+        .with_context(|| format!("stat lock {}", lock_path.display()))?;
+    if !file_meta.file_type().is_file() {
+        bail!("Lock path '{}' is not a regular file", lock_path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(path_meta.dev() == file_meta.dev() && path_meta.ino() == file_meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
     }
 }
 
 fn acquire_write_lock(dir: &Path) -> Result<LockGuard> {
+    let key = lock_key_for_dir(dir);
+    if HELD_LOCK_KEYS.with(|set| set.borrow().contains(&key)) {
+        return Ok(LockGuard::Reentrant);
+    }
+
     let lock_path = dir.join(".memory.lock");
-    for _ in 0..50 {
-        match OpenOptions::new()
+    for _ in 0..64 {
+        reject_symlink_lock(&lock_path)?;
+        let file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&lock_path)
-        {
-            Ok(mut f) => {
-                let _ = writeln!(f, "{}", std::process::id());
-                return Ok(LockGuard(lock_path));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Ok(meta) = fs::metadata(&lock_path) {
-                    if let Ok(modified) = meta.modified() {
-                        if SystemTime::now()
-                            .duration_since(modified)
-                            .unwrap_or(Duration::ZERO)
-                            > Duration::from_secs(30)
-                        {
-                            let _ = fs::remove_file(&lock_path);
-                            continue;
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => return Err(e).with_context(|| format!("lock {}", lock_path.display())),
+            .with_context(|| format!("open lock {}", lock_path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        if verify_locked_inode(&lock_path, &file)? {
+            HELD_LOCK_KEYS.with(|set| {
+                set.borrow_mut().insert(key.clone());
+            });
+            return Ok(LockGuard::Owned {
+                _file: file,
+                path: lock_path,
+                key,
+            });
         }
     }
     bail!(
-        "Timed out acquiring memory lock '{}'; another mimori process may be writing",
+        "Failed to acquire stable OS file lock on '{}'",
         lock_path.display()
     );
+}
+
+fn resolve_confined_write_target(path: &Path) -> Result<PathBuf> {
+    let Some(parent) = path.parent() else {
+        return Ok(path.to_path_buf());
+    };
+    if parent.file_name().is_some_and(|n| n == ".agents") {
+        let (Some(ws_root), Some(fname)) = (parent.parent(), path.file_name()) else {
+            return Ok(path.to_path_buf());
+        };
+        let rel = format!(".agents/{}", fname.to_string_lossy());
+        let confined = confine_agents_path(ws_root, &rel)?;
+        if fs::symlink_metadata(&confined).is_ok_and(|m| m.file_type().is_symlink()) {
+            return confined
+                .canonicalize()
+                .with_context(|| format!("resolve permitted symlink {}", confined.display()));
+        }
+        return Ok(confined);
+    }
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("Path '{}' escapes workspace root", path.display());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn create_unique_temp_file(write_target: &Path) -> Result<(PathBuf, File)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = write_target.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => return Ok((candidate, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("create temporary memory file {}", candidate.display())
+                });
+            }
+        }
+    }
+    bail!("Failed to allocate unique temporary file for atomic write");
+}
+
+fn sync_parent_dir(parent: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        match File::open(parent) {
+            Ok(dir_file) => {
+                if let Err(err) = dir_file.sync_all() {
+                    if !matches!(
+                        err.kind(),
+                        std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::Unsupported
+                            | std::io::ErrorKind::PermissionDenied
+                    ) {
+                        return Err(err).with_context(|| {
+                            format!("fsync parent directory {}", parent.display())
+                        });
+                    }
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("open parent directory {}", parent.display()));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
+}
+
+enum DebtLineViolation {
+    Strikethrough(LintError),
+    CheckedBox(LintError),
+    Schema(LintError),
+}
+
+impl DebtLineViolation {
+    fn into_error(self) -> LintError {
+        match self {
+            Self::Strikethrough(e) | Self::CheckedBox(e) | Self::Schema(e) => e,
+        }
+    }
+}
+
+fn validate_debt_line(raw_line: &str, line_number: usize) -> Result<DebtItem, DebtLineViolation> {
+    let trimmed = raw_line.trim_start();
+    if raw_line.contains("~~") {
+        return Err(DebtLineViolation::Strikethrough(LintError {
+            line_number,
+            line: raw_line.to_string(),
+            reason: "strikethrough '~~' forbidden (delete line when done)".to_string(),
+        }));
+    }
+    if let Some(after_bullet) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        let after = after_bullet.trim_start();
+        if after.starts_with("[x]") || after.starts_with("[X]") {
+            return Err(DebtLineViolation::CheckedBox(LintError {
+                line_number,
+                line: raw_line.to_string(),
+                reason: "completed checkbox '- [x]' forbidden (delete line when done)".to_string(),
+            }));
+        }
+        if after.starts_with("[ ]") {
+            return Err(DebtLineViolation::Schema(LintError {
+                line_number,
+                line: raw_line.to_string(),
+                reason: "checkbox '- [ ]' forbidden (use standard bullet '- ')".to_string(),
+            }));
+        }
+    }
+    parse_debt_line(raw_line, line_number).map_err(DebtLineViolation::Schema)
+}
+
+fn parse_target_section(section: &str) -> Result<MemorySection> {
+    let sec_lower = section.trim().to_lowercase();
+    if sec_lower.contains("epic") {
+        Ok(MemorySection::Epics)
+    } else if sec_lower.contains("debt") {
+        Ok(MemorySection::Debt)
+    } else if sec_lower.contains("vocab") || sec_lower.contains("glossary") {
+        Ok(MemorySection::Vocab)
+    } else if sec_lower.contains("gotcha") || sec_lower.contains("trap") {
+        Ok(MemorySection::Gotchas)
+    } else {
+        bail!(
+            "Unknown section '{}': expected 'epics', 'debt', 'vocab', or 'gotchas'",
+            section
+        );
+    }
+}
+
+fn sanitize_anchor_value<'a>(kind: &str, raw: Option<&'a str>) -> Result<Option<&'a str>> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        bail!("Memory entry '{}' anchor must not be empty", kind);
+    }
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '\n' | '\r' | '[' | ']'))
+    {
+        bail!(
+            "Memory entry '{}' anchor must not contain newlines or brackets ('[' or ']')",
+            kind
+        );
+    }
+    Ok(Some(trimmed))
+}
+
+fn format_entry_bullet(
+    target_sec: MemorySection,
+    clean_text: &str,
+    scope: Option<&str>,
+    sym: Option<&str>,
+) -> Result<String> {
+    let clean_scope = sanitize_anchor_value("scope", scope)?;
+    let clean_sym = sanitize_anchor_value("sym", sym)?;
+
+    if target_sec == MemorySection::Debt {
+        let candidate = if clean_text.starts_with("- ") || clean_text.starts_with("* ") {
+            clean_text.to_string()
+        } else {
+            format!("- {}", clean_text)
+        };
+        validate_debt_line(&candidate, 1)
+            .map_err(|v| anyhow::anyhow!("Invalid debt entry: {}", v.into_error().reason))?;
+        return Ok(candidate);
+    }
+
+    let mut tags = Vec::new();
+    if let Some(sc) = clean_scope {
+        tags.push(format!("@scope: {}", sc));
+    }
+    if let Some(sm) = clean_sym {
+        tags.push(format!("@sym: {}", sm));
+    }
+    let body = clean_text
+        .strip_prefix("- ")
+        .or_else(|| clean_text.strip_prefix("* "))
+        .unwrap_or(clean_text);
+    if tags.is_empty() {
+        Ok(format!("- {}", body))
+    } else {
+        Ok(format!("- [{}] {}", tags.join(", "), body))
+    }
+}
+
+fn insert_bullet_into_content(
+    raw_content: &str,
+    target_sec: MemorySection,
+    bullet: &str,
+) -> String {
+    let lines: Vec<&str> = raw_content.lines().collect();
+    let mut insert_at: Option<usize> = None;
+    let mut current: Option<MemorySection> = None;
+    let mut fence = FenceState::default();
+
+    let matches_target = |sec: MemorySection| match target_sec {
+        MemorySection::Vocab => matches!(sec, MemorySection::Vocab | MemorySection::VocabGotchas),
+        MemorySection::Gotchas => {
+            matches!(sec, MemorySection::Gotchas | MemorySection::VocabGotchas)
+        }
+        other => sec == other,
+    };
+
+    for (idx, line) in lines.iter().enumerate() {
+        if update_code_fence(line, &mut fence) {
+            continue;
+        }
+        if let Some(next_sec) = classify_memory_heading(line) {
+            if current.is_some_and(matches_target) && insert_at.is_none() {
+                insert_at = Some(idx);
+            }
+            current = Some(next_sec);
+        }
+    }
+    if current.is_some_and(matches_target) && insert_at.is_none() {
+        insert_at = Some(lines.len());
+    }
+
+    let mut out: Vec<String> = lines.into_iter().map(str::to_string).collect();
+    if let Some(mut pos) = insert_at {
+        while pos > 0 && out[pos - 1].trim().is_empty() {
+            pos -= 1;
+        }
+        out.insert(pos, bullet.to_string());
+    } else {
+        if !out.last().is_some_and(|l| l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        let heading = match target_sec {
+            MemorySection::Epics => "## Active Epics & Scale",
+            MemorySection::Debt => {
+                "## KNOWN DEBT (open only — one line per item, delete when done)"
+            }
+            MemorySection::Vocab | MemorySection::Gotchas | MemorySection::VocabGotchas => {
+                "## Domain Vocabulary & Gotchas"
+            }
+            MemorySection::Other => "## Notes",
+        };
+        out.push(heading.to_string());
+        out.push(bullet.to_string());
+    }
+
+    let mut updated = out.join("\n");
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated
 }
 
 impl MemoryLedger {
@@ -333,21 +709,10 @@ impl MemoryLedger {
 
         fs::create_dir_all(&agents_dir)
             .with_context(|| format!("create dir {}", agents_dir.display()))?;
+        let _lock = acquire_write_lock(&agents_dir)?;
 
         if !mem_file.exists() || force {
-            let template = "\
-# Project Memory
-
-## Active Epics & Scale
-- Scale: Baseline architecture initialized.
-
-## KNOWN DEBT (open only — one line per item, delete when done)
-<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->
-
-## Domain Vocabulary & Gotchas
-- [@scope: src/] Terms & empirical gotchas: add scoped notes via `mimori memory add`.
-";
-            Self::atomic_write(&mem_file, template)
+            Self::atomic_write_unlocked(&mem_file, DEFAULT_MEMORY_TEMPLATE)
                 .with_context(|| format!("write {}", mem_file.display()))?;
             Ok(true)
         } else {
@@ -363,9 +728,91 @@ impl MemoryLedger {
             );
         }
         let path = confine_agents_path(workspace_root, ".agents/memory.md")?;
-        let content = fs::read_to_string(&path)
+        let content = read_to_string_bounded(&path, MAX_MEMORY_FILE_BYTES)
             .with_context(|| format!("read memory file {}", path.display()))?;
         Ok(Self::from_str(&content, workspace_root.to_path_buf()))
+    }
+
+    /// Execute a transactional read-modify-write closure while holding the OS
+    /// advisory lock on `.agents/.memory.lock`. Loads the latest ledger inside
+    /// the lock and atomically saves if `ledger.raw_content` changed.
+    pub fn with_locked_ledger<T, F>(workspace_root: &Path, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut MemoryLedger) -> Result<T>,
+    {
+        if crate::workspace::walker::is_disallowed_workspace_root(workspace_root) {
+            bail!(
+                "Refusing to mutate memory in home or system directory '{}'",
+                workspace_root.display()
+            );
+        }
+        let agents_dir = confine_agents_path(workspace_root, ".agents")?;
+        let mem_path = confine_agents_path(workspace_root, ".agents/memory.md")?;
+        if !agents_dir.exists() {
+            // Surface standard missing-ledger error without creating stray `.agents/`.
+            Self::load(workspace_root)?;
+        }
+
+        let _lock = acquire_write_lock(&agents_dir)?;
+        let mut ledger = Self::load(workspace_root)?;
+        let before = ledger.raw_content.clone();
+        let res = f(&mut ledger)?;
+        if ledger.raw_content != before {
+            Self::atomic_write_unlocked(&mem_path, &ledger.raw_content)?;
+        }
+        Ok(res)
+    }
+
+    /// Transactionally scaffold (if missing) and append a structured entry
+    /// under an OS advisory file lock.
+    pub fn add_entry_locked(
+        workspace_root: &Path,
+        section: &str,
+        text: &str,
+        scope: Option<&str>,
+        sym: Option<&str>,
+    ) -> Result<String> {
+        let clean_text = text.trim();
+        if clean_text.is_empty() || clean_text.contains('\n') || clean_text.contains('\r') {
+            bail!("Memory entry text must be a single non-empty line");
+        }
+        let target_sec = parse_target_section(section)?;
+        let bullet = format_entry_bullet(target_sec, clean_text, scope, sym)?;
+
+        if crate::workspace::walker::is_disallowed_workspace_root(workspace_root) {
+            bail!(
+                "Refusing to mutate memory in home or system directory '{}'",
+                workspace_root.display()
+            );
+        }
+        let agents_dir = confine_agents_path(workspace_root, ".agents")?;
+        let mem_path = confine_agents_path(workspace_root, ".agents/memory.md")?;
+        fs::create_dir_all(&agents_dir)
+            .with_context(|| format!("create dir {}", agents_dir.display()))?;
+
+        let _lock = acquire_write_lock(&agents_dir)?;
+        if !mem_path.exists() {
+            Self::atomic_write_unlocked(&mem_path, DEFAULT_MEMORY_TEMPLATE)?;
+        }
+        let mut ledger = Self::load(workspace_root)?;
+        let updated = insert_bullet_into_content(&ledger.raw_content, target_sec, &bullet);
+        ledger.raw_content = updated;
+        Self::atomic_write_unlocked(&mem_path, &ledger.raw_content)?;
+        Ok(bullet)
+    }
+
+    /// Transactionally resolve matching debt line(s) under an OS advisory file
+    /// lock. Returns `(deleted_lines, remaining_debt_count)`.
+    pub fn resolve_debt_locked(
+        workspace_root: &Path,
+        pattern: &str,
+        all: bool,
+    ) -> Result<(Vec<String>, usize)> {
+        Self::with_locked_ledger(workspace_root, |ledger| {
+            let deleted = ledger.resolve_in_memory(pattern, all)?;
+            let remaining = ledger.raw_debt_lines.len();
+            Ok((deleted, remaining))
+        })
     }
 
     pub fn from_str(content: &str, workspace_root: PathBuf) -> Self {
@@ -387,7 +834,7 @@ impl MemoryLedger {
             let in_fence = update_code_fence(line, &mut fence);
 
             if !in_fence {
-                if let Some(next_section) = classify_memory_heading(trimmed) {
+                if let Some(next_section) = classify_memory_heading(line) {
                     flush_section(
                         current_section,
                         &section_content,
@@ -445,70 +892,49 @@ impl MemoryLedger {
         Self::atomic_write(&path, &self.raw_content)
     }
 
+    /// Write `self.raw_content` atomically assuming the caller already holds
+    /// the `.agents/.memory.lock` OS lock (e.g. inside `with_locked_ledger`).
+    pub fn save_unlocked(&self) -> Result<()> {
+        let path = confine_agents_path(&self.workspace_root, ".agents/memory.md")?;
+        Self::atomic_write_unlocked(&path, &self.raw_content)
+    }
+
     pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let write_target = if let Some(parent) = path.parent() {
-            if parent.file_name().is_some_and(|n| n == ".agents") {
-                if let (Some(ws_root), Some(fname)) = (parent.parent(), path.file_name()) {
-                    let rel = format!(".agents/{}", fname.to_string_lossy());
-                    let confined = confine_agents_path(ws_root, &rel)?;
-                    if fs::symlink_metadata(&confined).is_ok_and(|m| m.file_type().is_symlink()) {
-                        confined.canonicalize().with_context(|| {
-                            format!("resolve permitted symlink {}", confined.display())
-                        })?
-                    } else {
-                        confined
-                    }
-                } else {
-                    path.to_path_buf()
-                }
-            } else if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-                bail!("Path '{}' escapes workspace root", path.display());
-            } else {
-                path.to_path_buf()
-            }
-        } else {
-            path.to_path_buf()
-        };
-
+        let write_target = resolve_confined_write_target(path)?;
         let parent = write_target
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
         let _lock = acquire_write_lock(parent)?;
+        Self::atomic_write_resolved(&write_target, parent, content)
+    }
 
-        let mut tmp_path = None;
-        let mut file = None;
-        for _ in 0..32 {
-            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let candidate =
-                write_target.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(f) => {
-                    tmp_path = Some(candidate);
-                    file = Some(f);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("create temporary memory file {}", candidate.display())
-                    });
-                }
+    pub(crate) fn atomic_write_unlocked(path: &Path, content: &str) -> Result<()> {
+        let write_target = resolve_confined_write_target(path)?;
+        let parent = write_target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        Self::atomic_write_resolved(&write_target, parent, content)
+    }
+
+    fn atomic_write_resolved(write_target: &Path, parent: &Path, content: &str) -> Result<()> {
+        let existing_perms = fs::metadata(write_target).ok().map(|m| m.permissions());
+        let (tmp_path, mut file) = create_unique_temp_file(write_target)?;
+
+        if let Some(perms) = existing_perms {
+            if let Err(err) = file.set_permissions(perms) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err).with_context(|| {
+                    format!(
+                        "preserve permissions on temporary file {}",
+                        tmp_path.display()
+                    )
+                });
             }
         }
-
-        let (tmp_path, mut file) = match (tmp_path, file) {
-            (Some(p), Some(f)) => (p, f),
-            _ => bail!("Failed to allocate unique temporary file for atomic write"),
-        };
 
         if let Err(err) = file
             .write_all(content.as_bytes())
@@ -520,11 +946,12 @@ impl MemoryLedger {
         }
         drop(file);
 
-        if let Err(err) = fs::rename(&tmp_path, &write_target) {
+        if let Err(err) = fs::rename(&tmp_path, write_target) {
             let _ = fs::remove_file(&tmp_path);
             return Err(err)
                 .with_context(|| format!("atomic rename memory file {}", write_target.display()));
         }
+        sync_parent_dir(parent)?;
         Ok(())
     }
 
@@ -533,43 +960,16 @@ impl MemoryLedger {
         let mut strikethrough_errors = Vec::new();
 
         for (line_number, raw_line) in &self.raw_debt_lines {
-            let trimmed = raw_line.trim_start();
-            if raw_line.contains("~~") {
-                strikethrough_errors.push(*line_number);
-                schema_errors.push(LintError {
-                    line_number: *line_number,
-                    line: raw_line.clone(),
-                    reason: "strikethrough '~~' forbidden (delete line when done)".to_string(),
-                });
-                continue;
-            }
-            if let Some(after_bullet) = trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "))
-            {
-                let after = after_bullet.trim_start();
-                if after.starts_with("[x]") || after.starts_with("[X]") {
-                    strikethrough_errors.push(*line_number);
-                    schema_errors.push(LintError {
-                        line_number: *line_number,
-                        line: raw_line.clone(),
-                        reason: "completed checkbox '- [x]' forbidden (delete line when done)"
-                            .to_string(),
-                    });
-                    continue;
+            if let Err(violation) = validate_debt_line(raw_line, *line_number) {
+                match violation {
+                    DebtLineViolation::Strikethrough(err) | DebtLineViolation::CheckedBox(err) => {
+                        strikethrough_errors.push(*line_number);
+                        schema_errors.push(err);
+                    }
+                    DebtLineViolation::Schema(err) => {
+                        schema_errors.push(err);
+                    }
                 }
-                if after.starts_with("[ ]") {
-                    schema_errors.push(LintError {
-                        line_number: *line_number,
-                        line: raw_line.clone(),
-                        reason: "checkbox '- [ ]' forbidden (use standard bullet '- ')".to_string(),
-                    });
-                    continue;
-                }
-            }
-
-            if let Err(err) = parse_debt_line(raw_line, *line_number) {
-                schema_errors.push(err);
             }
         }
 
@@ -588,10 +988,7 @@ impl MemoryLedger {
         }
     }
 
-    /// Surgically delete matching debt line(s) from `## KNOWN DEBT`.
-    /// Rejects empty or delimiter-only patterns, errors on 0 matches, and
-    /// refuses multi-line deletion unless `all == true`.
-    pub fn resolve(&mut self, pattern: &str, all: bool) -> Result<Vec<String>> {
+    fn resolve_in_memory(&mut self, pattern: &str, all: bool) -> Result<Vec<String>> {
         let pattern_trimmed = pattern.trim();
         if pattern_trimmed.is_empty() {
             bail!("Cannot resolve debt item: pattern must not be empty");
@@ -616,7 +1013,7 @@ impl MemoryLedger {
             if update_code_fence(line, &mut fence) {
                 continue;
             }
-            if let Some(section) = classify_memory_heading(trimmed) {
+            if let Some(section) = classify_memory_heading(line) {
                 in_debt_section = section == MemorySection::Debt;
                 continue;
             }
@@ -674,14 +1071,48 @@ impl MemoryLedger {
         }
         self.raw_content = updated;
         *self = Self::from_str(&self.raw_content, self.workspace_root.clone());
-        self.save()?;
-
         Ok(deleted)
+    }
+
+    /// Surgically delete matching debt line(s) from `## KNOWN DEBT`.
+    /// Acquires the OS advisory lock and reloads the latest on-disk ledger
+    /// inside the lock (unless already inside `with_locked_ledger`) to prevent
+    /// lost updates under concurrent writers.
+    pub fn resolve(&mut self, pattern: &str, all: bool) -> Result<Vec<String>> {
+        let agents_dir = confine_agents_path(&self.workspace_root, ".agents")?;
+        let mem_path = confine_agents_path(&self.workspace_root, ".agents/memory.md")?;
+
+        if is_lock_held(&agents_dir) {
+            let deleted = self.resolve_in_memory(pattern, all)?;
+            Self::atomic_write_unlocked(&mem_path, &self.raw_content)?;
+            return Ok(deleted);
+        }
+
+        fs::create_dir_all(&agents_dir)?;
+        let _lock = acquire_write_lock(&agents_dir)?;
+        let mut latest = if mem_path.exists() {
+            Self::load(&self.workspace_root)?
+        } else {
+            self.clone()
+        };
+        let deleted = latest.resolve_in_memory(pattern, all)?;
+        Self::atomic_write_unlocked(&mem_path, &latest.raw_content)?;
+        *self = latest;
+        Ok(deleted)
+    }
+
+    fn add_entry_in_memory(&mut self, target_sec: MemorySection, bullet: &str) -> Result<()> {
+        let updated = insert_bullet_into_content(&self.raw_content, target_sec, bullet);
+        self.raw_content = updated;
+        *self = Self::from_str(&self.raw_content, self.workspace_root.clone());
+        Ok(())
     }
 
     /// Append a structured entry to `.agents/memory.md` under `section`
     /// (`epics`, `debt`, `vocab`, `gotchas`), optionally anchored with
     /// `@scope:` or `@sym:` for JIT delivery in `slice`, `blast`, and `diff`.
+    /// Transactionally reloads and saves under the OS advisory lock to prevent
+    /// lost updates under concurrent writers.
     pub fn add_entry(
         &mut self,
         section: &str,
@@ -693,113 +1124,28 @@ impl MemoryLedger {
         if clean_text.is_empty() || clean_text.contains('\n') || clean_text.contains('\r') {
             bail!("Memory entry text must be a single non-empty line");
         }
+        let target_sec = parse_target_section(section)?;
+        let bullet = format_entry_bullet(target_sec, clean_text, scope, sym)?;
 
-        let sec_lower = section.trim().to_lowercase();
-        let target_sec = if sec_lower.contains("epic") {
-            MemorySection::Epics
-        } else if sec_lower.contains("debt") {
-            MemorySection::Debt
-        } else if sec_lower.contains("vocab") || sec_lower.contains("glossary") {
-            MemorySection::Vocab
-        } else if sec_lower.contains("gotcha") || sec_lower.contains("trap") {
-            MemorySection::Gotchas
+        let agents_dir = confine_agents_path(&self.workspace_root, ".agents")?;
+        let mem_path = confine_agents_path(&self.workspace_root, ".agents/memory.md")?;
+
+        if is_lock_held(&agents_dir) {
+            self.add_entry_in_memory(target_sec, &bullet)?;
+            Self::atomic_write_unlocked(&mem_path, &self.raw_content)?;
+            return Ok(bullet);
+        }
+
+        fs::create_dir_all(&agents_dir)?;
+        let _lock = acquire_write_lock(&agents_dir)?;
+        let mut latest = if mem_path.exists() {
+            Self::load(&self.workspace_root)?
         } else {
-            bail!(
-                "Unknown section '{}': expected 'epics', 'debt', 'vocab', or 'gotchas'",
-                section
-            );
+            self.clone()
         };
-
-        let bullet = if target_sec == MemorySection::Debt {
-            let candidate = if clean_text.starts_with("- ") || clean_text.starts_with("* ") {
-                clean_text.to_string()
-            } else {
-                format!("- {}", clean_text)
-            };
-            parse_debt_line(&candidate, 1)
-                .map_err(|e| anyhow::anyhow!("Invalid debt entry: {}", e.reason))?;
-            candidate
-        } else {
-            let mut tags = Vec::new();
-            if let Some(sc) = scope.map(str::trim).filter(|s| !s.is_empty()) {
-                tags.push(format!("@scope: {}", sc));
-            }
-            if let Some(sm) = sym.map(str::trim).filter(|s| !s.is_empty()) {
-                tags.push(format!("@sym: {}", sm));
-            }
-            let body = clean_text
-                .strip_prefix("- ")
-                .or_else(|| clean_text.strip_prefix("* "))
-                .unwrap_or(clean_text);
-            if tags.is_empty() {
-                format!("- {}", body)
-            } else {
-                format!("- [{}] {}", tags.join(", "), body)
-            }
-        };
-
-        let lines: Vec<&str> = self.raw_content.lines().collect();
-        let mut insert_at: Option<usize> = None;
-        let mut current: Option<MemorySection> = None;
-        let mut fence = FenceState::default();
-
-        let matches_target = |sec: MemorySection| match target_sec {
-            MemorySection::Vocab => {
-                matches!(sec, MemorySection::Vocab | MemorySection::VocabGotchas)
-            }
-            MemorySection::Gotchas => {
-                matches!(sec, MemorySection::Gotchas | MemorySection::VocabGotchas)
-            }
-            other => sec == other,
-        };
-
-        for (idx, line) in lines.iter().enumerate() {
-            if update_code_fence(line, &mut fence) {
-                continue;
-            }
-            if let Some(next_sec) = classify_memory_heading(line) {
-                if current.is_some_and(matches_target) && insert_at.is_none() {
-                    insert_at = Some(idx);
-                }
-                current = Some(next_sec);
-            }
-        }
-        if current.is_some_and(matches_target) && insert_at.is_none() {
-            insert_at = Some(lines.len());
-        }
-
-        let mut out: Vec<String> = lines.into_iter().map(str::to_string).collect();
-        if let Some(mut pos) = insert_at {
-            while pos > 0 && out[pos - 1].trim().is_empty() {
-                pos -= 1;
-            }
-            out.insert(pos, bullet.clone());
-        } else {
-            if !out.last().is_some_and(|l| l.trim().is_empty()) {
-                out.push(String::new());
-            }
-            let heading = match target_sec {
-                MemorySection::Epics => "## Active Epics & Scale",
-                MemorySection::Debt => {
-                    "## KNOWN DEBT (open only — one line per item, delete when done)"
-                }
-                MemorySection::Vocab | MemorySection::Gotchas | MemorySection::VocabGotchas => {
-                    "## Domain Vocabulary & Gotchas"
-                }
-                MemorySection::Other => "## Notes",
-            };
-            out.push(heading.to_string());
-            out.push(bullet.clone());
-        }
-
-        let mut updated = out.join("\n");
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        self.raw_content = updated;
-        *self = Self::from_str(&self.raw_content, self.workspace_root.clone());
-        self.save()?;
-
+        latest.add_entry_in_memory(target_sec, &bullet)?;
+        Self::atomic_write_unlocked(&mem_path, &latest.raw_content)?;
+        *self = latest;
         Ok(bullet)
     }
 
@@ -900,6 +1246,46 @@ impl MemoryLedger {
     }
 }
 
+/// Extract the first Markdown H1 heading (`# ...`) outside YAML frontmatter
+/// (`---` ... `---`/`...`) and fenced/indented code blocks.
+fn extract_markdown_h1(content: &str) -> Option<&str> {
+    let mut lines = content.lines().peekable();
+    if let Some(&first) = lines.peek() {
+        let clean_first = first.strip_prefix('\u{feff}').unwrap_or(first);
+        if clean_first.trim() == "---" {
+            lines.next();
+            for line in lines.by_ref() {
+                let t = line.trim();
+                if t == "---" || t == "..." {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut fence = FenceState::default();
+    for line in lines {
+        if update_code_fence(line, &mut fence) {
+            continue;
+        }
+        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+        if leading_spaces > 3 {
+            continue;
+        }
+        let rest = &line[leading_spaces..];
+        if rest.starts_with('\t') {
+            continue;
+        }
+        if let Some(title) = rest.strip_prefix("# ") {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
 /// Index `docs/adr/*.md` H1 titles for compact Turn-0 `dump` inclusion.
 pub fn index_adr_titles(workspace_root: &Path) -> Vec<(String, String)> {
     let Ok(adr_dir) =
@@ -928,7 +1314,7 @@ pub fn index_adr_titles(workspace_root: &Path) -> Vec<(String, String)> {
         else {
             continue;
         };
-        let Ok(content) = fs::read_to_string(&confined) else {
+        let Ok(content) = read_to_string_bounded(&confined, MAX_MEMORY_FILE_BYTES) else {
             continue;
         };
         let fname = path
@@ -938,10 +1324,8 @@ pub fn index_adr_titles(workspace_root: &Path) -> Vec<(String, String)> {
         if fname.eq_ignore_ascii_case("README.md") {
             continue;
         }
-        let title = content
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("# ").map(str::trim))
-            .unwrap_or(&fname)
+        let title = extract_markdown_h1(&content)
+            .unwrap_or(fname.as_str())
             .to_string();
         out.push((format!("docs/adr/{}", fname), title));
     }
@@ -1042,19 +1426,44 @@ fn sym_anchor_matches(target: &str, sym: &str) -> bool {
     s.ends_with(&format!("::{t}")) || s.ends_with(&format!(".{t}"))
 }
 
-fn is_accepted_prefix(what: &str) -> bool {
+/// Strip a leading `accepted` or `[accepted]` waiver prefix (case-insensitive,
+/// with optional `:` or whitespace boundary). Returns `None` if no valid waiver
+/// prefix is present, ensuring `is_accepted_prefix` and normalization never diverge.
+pub(crate) fn strip_accepted_prefix(what: &str) -> Option<&str> {
     let w = what.trim();
-    let lower = w.to_lowercase();
-    if lower == "accepted" || lower == "[accepted]" {
-        return true;
+    if w.len() >= 10 && w.as_bytes()[..10].eq_ignore_ascii_case(b"[accepted]") {
+        let rest = &w[10..];
+        if rest.is_empty() {
+            return Some("");
+        }
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            return Some(after_colon.trim_start());
+        }
+        let trimmed = rest.trim_start();
+        if trimmed.len() < rest.len() {
+            return Some(trimmed);
+        }
+        return None;
     }
-    if let Some(rest) = lower.strip_prefix("[accepted]") {
-        return rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace);
+    if w.len() >= 8 && w.as_bytes()[..8].eq_ignore_ascii_case(b"accepted") {
+        let rest = &w[8..];
+        if rest.is_empty() {
+            return Some("");
+        }
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            return Some(after_colon.trim_start());
+        }
+        let trimmed = rest.trim_start();
+        if trimmed.len() < rest.len() {
+            return Some(trimmed);
+        }
+        return None;
     }
-    if let Some(rest) = lower.strip_prefix("accepted") {
-        return rest.starts_with(':') || rest.starts_with(char::is_whitespace);
-    }
-    false
+    None
+}
+
+pub(crate) fn is_accepted_prefix(what: &str) -> bool {
+    strip_accepted_prefix(what).is_some()
 }
 
 pub fn parse_debt_line(raw: &str, line_number: usize) -> Result<DebtItem, LintError> {
@@ -1128,6 +1537,7 @@ pub fn parse_debt_line(raw: &str, line_number: usize) -> Result<DebtItem, LintEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn heading_classifier_uses_word_boundaries_and_h1_terminates_sections() {
@@ -1155,6 +1565,13 @@ mod tests {
             classify_memory_heading("# Deliberate gaps get ledger lines: - accepted ..."),
             None
         );
+        // CommonMark: <=3 leading spaces allowed, >=4 spaces or tab is code block
+        assert_eq!(
+            classify_memory_heading("   ## KNOWN DEBT"),
+            Some(MemorySection::Debt)
+        );
+        assert_eq!(classify_memory_heading("    ## KNOWN DEBT"), None);
+        assert_eq!(classify_memory_heading("\t## KNOWN DEBT"), None);
     }
 
     #[test]
@@ -1174,6 +1591,10 @@ mod tests {
             report.schema_errors
         );
         assert!(!ledger.debt_items[1].is_accepted);
+        assert!(!is_accepted_prefix("[accepted]foo"));
+        assert!(strip_accepted_prefix("[accepted]foo").is_none());
+        assert_eq!(strip_accepted_prefix("[accepted] foo"), Some("foo"));
+        assert_eq!(strip_accepted_prefix("accepted: foo"), Some("foo"));
     }
 
     #[test]
@@ -1198,5 +1619,121 @@ mod tests {
         let sym_notes = ledger.scoped_notes(&[], &["MemoryLedger::lint"]);
         assert_eq!(sym_notes.len(), 1);
         assert!(sym_notes[0].contains("Soft 30-line ceiling"));
+    }
+
+    #[test]
+    fn add_entry_rejects_anchor_injection_and_invalid_debt() {
+        let dir = tempdir().unwrap();
+        MemoryLedger::scaffold(dir.path(), false).unwrap();
+        let mut ledger = MemoryLedger::load(dir.path()).unwrap();
+
+        assert!(ledger
+            .add_entry("gotchas", "ok", Some("src/]\n## KNOWN DEBT"), None)
+            .is_err());
+        assert!(ledger
+            .add_entry("gotchas", "ok", Some("src/[x]"), None)
+            .is_err());
+        assert!(ledger
+            .add_entry("gotchas", "ok", None, Some("foo\rbar"))
+            .is_err());
+        assert!(ledger
+            .add_entry("gotchas", "ok", Some("   "), None)
+            .is_err());
+        assert!(ledger
+            .add_entry("debt", "~~done~~ <- a -> b", None, None)
+            .is_err());
+        assert!(ledger
+            .add_entry("debt", "[x] done <- a -> b", None, None)
+            .is_err());
+        assert!(ledger
+            .add_entry("debt", "[ ] open <- a -> b", None, None)
+            .is_err());
+    }
+
+    #[test]
+    fn adr_title_skips_yaml_frontmatter_and_fences() {
+        let md = "\
+---
+# status: accepted
+title: ignored
+---
+
+```bash
+# shell comment inside fence
+```
+
+    # indented code comment
+
+# ADR-001: WAL Concurrency
+";
+        assert_eq!(extract_markdown_h1(md), Some("ADR-001: WAL Concurrency"));
+    }
+
+    #[test]
+    fn load_rejects_oversized_memory_file() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        let big = "a".repeat((MAX_MEMORY_FILE_BYTES + 16) as usize);
+        fs::write(dir.path().join(".agents/memory.md"), big).unwrap();
+        let err = MemoryLedger::load(dir.path()).unwrap_err();
+        assert!(format!("{:#}", err).contains("exceeds maximum allowed size"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_permissions_and_rejects_symlink_lock() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        MemoryLedger::scaffold(dir.path(), false).unwrap();
+        let mem_path = MemoryLedger::memory_path(dir.path());
+        fs::set_permissions(&mem_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        MemoryLedger::add_entry_locked(dir.path(), "gotchas", "keep perms", None, None).unwrap();
+        let mode = fs::metadata(&mem_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file mode must remain 0600");
+
+        let lock_path = dir.path().join(".agents/.memory.lock");
+        symlink("/nonexistent_target_for_test", &lock_path).unwrap();
+        let err = MemoryLedger::add_entry_locked(dir.path(), "gotchas", "blocked", None, None)
+            .unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("symlink"),
+            "expected symlink rejection, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn concurrent_add_entry_locked_preserves_all_updates() {
+        let dir = tempdir().unwrap();
+        MemoryLedger::scaffold(dir.path(), false).unwrap();
+        let root = dir.path().to_path_buf();
+
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let r = root.clone();
+                std::thread::spawn(move || {
+                    MemoryLedger::add_entry_locked(
+                        &r,
+                        "gotchas",
+                        &format!("concurrent-note-{i}"),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let ledger = MemoryLedger::load(dir.path()).unwrap();
+        for i in 0..12 {
+            assert!(
+                ledger.raw_content.contains(&format!("concurrent-note-{i}")),
+                "missing concurrent-note-{i}"
+            );
+        }
     }
 }

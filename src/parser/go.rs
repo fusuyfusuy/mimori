@@ -1,10 +1,11 @@
 use crate::model::{symbol_flags, Symbol, SymbolKind};
 use crate::parser::common::{
-    extract_signature_ast, is_valid_ident, node_text, ImportSet, RefCollector, MAX_AST_DEPTH,
+    build_symbol, extract_signature_ast, is_valid_ident, node_text, ImportSet, ParseDiagnostics,
+    RefCollector, ScopeStack, MAX_AST_DEPTH,
 };
 use crate::workspace::AliasSet;
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};
@@ -26,23 +27,64 @@ struct GoImports {
     external_list: Vec<String>,
 }
 
+struct GoWalkCtx<'a> {
+    content: &'a str,
+    file: &'a str,
+    file_is_test: bool,
+    imports: &'a GoImports,
+    depth_truncated: Cell<bool>,
+}
+
+impl<'a> GoWalkCtx<'a> {
+    fn check_depth(&self, depth: usize) -> bool {
+        if depth >= MAX_AST_DEPTH {
+            self.depth_truncated.set(true);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub fn parse_go(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
+    Ok(parse_go_with_diagnostics(file, content, aliases)?.0)
+}
+
+pub fn parse_go_with_diagnostics(
+    file: &str,
+    content: &str,
+    aliases: &AliasSet,
+) -> Result<(Vec<Symbol>, ParseDiagnostics)> {
     let tree = GO_PARSER
         .with(|p| p.borrow_mut().parse(content, None))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse Go source"))?;
 
-    let mut symbols = Vec::new();
     let root = tree.root_node();
-    let imports = collect_go_imports(root, content, aliases);
+    let depth_truncated = Cell::new(false);
+    let imports = collect_go_imports(root, content, aliases, &depth_truncated);
     let file_is_test = file.ends_with("_test.go");
-    walk_go_node(root, content, file, file_is_test, &imports, &mut symbols, 0);
+    let ctx = GoWalkCtx {
+        content,
+        file,
+        file_is_test,
+        imports: &imports,
+        depth_truncated: Cell::new(depth_truncated.get()),
+    };
+
+    let mut symbols = Vec::new();
+    walk_go_node(root, &ctx, &mut symbols, 0);
+    let truncated = ctx.depth_truncated.get();
 
     let external_imports: Arc<[String]> = imports.external_list.into();
     for s in &mut symbols {
         s.external_imports = Arc::clone(&external_imports);
     }
 
-    Ok(symbols)
+    let diag = ParseDiagnostics {
+        has_error: root.has_error(),
+        depth_truncated: truncated,
+    };
+    Ok((symbols, diag))
 }
 
 /// Bind Go package name for an import path, stripping trailing major-version
@@ -64,10 +106,23 @@ fn is_go_major_version(seg: &str) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn collect_go_imports(root: Node, content: &str, aliases: &AliasSet) -> GoImports {
+fn collect_go_imports(
+    root: Node,
+    content: &str,
+    aliases: &AliasSet,
+    depth_truncated: &Cell<bool>,
+) -> GoImports {
     let mut internal = HashMap::new();
     let mut ext_set = ImportSet::default();
-    walk_go_imports(root, content, aliases, &mut internal, &mut ext_set, 0);
+    walk_go_imports(
+        root,
+        content,
+        aliases,
+        &mut internal,
+        &mut ext_set,
+        depth_truncated,
+        0,
+    );
     let external: HashSet<String> = ext_set.items.iter().cloned().collect();
     GoImports {
         internal,
@@ -82,9 +137,11 @@ fn walk_go_imports(
     aliases: &AliasSet,
     internal: &mut HashMap<String, String>,
     external: &mut ImportSet,
+    depth_truncated: &Cell<bool>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     if node.kind() == "import_spec" {
@@ -95,10 +152,12 @@ fn walk_go_imports(
                 Some(n) => n,
                 None => go_default_pkg_name(p),
             };
+            // Without `go.mod`, domain-qualified imports (`github.com/...`, `golang.org/...`)
+            // and stdlib imports are external; only explicit relative imports are internal.
             let is_internal = if aliases.has_go_modules() {
                 aliases.matches_go(p)
             } else {
-                p.contains('.')
+                p.starts_with("./") || p.starts_with("../")
             };
             if is_internal {
                 let hint = go_default_pkg_name(p).to_string();
@@ -111,7 +170,15 @@ fn walk_go_imports(
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        walk_go_imports(c, content, aliases, internal, external, depth + 1);
+        walk_go_imports(
+            c,
+            content,
+            aliases,
+            internal,
+            external,
+            depth_truncated,
+            depth + 1,
+        );
     }
 }
 
@@ -133,39 +200,25 @@ fn parse_go_import_spec<'a>(node: Node, content: &'a str) -> (Option<&'a str>, O
     (name, path)
 }
 
-fn walk_go_node(
-    node: Node,
-    content: &str,
-    file: &str,
-    file_is_test: bool,
-    imports: &GoImports,
-    symbols: &mut Vec<Symbol>,
-    depth: usize,
-) {
-    if depth >= MAX_AST_DEPTH {
+fn walk_go_node(node: Node, ctx: &GoWalkCtx<'_>, symbols: &mut Vec<Symbol>, depth: usize) {
+    if ctx.check_depth(depth) {
         return;
     }
+    let content = ctx.content;
     let kind = node.kind();
     match kind {
         "function_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
-                let is_test = file_is_test
-                    || name.starts_with("Test")
-                    || name.starts_with("Benchmark")
-                    || name.starts_with("Fuzz")
-                    || name.starts_with("Example");
-                let symbol = create_symbol(
+                let flags = go_flags(name, ctx.file_is_test, false);
+                symbols.push(create_symbol(
                     node,
-                    content,
-                    file,
+                    ctx,
                     name.to_string(),
                     SymbolKind::Function,
                     None,
-                    imports,
-                    go_flags(name, is_test),
-                );
-                symbols.push(symbol);
+                    flags,
+                ));
             }
             return;
         }
@@ -174,85 +227,31 @@ fn walk_go_node(
                 let name = node_text(name_node, content).trim();
                 let (recv_ident, receiver_type) = extract_receiver(node, content);
                 let full_name = match receiver_type {
-                    Some(rt) => format!("{}::{}", rt, name),
+                    Some(rt) => format!("{rt}::{name}"),
                     None => name.to_string(),
                 };
-                let symbol = create_symbol(
+                let flags = go_flags(name, ctx.file_is_test, true);
+                symbols.push(create_symbol(
                     node,
-                    content,
-                    file,
+                    ctx,
                     full_name,
                     SymbolKind::Method,
                     recv_ident.zip(receiver_type),
-                    imports,
-                    go_flags(name, file_is_test),
-                );
-                symbols.push(symbol);
+                    flags,
+                ));
             }
             return;
         }
         "type_declaration" => {
-            let mut cursor = node.walk();
-            let mut specs = Vec::new();
-            for child in node.children(&mut cursor) {
-                if matches!(child.kind(), "type_spec" | "type_alias") {
-                    specs.push(child);
-                }
-            }
-            let is_grouped = specs.len() > 1;
-            for child in specs {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(name_node, content).trim();
-                    let type_node = child.child_by_field_name("type");
-                    let sym_kind = if child.kind() == "type_alias" {
-                        SymbolKind::TypeAlias
-                    } else {
-                        match type_node.map(|t| t.kind()) {
-                            Some("struct_type") => SymbolKind::Struct,
-                            Some("interface_type") => SymbolKind::Interface,
-                            _ => SymbolKind::TypeAlias,
-                        }
-                    };
-                    let sym_node = if is_grouped { child } else { node };
-                    let symbol = create_symbol(
-                        sym_node,
-                        content,
-                        file,
-                        name.to_string(),
-                        sym_kind,
-                        None,
-                        imports,
-                        go_flags(name, file_is_test),
-                    );
-                    symbols.push(symbol);
-                }
-            }
+            extract_go_type_specs(node, ctx, symbols);
             return;
         }
         "const_declaration" => {
-            extract_spec_symbols(
-                node,
-                content,
-                file,
-                file_is_test,
-                "const_spec",
-                SymbolKind::Constant,
-                imports,
-                symbols,
-            );
+            extract_spec_symbols(node, ctx, "const_spec", SymbolKind::Constant, symbols);
             return;
         }
         "var_declaration" => {
-            extract_spec_symbols(
-                node,
-                content,
-                file,
-                file_is_test,
-                "var_spec",
-                SymbolKind::Variable,
-                imports,
-                symbols,
-            );
+            extract_spec_symbols(node, ctx, "var_spec", SymbolKind::Variable, symbols);
             return;
         }
         _ => {}
@@ -260,19 +259,45 @@ fn walk_go_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_go_node(
-            child,
-            content,
-            file,
-            file_is_test,
-            imports,
-            symbols,
-            depth + 1,
-        );
+        walk_go_node(child, ctx, symbols, depth + 1);
     }
 }
 
-fn go_flags(name: &str, is_test: bool) -> u8 {
+fn extract_go_type_specs(node: Node, ctx: &GoWalkCtx<'_>, symbols: &mut Vec<Symbol>) {
+    let content = ctx.content;
+    let mut cursor = node.walk();
+    let specs: Vec<Node> = node
+        .children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "type_spec" | "type_alias"))
+        .collect();
+    let is_grouped = specs.len() > 1;
+    for child in specs {
+        if let Some(name_node) = child.child_by_field_name("name") {
+            let name = node_text(name_node, content).trim();
+            let type_node = child.child_by_field_name("type");
+            let sym_kind = if child.kind() == "type_alias" {
+                SymbolKind::TypeAlias
+            } else {
+                match type_node.map(|t| t.kind()) {
+                    Some("struct_type") => SymbolKind::Struct,
+                    Some("interface_type") => SymbolKind::Interface,
+                    _ => SymbolKind::TypeAlias,
+                }
+            };
+            let sym_node = if is_grouped { child } else { node };
+            symbols.push(create_symbol(
+                sym_node,
+                ctx,
+                name.to_string(),
+                sym_kind,
+                None,
+                go_flags(name, ctx.file_is_test, false),
+            ));
+        }
+    }
+}
+
+fn go_flags(name: &str, is_test: bool, is_method: bool) -> u8 {
     let mut flags = 0u8;
     if is_test {
         flags |= symbol_flags::IS_TEST;
@@ -280,45 +305,28 @@ fn go_flags(name: &str, is_test: bool) -> u8 {
     if name.starts_with(|c: char| c.is_ascii_uppercase()) {
         flags |= symbol_flags::IS_PUBLIC;
     }
+    if !is_method && name == "init" {
+        flags |= symbol_flags::IS_ATTR_ENTRY;
+    }
     flags
 }
 
-#[allow(clippy::too_many_arguments)]
 fn extract_spec_symbols(
     decl_node: Node,
-    content: &str,
-    file: &str,
-    file_is_test: bool,
+    ctx: &GoWalkCtx<'_>,
     spec_kind: &str,
     sym_kind: SymbolKind,
-    imports: &GoImports,
     symbols: &mut Vec<Symbol>,
 ) {
     let mut cursor = decl_node.walk();
     for child in decl_node.children(&mut cursor) {
         if child.kind() == spec_kind {
-            emit_named_specs(
-                child,
-                content,
-                file,
-                file_is_test,
-                &sym_kind,
-                imports,
-                symbols,
-            );
+            emit_named_specs(child, ctx, &sym_kind, symbols);
         } else if child.kind().ends_with("_spec_list") {
             let mut lcursor = child.walk();
             for sub in child.children(&mut lcursor) {
                 if sub.kind() == spec_kind {
-                    emit_named_specs(
-                        sub,
-                        content,
-                        file,
-                        file_is_test,
-                        &sym_kind,
-                        imports,
-                        symbols,
-                    );
+                    emit_named_specs(sub, ctx, &sym_kind, symbols);
                 }
             }
         }
@@ -327,28 +335,22 @@ fn extract_spec_symbols(
 
 fn emit_named_specs(
     spec_node: Node,
-    content: &str,
-    file: &str,
-    file_is_test: bool,
+    ctx: &GoWalkCtx<'_>,
     sym_kind: &SymbolKind,
-    imports: &GoImports,
     symbols: &mut Vec<Symbol>,
 ) {
     let mut ncursor = spec_node.walk();
     for name_node in spec_node.children_by_field_name("name", &mut ncursor) {
-        let name = node_text(name_node, content).trim();
+        let name = node_text(name_node, ctx.content).trim();
         if !name.is_empty() && name != "_" {
-            let symbol = create_symbol(
+            symbols.push(create_symbol(
                 spec_node,
-                content,
-                file,
+                ctx,
                 name.to_string(),
                 sym_kind.clone(),
                 None,
-                imports,
-                go_flags(name, file_is_test),
-            );
-            symbols.push(symbol);
+                go_flags(name, ctx.file_is_test, false),
+            ));
         }
     }
 }
@@ -387,45 +389,141 @@ fn strip_go_type_name(raw: &str) -> Option<&str> {
     is_valid_ident(t).then_some(t)
 }
 
-fn collect_go_local_types(fn_node: Node, content: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Some(params) = fn_node.child_by_field_name("parameters") {
-        let mut cursor = params.walk();
-        for p in params.children(&mut cursor) {
-            if p.kind() == "parameter_declaration" {
-                let ty = p
-                    .child_by_field_name("type")
-                    .and_then(|t| strip_go_type_name(node_text(t, content)));
+fn is_go_builtin_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "any"
+            | "bool"
+            | "byte"
+            | "comparable"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+    )
+}
+
+fn bind_go_params(fn_node: Node, content: &str, scopes: &mut ScopeStack) {
+    let Some(params) = fn_node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = params.walk();
+    for p in params.children(&mut cursor) {
+        if p.kind() != "parameter_declaration" {
+            continue;
+        }
+        let ty = p
+            .child_by_field_name("type")
+            .and_then(|t| strip_go_type_name(node_text(t, content)))
+            .filter(|t| !is_go_builtin_type(t));
+        let mut ncursor = p.walk();
+        for name_node in p.children_by_field_name("name", &mut ncursor) {
+            let var = node_text(name_node, content).trim();
+            if is_valid_ident(var) {
                 if let Some(ty_name) = ty {
-                    if ty_name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                        let mut ncursor = p.walk();
-                        for name_node in p.children_by_field_name("name", &mut ncursor) {
-                            let var = node_text(name_node, content).trim();
-                            if is_valid_ident(var) {
-                                map.insert(var.to_string(), ty_name.to_string());
-                            }
-                        }
-                    }
+                    scopes.insert(var.to_string(), ty_name.to_string());
+                } else {
+                    scopes.shadow(var.to_string());
                 }
             }
         }
     }
-    map
 }
 
-#[allow(clippy::too_many_arguments)]
+fn infer_go_expr_type(mut expr: Node, content: &str) -> Option<String> {
+    for _ in 0..4 {
+        match expr.kind() {
+            "unary_expression" | "parenthesized_expression" => {
+                expr = expr
+                    .child_by_field_name("operand")
+                    .or_else(|| expr.named_child(0))?;
+            }
+            "composite_literal" => {
+                let ty = expr.child_by_field_name("type")?;
+                let name = strip_go_type_name(node_text(ty, content))?;
+                return (!is_go_builtin_type(name)).then(|| name.to_string());
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn bind_go_short_var_decl(node: Node, content: &str, scopes: &mut ScopeStack) {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    let mut lcur = left.walk();
+    let lhs: Vec<Node> = left.named_children(&mut lcur).collect();
+    let mut rcur = right.walk();
+    let rhs: Vec<Node> = right.named_children(&mut rcur).collect();
+    for (i, l) in lhs.iter().enumerate() {
+        if l.kind() != "identifier" {
+            continue;
+        }
+        let var = node_text(*l, content).trim();
+        if !is_valid_ident(var) || var == "_" {
+            continue;
+        }
+        if let Some(ty) = rhs.get(i).and_then(|r| infer_go_expr_type(*r, content)) {
+            scopes.insert(var.to_string(), ty);
+        } else {
+            scopes.shadow(var.to_string());
+        }
+    }
+}
+
+fn bind_go_var_spec(node: Node, content: &str, scopes: &mut ScopeStack) {
+    let explicit_ty = node
+        .child_by_field_name("type")
+        .and_then(|t| strip_go_type_name(node_text(t, content)))
+        .filter(|t| !is_go_builtin_type(t))
+        .map(str::to_string);
+    let inferred_ty = explicit_ty.or_else(|| {
+        node.child_by_field_name("value")
+            .and_then(|v| v.named_child(0).or(Some(v)))
+            .and_then(|e| infer_go_expr_type(e, content))
+    });
+    let mut ncursor = node.walk();
+    for name_node in node.children_by_field_name("name", &mut ncursor) {
+        let var = node_text(name_node, content).trim();
+        if !is_valid_ident(var) || var == "_" {
+            continue;
+        }
+        if let Some(ref ty) = inferred_ty {
+            scopes.insert(var.to_string(), ty.clone());
+        } else {
+            scopes.shadow(var.to_string());
+        }
+    }
+}
+
 fn create_symbol(
     node: Node,
-    content: &str,
-    file: &str,
+    ctx: &GoWalkCtx<'_>,
     name: String,
     kind: SymbolKind,
     receiver: Option<(&str, &str)>,
-    imports: &GoImports,
     flags: u8,
 ) -> Symbol {
-    let start_pos = node.start_position();
-    let end_pos = node.end_position();
+    let content = ctx.content;
     let raw_body = node_text(node, content);
     let first_line = raw_body.lines().next().unwrap_or("").trim();
     let signature = if matches!(kind, SymbolKind::Constant | SymbolKind::Variable) {
@@ -434,76 +532,81 @@ fn create_symbol(
         extract_signature_ast(node, content, first_line)
     };
 
-    let local_types = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-        collect_go_local_types(node, content)
-    } else {
-        HashMap::new()
-    };
+    let mut scopes = ScopeStack::new();
+    if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        bind_go_params(node, content, &mut scopes);
+    }
 
     let mut refs = RefCollector::default();
-    collect_references(node, content, receiver, &local_types, imports, &mut refs, 0);
+    collect_references(node, ctx, receiver, &mut scopes, &mut refs, 0);
 
-    Symbol {
-        name,
-        kind,
-        file: file.to_string(),
-        start_line: start_pos.row + 1,
-        end_line: end_pos.row + 1,
-        signature,
-        body: String::new(),
-        centrality: 0.0,
-        calls: refs.calls,
-        mentions: refs.mentions,
-        call_counts: refs.counts,
-        member_calls: refs.member_calls,
-        external_imports: crate::model::symbol::empty_external_imports(),
-        flags,
-    }
+    build_symbol(node, ctx.file, name, kind, signature, refs, flags)
 }
 
 fn collect_references(
     node: Node,
-    content: &str,
+    ctx: &GoWalkCtx<'_>,
     receiver: Option<(&str, &str)>,
-    local_types: &HashMap<String, String>,
-    imports: &GoImports,
+    scopes: &mut ScopeStack,
     refs: &mut RefCollector,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH {
+    if ctx.check_depth(depth) {
         return;
     }
+    let content = ctx.content;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let kind = child.kind();
-        if kind == "call_expression" {
-            extract_go_call(child, content, receiver, local_types, imports, refs);
-        } else if kind == "type_conversion_expression" {
-            // tree-sitter-go parses single-argument generic calls (`GenericFn[int](42)`
-            // and `pkg.GenericFn[int](42)`) as `type_conversion_expression` with a
-            // `generic_type` or `type_instantiation_expression` target.
-            if let Some(ty) = child.child_by_field_name("type") {
-                if matches!(ty.kind(), "generic_type" | "type_instantiation_expression") {
-                    extract_go_callee(ty, content, receiver, local_types, imports, refs);
+        match kind {
+            "block" => {
+                scopes.push();
+                collect_references(child, ctx, receiver, scopes, refs, depth + 1);
+                scopes.pop();
+                continue;
+            }
+            "func_literal" => {
+                scopes.push();
+                bind_go_params(child, content, scopes);
+                collect_references(child, ctx, receiver, scopes, refs, depth + 1);
+                scopes.pop();
+                continue;
+            }
+            "short_var_declaration" => {
+                collect_references(child, ctx, receiver, scopes, refs, depth + 1);
+                bind_go_short_var_decl(child, content, scopes);
+                continue;
+            }
+            "var_spec" => {
+                collect_references(child, ctx, receiver, scopes, refs, depth + 1);
+                bind_go_var_spec(child, content, scopes);
+                continue;
+            }
+            "call_expression" => {
+                extract_go_call(child, ctx, receiver, scopes, refs);
+            }
+            "type_conversion_expression" => {
+                // tree-sitter-go parses single-argument generic calls (`GenericFn[int](42)`
+                // and `pkg.GenericFn[int](42)`) as `type_conversion_expression` with a
+                // `generic_type` or `type_instantiation_expression` target.
+                if let Some(ty) = child.child_by_field_name("type") {
+                    if matches!(ty.kind(), "generic_type" | "type_instantiation_expression") {
+                        extract_go_callee(ty, ctx, receiver, scopes, refs);
+                    }
                 }
             }
-        } else if kind == "selector_expression" {
-            if let Some(field) = child.child_by_field_name("field") {
-                refs.push_mention(node_text(field, content));
+            "selector_expression" => {
+                if let Some(field) = child.child_by_field_name("field") {
+                    refs.push_mention(node_text(field, content));
+                }
             }
-        } else if kind == "type_identifier" {
-            refs.push_mention(node_text(child, content));
+            "type_identifier" => {
+                refs.push_mention(node_text(child, content));
+            }
+            _ => {}
         }
 
-        collect_references(
-            child,
-            content,
-            receiver,
-            local_types,
-            imports,
-            refs,
-            depth + 1,
-        );
+        collect_references(child, ctx, receiver, scopes, refs, depth + 1);
     }
 }
 
@@ -533,12 +636,13 @@ fn unwrap_go_generic_callee(mut node: Node) -> Node {
 
 fn extract_go_callee(
     raw_fn: Node,
-    content: &str,
+    ctx: &GoWalkCtx<'_>,
     receiver: Option<(&str, &str)>,
-    local_types: &HashMap<String, String>,
-    imports: &GoImports,
+    scopes: &ScopeStack,
     refs: &mut RefCollector,
 ) {
+    let content = ctx.content;
+    let imports = ctx.imports;
     let func_node = unwrap_go_generic_callee(raw_fn);
     if matches!(func_node.kind(), "selector_expression" | "qualified_type") {
         let field_name = if func_node.kind() == "qualified_type" {
@@ -561,7 +665,6 @@ fn extract_go_callee(
         if let Some(operand) = func_node.child_by_field_name(op_field) {
             let op_text = node_text(operand, content).trim();
             if imports.external.contains(op_text) {
-                // Emit `pkg.Fn` so `external_set` matches `pkg` prefix and NEVER hijacks local `Fn`.
                 refs.push_call(&format!("{op_text}.{func_name}"), false);
                 return;
             }
@@ -571,8 +674,11 @@ fn extract_go_callee(
             }
             if let Some((_, recv_type)) = receiver.filter(|(id, _)| *id == op_text) {
                 refs.push_call(&format!("{recv_type}::{func_name}"), false);
-            } else if let Some(ty) = local_types.get(op_text) {
+                return;
+            }
+            if let Some(ty) = scopes.get(op_text) {
                 refs.push_call(&format!("{ty}::{func_name}"), false);
+                return;
             }
         }
         refs.push_call(func_name, true);
@@ -586,20 +692,19 @@ fn extract_go_callee(
 
 fn extract_go_call(
     call_node: Node,
-    content: &str,
+    ctx: &GoWalkCtx<'_>,
     receiver: Option<(&str, &str)>,
-    local_types: &HashMap<String, String>,
-    imports: &GoImports,
+    scopes: &ScopeStack,
     refs: &mut RefCollector,
 ) {
     if let Some(raw_fn) = call_node.child_by_field_name("function") {
-        extract_go_callee(raw_fn, content, receiver, local_types, imports, refs);
+        extract_go_callee(raw_fn, ctx, receiver, scopes, refs);
     }
     if let Some(args_node) = call_node.child_by_field_name("arguments") {
         let mut acursor = args_node.walk();
         for arg in args_node.children(&mut acursor) {
             if arg.kind() == "identifier" {
-                refs.push_mention(node_text(arg, content));
+                refs.push_mention(node_text(arg, ctx.content));
             }
         }
     }
@@ -644,6 +749,9 @@ func Run() { os.Open("x") }
 
     #[test]
     fn type_alias_generic_call_and_v2_imports_parse_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/app\n").unwrap();
+        let aliases = AliasSet::collect(dir.path());
         let src = r#"
 package app
 import "example.com/app/bar/v2"
@@ -653,7 +761,7 @@ func Use(x interface{}) {
     bar.DoThing()
 }
 "#;
-        let syms = parse_go("a.go", src, &AliasSet::default()).unwrap();
+        let syms = parse_go("a.go", src, &aliases).unwrap();
         assert!(syms
             .iter()
             .any(|s| s.name == "MyAlias" && s.kind == SymbolKind::TypeAlias));
@@ -665,5 +773,42 @@ func Use(x interface{}) {
             "{:?}",
             u.calls
         );
+    }
+
+    #[test]
+    fn go_flags_unexported_receivers_and_no_gomod_externals() {
+        let src = r#"
+package p
+import "github.com/gin-gonic/gin"
+
+type server struct{}
+func (s *server) stop() {}
+func TestConnection(s *server) {
+    s.stop()
+    g := &server{}
+    g.stop()
+    gin.New()
+}
+func init() {}
+"#;
+        let syms = parse_go("h.go", src, &AliasSet::default()).unwrap();
+        let tc = syms.iter().find(|s| s.name == "TestConnection").unwrap();
+        assert!(!tc.is_test_flag());
+        assert!(tc.is_public());
+        assert!(
+            tc.calls.contains(&"server::stop".to_string()),
+            "{:?}",
+            tc.calls
+        );
+        assert!(
+            !tc.member_calls.contains(&"stop".to_string()),
+            "{:?}",
+            tc.member_calls
+        );
+        assert!(tc.calls.contains(&"gin.New".to_string()), "{:?}", tc.calls);
+        assert!(tc.external_imports.contains(&"gin".to_string()));
+        let init_fn = syms.iter().find(|s| s.name == "init").unwrap();
+        assert!(init_fn.is_attr_entry());
+        assert!(!init_fn.is_test_flag());
     }
 }

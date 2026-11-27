@@ -3,7 +3,7 @@ use crate::model::{Coordinate, Symbol, SymbolKind};
 use crate::workspace::walker::MAX_INDEX_FILE_BYTES;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
@@ -85,6 +85,12 @@ impl BlastResult {
                 out.push_str(
                     "No upstream callers affected. This symbol is an isolated root or leaf.\n",
                 );
+            }
+            if !self.literal_test_mentions.is_empty() {
+                out.push_str("\n### Literal / Source-Inspection Test Mentions\n");
+                for m in &self.literal_test_mentions {
+                    out.push_str(&format!("- `{}`\n", m));
+                }
             }
             return out;
         }
@@ -209,9 +215,14 @@ fn is_generic_leaf_ident(leaf: &str) -> bool {
     leaf.len() < 4 || GENERIC_LEAF_NAMES.contains(&leaf)
 }
 
+const MAX_FILE_CACHE_ENTRIES: usize = 64;
+const MAX_FILE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
 struct FileLineCache<'a> {
     root: Option<&'a Path>,
-    files: HashMap<&'a str, Vec<String>>,
+    files: HashMap<&'a str, (Vec<String>, usize)>,
+    order: VecDeque<&'a str>,
+    cached_bytes: usize,
 }
 
 impl<'a> FileLineCache<'a> {
@@ -219,6 +230,59 @@ impl<'a> FileLineCache<'a> {
         Self {
             root,
             files: HashMap::new(),
+            order: VecDeque::new(),
+            cached_bytes: 0,
+        }
+    }
+
+    fn load_lines(&self, rel_file: &str) -> (Vec<String>, usize) {
+        let Some(root) = self.root else {
+            return (Vec::new(), 0);
+        };
+        let Ok(path) = crate::workspace::walker::confine_to_workspace(root, Path::new(rel_file))
+        else {
+            return (Vec::new(), 0);
+        };
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_INDEX_FILE_BYTES) {
+            return (Vec::new(), 0);
+        }
+        match std::fs::read_to_string(path) {
+            Ok(s) => {
+                let bytes = s.len();
+                let lines = s.lines().map(str::to_string).collect();
+                (lines, bytes)
+            }
+            Err(_) => (Vec::new(), 0),
+        }
+    }
+
+    fn evict_if_needed(&mut self, incoming_bytes: usize) {
+        while (self.files.len() >= MAX_FILE_CACHE_ENTRIES
+            || self.cached_bytes.saturating_add(incoming_bytes) > MAX_FILE_CACHE_BYTES)
+            && !self.order.is_empty()
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some((_, bytes)) = self.files.remove(oldest) {
+                    self.cached_bytes = self.cached_bytes.saturating_sub(bytes);
+                }
+            }
+        }
+    }
+
+    fn emit_symbol_range<F>(sym: &Symbol, lines: &[String], mut f: F)
+    where
+        F: FnMut(usize, &str),
+    {
+        if lines.is_empty() {
+            return;
+        }
+        let start_idx = sym.start_line.saturating_sub(1);
+        if start_idx >= lines.len() {
+            return;
+        }
+        let end_idx = sym.end_line.max(sym.start_line).min(lines.len());
+        for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
+            f(idx, line);
         }
     }
 
@@ -232,33 +296,26 @@ impl<'a> FileLineCache<'a> {
             }
             return;
         }
-        let Some(root) = self.root else {
-            return;
-        };
-        let lines = self.files.entry(sym.file.as_str()).or_insert_with(|| {
-            let Ok(path) =
-                crate::workspace::walker::confine_to_workspace(root, Path::new(&sym.file))
-            else {
-                return Vec::new();
-            };
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_INDEX_FILE_BYTES) {
-                return Vec::new();
-            }
-            std::fs::read_to_string(path)
-                .map(|s| s.lines().map(str::to_string).collect())
-                .unwrap_or_default()
-        });
-        if lines.is_empty() {
+        if self.root.is_none() {
             return;
         }
-        let start_idx = sym.start_line.saturating_sub(1);
-        if start_idx >= lines.len() {
+        if let Some((lines, _)) = self.files.get(sym.file.as_str()) {
+            Self::emit_symbol_range(sym, lines, f);
             return;
         }
-        let end_idx = sym.end_line.max(sym.start_line).min(lines.len());
-        for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
-            f(idx, line);
+        let (lines, bytes) = self.load_lines(&sym.file);
+        if bytes > MAX_FILE_CACHE_BYTES {
+            Self::emit_symbol_range(sym, &lines, f);
+            return;
         }
+        self.evict_if_needed(bytes);
+        self.cached_bytes = self.cached_bytes.saturating_add(bytes);
+        self.order.push_back(sym.file.as_str());
+        let entry = self
+            .files
+            .entry(sym.file.as_str())
+            .or_insert((lines, bytes));
+        Self::emit_symbol_range(sym, &entry.0, f);
     }
 }
 
@@ -366,6 +423,14 @@ fn run_bfs<'a>(
         }
     }
 
+    affected.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| a.coordinate.cmp(&b.coordinate))
+    });
+    entry_points.sort();
+    test_suites.sort();
+
     BfsOutput {
         affected,
         entry_points,
@@ -374,7 +439,11 @@ fn run_bfs<'a>(
     }
 }
 
-fn build_unverified_member_warning(graph: &SymbolGraph, seed_indices: &[usize]) -> Option<String> {
+pub(crate) fn build_unverified_member_warning(
+    graph: &SymbolGraph,
+    seed_indices: &[usize],
+) -> Option<String> {
+    let mut warned: BTreeMap<&str, usize> = BTreeMap::new();
     for &idx in seed_indices {
         let sym = &graph.symbols[idx];
         if sym.kind != SymbolKind::Method {
@@ -383,14 +452,33 @@ fn build_unverified_member_warning(graph: &SymbolGraph, seed_indices: &[usize]) 
         let leaf = sym.name.rsplit([':', '.']).next().unwrap_or(&sym.name);
         if let Some(&count) = graph.unresolved_member_calls.get(leaf) {
             if count > 0 {
-                return Some(format!(
-                    "Warning: {} unresolved cross-file `.{}()` call site(s) exist in workspace (untyped receiver calls are not linked statically); verify with: `rg -n \"\\.{}\\(\"`",
-                    count, leaf, leaf
-                ));
+                warned.entry(leaf).or_insert(count);
             }
         }
     }
-    None
+    if warned.is_empty() {
+        return None;
+    }
+    if warned.len() == 1 {
+        let (&leaf, &count) = warned.iter().next()?;
+        return Some(format!(
+            "Warning: {} unresolved cross-file `.{}()` call site(s) exist in workspace (untyped receiver calls are not linked statically); verify with: `rg -n \"\\.{}\\(\"`",
+            count, leaf, leaf
+        ));
+    }
+    let total: usize = warned.values().sum();
+    let details: Vec<String> = warned
+        .iter()
+        .map(|(leaf, count)| format!("`.{}()` ({})", leaf, count))
+        .collect();
+    let rg_pattern = warned.keys().copied().collect::<Vec<_>>().join("|");
+    Some(format!(
+        "Warning: {} unresolved cross-file member call site(s) across {} method(s) ({}) exist in workspace (untyped receiver calls are not linked statically); verify with: `rg -n \"\\.({})\\(\"`",
+        total,
+        warned.len(),
+        details.join(", "),
+        rg_pattern
+    ))
 }
 
 fn traverse(
@@ -447,6 +535,8 @@ fn traverse(
             }
         }
 
+        value_uses.sort_by(|a, b| a.coordinate.cmp(&b.coordinate));
+
         let literal_seed_names: Vec<&str> = indices
             .iter()
             .filter_map(|&i| {
@@ -496,14 +586,28 @@ fn traverse(
     })
 }
 
+pub(crate) struct MultiUpstreamResult {
+    pub affected: Vec<BlastNode>,
+    pub entry_points: Vec<String>,
+    pub test_suites: Vec<String>,
+    pub literal_test_mentions: Vec<String>,
+    pub unverified_member_calls: Option<String>,
+}
+
 /// Multi-source upstream BFS for `mimori diff`.
 pub(crate) fn traverse_multi_upstream(
     graph: &SymbolGraph,
     mutated_indices: &[usize],
     depth_limit: usize,
-) -> (Vec<BlastNode>, Vec<String>, Vec<String>, Vec<String>) {
+) -> MultiUpstreamResult {
     if mutated_indices.is_empty() {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return MultiUpstreamResult {
+            affected: Vec::new(),
+            entry_points: Vec::new(),
+            test_suites: Vec::new(),
+            literal_test_mentions: Vec::new(),
+            unverified_member_calls: None,
+        };
     }
 
     let mut file_cache = FileLineCache::new(graph.root.as_deref());
@@ -519,11 +623,7 @@ pub(crate) fn traverse_multi_upstream(
         &mut file_cache,
     );
 
-    bfs.affected.sort_by(|a, b| {
-        a.depth
-            .cmp(&b.depth)
-            .then_with(|| a.coordinate.cmp(&b.coordinate))
-    });
+    let unverified_member_calls = build_unverified_member_warning(graph, &seed_indices);
 
     for &seed in &seed_indices {
         for m_idx in graph.mentioner_indices(seed) {
@@ -545,12 +645,13 @@ pub(crate) fn traverse_multi_upstream(
     let literal_test_mentions =
         collect_literal_test_mentions(graph, &mut file_cache, &bfs.visited, &literal_seed_names);
 
-    (
-        bfs.affected,
-        bfs.entry_points,
-        bfs.test_suites,
+    MultiUpstreamResult {
+        affected: bfs.affected,
+        entry_points: bfs.entry_points,
+        test_suites: bfs.test_suites,
         literal_test_mentions,
-    )
+        unverified_member_calls,
+    }
 }
 
 fn find_call_site_lines<'a>(
@@ -710,6 +811,7 @@ pub(crate) fn is_test_symbol(sym: &Symbol) -> bool {
     const TEST_SUFFIXES: &[&str] = &[
         "_test.go",
         "_test.py",
+        "_test.rs",
         ".test.ts",
         ".test.tsx",
         ".test.js",
@@ -733,15 +835,12 @@ pub(crate) fn is_test_symbol(sym: &Symbol) -> bool {
         .and_then(|n| n.to_str())
         .unwrap_or_default();
 
-    if TEST_SUFFIXES.iter().any(|sfx| name.ends_with(sfx))
-        || name.starts_with("test_")
-        || name.starts_with("Test")
-    {
+    if TEST_SUFFIXES.iter().any(|sfx| name.ends_with(sfx)) || name.starts_with("test_") {
         return true;
     }
 
     let sym_leaf = sym.name.rsplit("::").next().unwrap_or(&sym.name);
-    sym_leaf.starts_with("test_") || sym_leaf.starts_with("Test")
+    sym_leaf.starts_with("test_")
 }
 
 pub fn parse_sink_list(raw: Option<&str>) -> Vec<String> {
@@ -912,5 +1011,62 @@ mod tests {
         assert!(!is_test_symbol(&s("src/contest.rs", "run_contest")));
         assert!(!is_test_symbol(&s("src/auth.rs", "attestation")));
         assert!(!is_test_symbol(&s("src/protest/mod.rs", "handler")));
+        assert!(!is_test_symbol(&s("src/Testimonials.rs", "Testimonials")));
+        assert!(!is_test_symbol(&s("src/runner.rs", "TestRunner")));
+    }
+
+    #[test]
+    fn blast_markdown_preserves_literal_test_mentions_when_affected_empty() {
+        let res = BlastResult {
+            target: "src/a.rs:lonely_token".into(),
+            depth_limit: 3,
+            affected: vec![],
+            entry_points: vec![],
+            test_suites: vec![],
+            direction: "up".into(),
+            value_uses: vec![],
+            literal_test_mentions: vec!["tests/spec.rs:#L12".into()],
+            unverified_member_calls: None,
+            memory_notes: vec![],
+        };
+        let md = res.to_markdown();
+        assert!(md.contains("Literal / Source-Inspection Test Mentions"));
+        assert!(md.contains("tests/spec.rs:#L12"));
+    }
+
+    #[test]
+    fn unverified_member_warning_aggregates_multiple_methods_and_generic_names() {
+        let mut m1 = s("src/symbol.rs", "SymbolKind::as_str");
+        m1.kind = SymbolKind::Method;
+        let mut m2 = s("src/db.rs", "Database::save_rows");
+        m2.kind = SymbolKind::Method;
+        let mut c = sr("src/app.rs", "run_app", &["as_str", "save_rows"]);
+        c.member_calls = vec!["as_str".into(), "save_rows".into()];
+        let g = SymbolGraph::new(vec![m1, m2, c]);
+
+        let single = calculate_blast_radius(
+            &g,
+            &Coordinate::parse("src/symbol.rs:SymbolKind::as_str").unwrap(),
+            3,
+        )
+        .unwrap();
+        assert!(single
+            .unverified_member_calls
+            .as_deref()
+            .is_some_and(|w| w.contains(".as_str()")));
+
+        let m1_idx = g
+            .symbols
+            .iter()
+            .position(|x| x.name == "SymbolKind::as_str")
+            .unwrap();
+        let m2_idx = g
+            .symbols
+            .iter()
+            .position(|x| x.name == "Database::save_rows")
+            .unwrap();
+        let multi = build_unverified_member_warning(&g, &[m1_idx, m2_idx]).unwrap();
+        assert!(multi.contains(".as_str()"), "got: {multi}");
+        assert!(multi.contains(".save_rows()"), "got: {multi}");
     }
 }

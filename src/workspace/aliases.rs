@@ -2,10 +2,16 @@
 //! `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.mod`, Python local
 //! modules) with strict workspace confinement before reading any file.
 
-use crate::workspace::walker::{confine_to_workspace, fnv1a_hash, normalize_rel_str};
+use crate::workspace::walker::{
+    confine_to_workspace, fnv1a_hash, normalize_rel_str, read_bounded, read_to_string_bounded,
+    MAX_INDEX_FILE_BYTES,
+};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Hard cap on directories traversed while expanding workspace globs (`/**`).
+const MAX_WORKSPACE_GLOB_DIRS: usize = 2_048;
 
 /// One `compilerOptions.paths` key. TypeScript allows a single `*`, anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +41,7 @@ pub struct AliasSet {
     rust_crates: Vec<String>,
     go_modules: Vec<String>,
     py_modules: Vec<String>,
+    visited_configs: Vec<PathBuf>,
     fingerprint: String,
 }
 
@@ -53,6 +60,12 @@ impl AliasSet {
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// All confined manifest/config files and `baseUrl` directories consulted
+    /// while building this `AliasSet`, sorted and deduplicated.
+    pub fn visited_configs(&self) -> &[PathBuf] {
+        &self.visited_configs
     }
 
     /// True when `spec` is a first-party JS/TS alias or workspace package.
@@ -106,84 +119,36 @@ impl AliasSet {
         root: &Path,
         discovery: &super::walker::WorkspaceDiscovery,
     ) -> AliasSet {
-        let mut manifests: Vec<PathBuf> = discovery
-            .package_manifests
-            .iter()
-            .filter_map(|p| confine_to_workspace(root, p).ok())
-            .collect();
-        let mut configs: Vec<PathBuf> = discovery
-            .tsconfigs
-            .iter()
-            .filter_map(|p| confine_to_workspace(root, p).ok())
-            .collect();
-
-        let mut workspace_globs = read_package_json_workspaces(root);
-        workspace_globs.extend(read_pnpm_workspaces(root));
-        let workspace_dirs = expand_workspace_globs(root, &workspace_globs);
-
-        for dir in &workspace_dirs {
-            let pkg_json = dir.join("package.json");
-            if let Ok(confined) = confine_to_workspace(root, &pkg_json) {
-                if confined.is_file() && !manifests.contains(&confined) {
-                    manifests.push(confined);
-                }
-            }
-            let tsconfig = dir.join("tsconfig.json");
-            if let Ok(confined) = confine_to_workspace(root, &tsconfig) {
-                if confined.is_file() && !configs.contains(&confined) {
-                    configs.push(confined);
-                }
-            }
-        }
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let (manifests, configs, workspace_dirs) =
+            collect_js_manifests(&canon_root, root, discovery);
 
         let packages = read_package_names(&manifests);
         let mut set = AliasSet {
             js_packages: packages.iter().map(|(name, _)| name.clone()).collect(),
             ..Default::default()
         };
+        add_workspace_dir_packages(&canon_root, &workspace_dirs, &mut set.js_packages);
 
-        let canon_root = root.canonicalize().ok();
-        for dir in &workspace_dirs {
-            let rel_opt = canon_root
-                .as_deref()
-                .and_then(|cr| dir.strip_prefix(cr).ok())
-                .or_else(|| dir.strip_prefix(root).ok());
-            if let Some(rel) = rel_opt {
-                let rel_str = normalize_rel_str(rel);
-                if !rel_str.is_empty() && !set.js_packages.contains(&rel_str) {
-                    set.js_packages.push(rel_str);
-                }
-            }
-        }
-
-        let confined_cargo: Vec<PathBuf> = discovery
-            .cargo_manifests
-            .iter()
-            .filter_map(|p| confine_to_workspace(root, p).ok())
-            .collect();
-        let confined_gomods: Vec<PathBuf> = discovery
-            .go_mods
-            .iter()
-            .filter_map(|p| confine_to_workspace(root, p).ok())
-            .collect();
+        let confined_cargo = confine_discovered_list(&canon_root, root, &discovery.cargo_manifests);
+        let confined_gomods = confine_discovered_list(&canon_root, root, &discovery.go_mods);
 
         read_cargo_package_names(&confined_cargo, &mut set.rust_crates);
         read_go_module_names(&confined_gomods, &mut set.go_modules);
         collect_python_modules(discovery, &mut set.py_modules);
 
-        let mut hash: u64 = 0xcbf29ce484222325;
-        let mix = |h: u64, bytes: &[u8]| fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3);
-
-        if let Ok(pnpm_yaml) = confine_to_workspace(root, &root.join("pnpm-workspace.yaml")) {
-            if let Ok(content) = std::fs::read(&pnpm_yaml) {
-                hash = mix(hash, &content);
-            }
-        }
-
         let mut visited_configs = HashSet::new();
+        let mut watched_dirs = HashSet::new();
         for config in &configs {
             let mut paths = Vec::new();
-            collect_paths(root, config, &packages, &mut visited_configs, &mut paths);
+            collect_paths(
+                &canon_root,
+                config,
+                &packages,
+                &mut visited_configs,
+                &mut watched_dirs,
+                &mut paths,
+            );
             for (key, replacements) in paths {
                 if let Some(pattern) = pattern_for(&key, &replacements) {
                     if !set.patterns.contains(&pattern) {
@@ -193,55 +158,132 @@ impl AliasSet {
             }
         }
 
-        let mut all_paths: Vec<&PathBuf> = manifests
-            .iter()
-            .chain(confined_cargo.iter())
-            .chain(confined_gomods.iter())
-            .chain(visited_configs.iter())
+        let pnpm_yaml = confine_to_workspace(&canon_root, Path::new("pnpm-workspace.yaml")).ok();
+        let mut all_files: Vec<PathBuf> = manifests
+            .into_iter()
+            .chain(confined_cargo)
+            .chain(confined_gomods)
+            .chain(visited_configs)
             .collect();
-        all_paths.sort();
-        all_paths.dedup();
-        for path in all_paths {
-            let rel = canon_root
-                .as_deref()
-                .and_then(|cr| path.strip_prefix(cr).ok())
-                .or_else(|| path.strip_prefix(root).ok())
-                .unwrap_or(path);
-            hash = mix(hash, normalize_rel_str(rel).as_bytes());
-            if let Ok(content) = std::fs::read(path) {
-                hash = mix(hash, &content);
-            }
-        }
+        all_files.sort();
+        all_files.dedup();
 
-        for list in [
-            &set.js_packages,
-            &set.rust_crates,
-            &set.go_modules,
-            &set.py_modules,
-        ] {
-            let mut sorted = list.clone();
-            sorted.sort();
-            sorted.dedup();
-            hash = mix(hash, b"|");
-            for pkg in &sorted {
-                hash = mix(hash, pkg.as_bytes());
-            }
-        }
-        let mut sorted_pats: Vec<(&str, &str, bool)> = set
-            .patterns
-            .iter()
-            .map(|p| (p.prefix.as_str(), p.suffix.as_str(), p.wildcard))
-            .collect();
-        sorted_pats.sort_unstable();
-        for (pref, suf, wc) in sorted_pats {
-            hash = mix(hash, pref.as_bytes());
-            hash = mix(hash, suf.as_bytes());
-            hash = mix(hash, &[u8::from(wc)]);
-        }
+        set.fingerprint =
+            compute_alias_fingerprint(&canon_root, pnpm_yaml.as_deref(), &all_files, &set);
 
-        set.fingerprint = format!("{hash:016x}");
+        let mut all_watched = all_files;
+        if let Some(pnpm) = pnpm_yaml {
+            all_watched.push(pnpm);
+        }
+        all_watched.extend(watched_dirs);
+        all_watched.sort();
+        all_watched.dedup();
+        set.visited_configs = all_watched;
         set
     }
+}
+
+fn confine_discovered_list(canon_root: &Path, raw_root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let candidate = p.strip_prefix(raw_root).unwrap_or(p);
+            confine_to_workspace(canon_root, candidate).ok()
+        })
+        .collect()
+}
+
+fn collect_js_manifests(
+    canon_root: &Path,
+    raw_root: &Path,
+    discovery: &super::walker::WorkspaceDiscovery,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut manifests = confine_discovered_list(canon_root, raw_root, &discovery.package_manifests);
+    let mut configs = confine_discovered_list(canon_root, raw_root, &discovery.tsconfigs);
+
+    let mut workspace_globs = read_package_json_workspaces(canon_root);
+    workspace_globs.extend(read_pnpm_workspaces(canon_root));
+    let workspace_dirs = expand_workspace_globs(canon_root, &workspace_globs);
+
+    for dir in &workspace_dirs {
+        push_confined_file(canon_root, &dir.join("package.json"), &mut manifests);
+        push_confined_file(canon_root, &dir.join("tsconfig.json"), &mut configs);
+    }
+
+    (manifests, configs, workspace_dirs)
+}
+
+fn push_confined_file(canon_root: &Path, candidate: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(confined) = confine_to_workspace(canon_root, candidate) {
+        if confined.is_file() && !out.contains(&confined) {
+            out.push(confined);
+        }
+    }
+}
+
+fn add_workspace_dir_packages(canon_root: &Path, dirs: &[PathBuf], js_packages: &mut Vec<String>) {
+    for dir in dirs {
+        let Ok(rel) = dir.strip_prefix(canon_root) else {
+            continue;
+        };
+        let rel_str = normalize_rel_str(rel);
+        if !rel_str.is_empty() && !js_packages.contains(&rel_str) {
+            js_packages.push(rel_str);
+        }
+    }
+}
+
+fn compute_alias_fingerprint(
+    canon_root: &Path,
+    pnpm_yaml: Option<&Path>,
+    all_files: &[PathBuf],
+    set: &AliasSet,
+) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mix = |h: u64, bytes: &[u8]| fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3);
+
+    if let Some(pnpm) = pnpm_yaml {
+        if let Ok(Some(content)) = read_bounded(pnpm, MAX_INDEX_FILE_BYTES) {
+            hash = mix(hash, &content);
+        }
+    }
+
+    for path in all_files {
+        let rel = path.strip_prefix(canon_root).unwrap_or(path);
+        hash = mix(hash, normalize_rel_str(rel).as_bytes());
+        if let Ok(Some(content)) = read_bounded(path, MAX_INDEX_FILE_BYTES) {
+            hash = mix(hash, &content);
+        }
+    }
+
+    for list in [
+        &set.js_packages,
+        &set.rust_crates,
+        &set.go_modules,
+        &set.py_modules,
+    ] {
+        let mut sorted = list.clone();
+        sorted.sort();
+        sorted.dedup();
+        hash = mix(hash, b"|");
+        for pkg in &sorted {
+            hash = mix(hash, pkg.as_bytes());
+        }
+    }
+
+    let mut sorted_pats: Vec<(&str, &str, bool)> = set
+        .patterns
+        .iter()
+        .map(|p| (p.prefix.as_str(), p.suffix.as_str(), p.wildcard))
+        .collect();
+    sorted_pats.sort_unstable();
+    for (pref, suf, wc) in sorted_pats {
+        hash = mix(hash, pref.as_bytes());
+        hash = mix(hash, suf.as_bytes());
+        hash = mix(hash, &[u8::from(wc)]);
+    }
+
+    format!("{hash:016x}")
 }
 
 fn matches_pkg_list(list: &[String], spec: &str) -> bool {
@@ -278,10 +320,10 @@ fn collect_python_modules(discovery: &super::walker::WorkspaceDiscovery, out: &m
 }
 
 fn read_package_json_workspaces(root: &Path) -> Vec<String> {
-    let Ok(pkg_path) = confine_to_workspace(root, &root.join("package.json")) else {
+    let Ok(pkg_path) = confine_to_workspace(root, Path::new("package.json")) else {
         return Vec::new();
     };
-    let Ok(raw) = std::fs::read_to_string(&pkg_path) else {
+    let Ok(Some(raw)) = read_to_string_bounded(&pkg_path, MAX_INDEX_FILE_BYTES) else {
         return Vec::new();
     };
     let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
@@ -306,10 +348,10 @@ fn read_package_json_workspaces(root: &Path) -> Vec<String> {
 }
 
 fn read_pnpm_workspaces(root: &Path) -> Vec<String> {
-    let Ok(yaml_path) = confine_to_workspace(root, &root.join("pnpm-workspace.yaml")) else {
+    let Ok(yaml_path) = confine_to_workspace(root, Path::new("pnpm-workspace.yaml")) else {
         return Vec::new();
     };
-    let Ok(raw) = std::fs::read_to_string(&yaml_path) else {
+    let Ok(Some(raw)) = read_to_string_bounded(&yaml_path, MAX_INDEX_FILE_BYTES) else {
         return Vec::new();
     };
     parse_yaml_packages_list(&raw)
@@ -368,14 +410,32 @@ fn parse_yaml_packages_list(raw: &str) -> Vec<String> {
     out
 }
 
+fn is_unsafe_glob_pattern(pat: &str) -> bool {
+    if pat.is_empty() {
+        return true;
+    }
+    let normalized = pat.replace('\\', "/");
+    if normalized.starts_with('/') || Path::new(pat).is_absolute() {
+        return true;
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    normalized.split('/').any(|seg| seg == "..")
+}
+
 fn collect_dirs_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 8 {
+    if depth > 8 || out.len() >= MAX_WORKSPACE_GLOB_DIRS {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if out.len() >= MAX_WORKSPACE_GLOB_DIRS {
+            return;
+        }
         let path = entry.path();
         let Ok(ft) = entry.file_type() else {
             continue;
@@ -396,6 +456,43 @@ fn collect_dirs_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn expand_single_glob(root: &Path, clean: &str, out: &mut Vec<PathBuf>) {
+    if is_unsafe_glob_pattern(clean) || out.len() >= MAX_WORKSPACE_GLOB_DIRS {
+        return;
+    }
+    if let Some(parent) = clean.strip_suffix("/**") {
+        let rel = if parent.is_empty() { "." } else { parent };
+        if let Ok(confined_parent) = confine_to_workspace(root, Path::new(rel)) {
+            if confined_parent.is_dir() {
+                collect_dirs_recursive(&confined_parent, 0, out);
+            }
+        }
+        return;
+    }
+    if let Some(parent) = clean.strip_suffix("/*") {
+        let rel = if parent.is_empty() { "." } else { parent };
+        let Ok(confined_parent) = confine_to_workspace(root, Path::new(rel)) else {
+            return;
+        };
+        if let Ok(entries) = std::fs::read_dir(&confined_parent) {
+            for entry in entries.flatten() {
+                if out.len() >= MAX_WORKSPACE_GLOB_DIRS {
+                    break;
+                }
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    out.push(entry.path());
+                }
+            }
+        }
+        return;
+    }
+    if let Ok(confined_dir) = confine_to_workspace(root, Path::new(clean)) {
+        if confined_dir.is_dir() {
+            out.push(confined_dir);
+        }
+    }
+}
+
 fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     let mut includes = Vec::new();
     let mut excludes = Vec::new();
@@ -410,24 +507,7 @@ fn expand_workspace_globs(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
 
     let mut package_dirs = Vec::new();
     for clean in &includes {
-        if let Some(parent) = clean.strip_suffix("/**") {
-            let parent_dir = root.join(parent);
-            collect_dirs_recursive(&parent_dir, 0, &mut package_dirs);
-        } else if let Some(parent) = clean.strip_suffix("/*") {
-            let parent_dir = root.join(parent);
-            if let Ok(entries) = std::fs::read_dir(&parent_dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                        package_dirs.push(entry.path());
-                    }
-                }
-            }
-        } else {
-            let dir = root.join(clean);
-            if dir.is_dir() {
-                package_dirs.push(dir);
-            }
-        }
+        expand_single_glob(root, clean, &mut package_dirs);
     }
 
     let canon_root = root.canonicalize().ok();
@@ -464,7 +544,7 @@ fn read_package_names(manifests: &[PathBuf]) -> Vec<(String, PathBuf)> {
         let Some(dir) = path.parent() else {
             continue;
         };
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Ok(Some(raw)) = read_to_string_bounded(path, MAX_INDEX_FILE_BYTES) else {
             continue;
         };
         let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
@@ -501,7 +581,7 @@ fn push_rust_crate(out: &mut Vec<String>, name: &str) {
 
 fn read_cargo_package_names(cargo_manifests: &[PathBuf], out: &mut Vec<String>) {
     for cargo_toml in cargo_manifests {
-        let Ok(content) = std::fs::read_to_string(cargo_toml) else {
+        let Ok(Some(content)) = read_to_string_bounded(cargo_toml, MAX_INDEX_FILE_BYTES) else {
             continue;
         };
         let mut section = "";
@@ -527,13 +607,17 @@ fn read_cargo_package_names(cargo_manifests: &[PathBuf], out: &mut Vec<String>) 
 
 fn read_go_module_names(go_mods: &[PathBuf], out: &mut Vec<String>) {
     for go_mod in go_mods {
-        let Ok(content) = std::fs::read_to_string(go_mod) else {
+        let Ok(Some(content)) = read_to_string_bounded(go_mod, MAX_INDEX_FILE_BYTES) else {
             continue;
         };
         for line in content.lines() {
             let trimmed = line.split("//").next().unwrap_or("").trim();
-            if let Some(rest) = trimmed.strip_prefix("module ") {
-                let mod_name = rest.trim().trim_matches('"').trim();
+            let mut tokens = trimmed.split_whitespace();
+            if tokens.next() != Some("module") {
+                continue;
+            }
+            if let Some(raw_mod) = tokens.next() {
+                let mod_name = raw_mod.trim_matches('"').trim();
                 if !mod_name.is_empty() && !out.iter().any(|p| p == mod_name) {
                     out.push(mod_name.to_string());
                 }
@@ -572,18 +656,36 @@ fn append_json_ext(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn resolve_tsconfig_target(base: PathBuf) -> PathBuf {
-    if base.is_file() {
-        return base;
+fn is_absolute_spec(spec: &str) -> bool {
+    let norm = spec.replace('\\', "/");
+    if norm.starts_with('/') || Path::new(spec).is_absolute() {
+        return true;
     }
-    if base.is_dir() {
-        return base.join("tsconfig.json");
+    let bytes = norm.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn resolve_tsconfig_target(root: &Path, base: &Path) -> Option<PathBuf> {
+    if let Ok(confined) = confine_to_workspace(root, base) {
+        if confined.is_file() {
+            return Some(confined);
+        }
+        if confined.is_dir() {
+            let nested = confined.join("tsconfig.json");
+            if let Ok(nested_confined) = confine_to_workspace(root, &nested) {
+                if nested_confined.is_file() {
+                    return Some(nested_confined);
+                }
+            }
+        }
     }
-    let with_json = append_json_ext(&base);
-    if with_json.is_file() {
-        return with_json;
+    let with_json = append_json_ext(base);
+    if let Ok(confined_json) = confine_to_workspace(root, &with_json) {
+        if confined_json.is_file() {
+            return Some(confined_json);
+        }
     }
-    base
+    None
 }
 
 fn collect_paths(
@@ -591,6 +693,7 @@ fn collect_paths(
     config: &Path,
     packages: &[(String, PathBuf)],
     visited: &mut HashSet<PathBuf>,
+    watched_dirs: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
     let Ok(normalized) = confine_to_workspace(root, config) else {
@@ -600,7 +703,7 @@ fn collect_paths(
         return;
     }
 
-    let Ok(raw) = std::fs::read_to_string(&normalized) else {
+    let Ok(Some(raw)) = read_to_string_bounded(&normalized, MAX_INDEX_FILE_BYTES) else {
         return;
     };
     let Some(json) = parse_jsonc(&raw) else {
@@ -612,12 +715,26 @@ fn collect_paths(
     };
 
     match json.get("extends") {
-        Some(Value::String(parent)) => {
-            follow_extends(root, &normalized, parent, packages, visited, out)
-        }
+        Some(Value::String(parent)) => follow_extends(
+            root,
+            &normalized,
+            parent,
+            packages,
+            visited,
+            watched_dirs,
+            out,
+        ),
         Some(Value::Array(parents)) => {
             for parent in parents.iter().filter_map(Value::as_str) {
-                follow_extends(root, &normalized, parent, packages, visited, out);
+                follow_extends(
+                    root,
+                    &normalized,
+                    parent,
+                    packages,
+                    visited,
+                    watched_dirs,
+                    out,
+                );
             }
         }
         _ => {}
@@ -627,7 +744,15 @@ fn collect_paths(
         for r in refs {
             let ref_path = r.as_str().or_else(|| r.get("path").and_then(Value::as_str));
             if let Some(target_spec) = ref_path {
-                follow_reference(root, &normalized, target_spec, packages, visited, out);
+                follow_reference(
+                    root,
+                    &normalized,
+                    target_spec,
+                    packages,
+                    visited,
+                    watched_dirs,
+                    out,
+                );
             }
         }
     }
@@ -637,7 +762,7 @@ fn collect_paths(
         .and_then(|c| c.get("baseUrl"))
         .and_then(Value::as_str)
     {
-        collect_base_url_aliases(root, &normalized, base_url, out);
+        collect_base_url_aliases(root, &normalized, base_url, watched_dirs, out);
     }
 
     let Some(paths) = json
@@ -666,12 +791,14 @@ fn follow_extends(
     parent: &str,
     packages: &[(String, PathBuf)],
     visited: &mut HashSet<PathBuf>,
+    watched_dirs: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
+    if is_absolute_spec(parent) {
+        return;
+    }
     let base = if parent.starts_with('.') {
         config.parent().unwrap_or(Path::new("")).join(parent)
-    } else if parent.starts_with('/') {
-        return;
     } else {
         let Some((name, rest)) = split_package_spec(parent) else {
             return;
@@ -681,8 +808,10 @@ fn follow_extends(
         };
         dir.join(rest)
     };
-    let target = resolve_tsconfig_target(base);
-    collect_paths(root, &target, packages, visited, out);
+    let Some(target) = resolve_tsconfig_target(root, &base) else {
+        return;
+    };
+    collect_paths(root, &target, packages, visited, watched_dirs, out);
 }
 
 fn follow_reference(
@@ -691,9 +820,10 @@ fn follow_reference(
     target_spec: &str,
     packages: &[(String, PathBuf)],
     visited: &mut HashSet<PathBuf>,
+    watched_dirs: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
-    if target_spec.starts_with('/') {
+    if is_absolute_spec(target_spec) {
         return;
     }
     let config_dir = config.parent().unwrap_or(Path::new(""));
@@ -711,21 +841,28 @@ fn follow_reference(
         config_dir.join(target_spec)
     };
 
-    let target = resolve_tsconfig_target(candidate);
-    collect_paths(root, &target, packages, visited, out);
+    let Some(target) = resolve_tsconfig_target(root, &candidate) else {
+        return;
+    };
+    collect_paths(root, &target, packages, visited, watched_dirs, out);
 }
 
 fn collect_base_url_aliases(
     root: &Path,
     config: &Path,
     base_url: &str,
+    watched_dirs: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, Vec<String>)>,
 ) {
+    if is_absolute_spec(base_url) {
+        return;
+    }
     let config_dir = config.parent().unwrap_or(Path::new(""));
     let base_dir = config_dir.join(base_url);
     let Ok(canon_base_dir) = confine_to_workspace(root, &base_dir) else {
         return;
     };
+    watched_dirs.insert(canon_base_dir.clone());
     let Ok(entries) = std::fs::read_dir(&canon_base_dir) else {
         return;
     };

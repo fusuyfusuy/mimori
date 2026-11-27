@@ -76,9 +76,16 @@ fn resolve_cli_root(workspace: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
             } else {
                 cwd.join(w)
             };
-            candidate
+            let canon = candidate
                 .canonicalize()
-                .map_err(|e| anyhow::anyhow!("Invalid --workspace '{}': {}", w.display(), e))?
+                .map_err(|e| anyhow::anyhow!("Invalid --workspace '{}': {}", w.display(), e))?;
+            if !canon.is_dir() {
+                bail!(
+                    "Invalid --workspace '{}': path is not a directory",
+                    w.display()
+                );
+            }
+            canon
         }
         None => find_workspace_root(None, cwd),
     };
@@ -92,7 +99,7 @@ fn resolve_cli_root(workspace: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
 }
 
 /// Confine any file path inside `coord` against `root` (resolving relative
-/// subdir paths like `../lib.rs` against `cwd` before confining to `root`).
+/// subdir paths against `cwd` only when `cwd` is inside `root`).
 fn confine_and_normalize_coord(coord: Coordinate, root: &Path, cwd: &Path) -> Result<Coordinate> {
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let Some(file) = coord.file() else {
@@ -101,21 +108,22 @@ fn confine_and_normalize_coord(coord: Coordinate, root: &Path, cwd: &Path) -> Re
     let has_parent = file
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir));
+    let cwd_in_root = cwd
+        .canonicalize()
+        .ok()
+        .is_some_and(|c| c.starts_with(&canon_root));
 
     let confined = if file.is_absolute() {
         Some(confine_to_workspace(&canon_root, file)?)
     } else if has_parent {
+        let base = if cwd_in_root { cwd } else { &canon_root };
+        Some(confine_to_workspace(&canon_root, &base.join(file))?)
+    } else if cwd_in_root && fs::symlink_metadata(cwd.join(file)).is_ok() {
         Some(confine_to_workspace(&canon_root, &cwd.join(file))?)
+    } else if fs::symlink_metadata(canon_root.join(file)).is_ok() {
+        Some(confine_to_workspace(&canon_root, &canon_root.join(file))?)
     } else {
-        let from_cwd = cwd.join(file);
-        let from_root = canon_root.join(file);
-        if fs::symlink_metadata(&from_cwd).is_ok() {
-            Some(confine_to_workspace(&canon_root, &from_cwd)?)
-        } else if fs::symlink_metadata(&from_root).is_ok() {
-            Some(confine_to_workspace(&canon_root, &from_root)?)
-        } else {
-            None
-        }
+        None
     };
 
     if let Some(abs_target) = confined {
@@ -616,107 +624,94 @@ fn cmd_clean(args: CleanArgs, ws: Option<&Path>, cwd: &Path, as_json: bool) -> E
 }
 
 fn cmd_init(args: InitArgs, ws: Option<&Path>, cwd: &Path, as_json: bool) -> ExitCode {
+    match run_init(args, ws, cwd) {
+        Ok((mimori_dir, gitignore_status, agents_status)) => {
+            if as_json {
+                print_json(&json!({
+                    "initialized": true,
+                    "mimori_cache": mimori_dir.display().to_string(),
+                    "gitignore": gitignore_status,
+                    "agents": agents_status,
+                }))
+            } else {
+                println!(
+                    "INIT: .mimori cache ready; .gitignore {}; .agents/ {} (memory.md); exit 0.",
+                    gitignore_status, agents_status
+                );
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("INIT_FAIL: {}; exit 1.", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_init(
+    args: InitArgs,
+    ws: Option<&Path>,
+    cwd: &Path,
+) -> Result<(PathBuf, &'static str, &'static str)> {
     let root = match ws {
         Some(w) if w.is_absolute() => w.to_path_buf(),
         Some(w) => cwd.join(w),
         None => cwd.to_path_buf(),
     };
     if is_disallowed_workspace_root(&root) {
-        eprintln!(
-            "INIT_FAIL: Cannot initialize mimori in home or system directory '{}'; exit 1.",
+        bail!(
+            "Cannot initialize mimori in home or system directory '{}'",
             root.display()
         );
-        return ExitCode::FAILURE;
     }
 
     // Validate all target paths BEFORE any filesystem mutation (atomic init).
     let mimori_dir = root.join(".mimori");
     if fs::symlink_metadata(&mimori_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        eprintln!(
-            "INIT_FAIL: Refusing to follow symlink '{}'; exit 1.",
-            mimori_dir.display()
-        );
-        return ExitCode::FAILURE;
+        bail!("Refusing to follow symlink '{}'", mimori_dir.display());
     }
     let gitignore_path = root.join(".gitignore");
     if fs::symlink_metadata(&gitignore_path).is_ok_and(|m| m.file_type().is_symlink()) {
-        eprintln!(
-            "INIT_FAIL: Refusing to modify symlinked .gitignore '{}'; exit 1.",
+        bail!(
+            "Refusing to modify symlinked .gitignore '{}'",
             gitignore_path.display()
         );
-        return ExitCode::FAILURE;
     }
 
-    let mem_created = match MemoryLedger::scaffold(&root, args.force) {
-        Ok(created) => created,
-        Err(e) => {
-            eprintln!("INIT_FAIL: scaffold .agents: {}; exit 1.", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Err(e) = fs::create_dir_all(&mimori_dir) {
-        eprintln!(
-            "INIT_FAIL: create dir {}: {}; exit 1.",
-            mimori_dir.display(),
-            e
-        );
-        return ExitCode::FAILURE;
-    }
-
-    let gitignore_status = if gitignore_path.exists() {
-        let content = match fs::read_to_string(&gitignore_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("INIT_FAIL: read .gitignore: {}; exit 1.", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        if content
-            .lines()
-            .any(|l| l.trim() == ".mimori" || l.trim() == ".mimori/")
-        {
-            "already configured"
-        } else {
-            let mut updated = content;
-            if !updated.ends_with('\n') && !updated.is_empty() {
-                updated.push('\n');
-            }
-            updated.push_str(".mimori/\n");
-            if let Err(e) = fs::write(&gitignore_path, updated) {
-                eprintln!("INIT_FAIL: write .gitignore: {}; exit 1.", e);
-                return ExitCode::FAILURE;
-            }
-            "updated"
-        }
-    } else {
-        if let Err(e) = fs::write(&gitignore_path, ".mimori/\n") {
-            eprintln!("INIT_FAIL: create .gitignore: {}; exit 1.", e);
-            return ExitCode::FAILURE;
-        }
-        "created"
-    };
-
+    let mem_created = MemoryLedger::scaffold(&root, args.force)
+        .map_err(|e| anyhow::anyhow!("scaffold .agents: {}", e))?;
+    fs::create_dir_all(&mimori_dir)
+        .map_err(|e| anyhow::anyhow!("create dir {}: {}", mimori_dir.display(), e))?;
+    let gitignore_status = ensure_mimori_gitignored(&gitignore_path)?;
     let agents_status = if mem_created {
         "initialized"
     } else {
         "verified"
     };
+    Ok((mimori_dir, gitignore_status, agents_status))
+}
 
-    if as_json {
-        print_json(&json!({
-            "initialized": true,
-            "mimori_cache": mimori_dir.display().to_string(),
-            "gitignore": gitignore_status,
-            "agents": agents_status,
-        }))
-    } else {
-        println!(
-            "INIT: .mimori cache ready; .gitignore {}; .agents/ {} (memory.md); exit 0.",
-            gitignore_status, agents_status
-        );
-        ExitCode::SUCCESS
+fn ensure_mimori_gitignored(gitignore_path: &Path) -> Result<&'static str> {
+    if !gitignore_path.exists() {
+        fs::write(gitignore_path, ".mimori/\n")
+            .map_err(|e| anyhow::anyhow!("create .gitignore: {}", e))?;
+        return Ok("created");
     }
+    let content = fs::read_to_string(gitignore_path)
+        .map_err(|e| anyhow::anyhow!("read .gitignore: {}", e))?;
+    if content
+        .lines()
+        .any(|l| l.trim() == ".mimori" || l.trim() == ".mimori/")
+    {
+        return Ok("already configured");
+    }
+    let mut updated = content;
+    if !updated.ends_with('\n') && !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str(".mimori/\n");
+    fs::write(gitignore_path, updated).map_err(|e| anyhow::anyhow!("write .gitignore: {}", e))?;
+    Ok("updated")
 }
 
 fn cmd_memory(args: MemoryArgs, ws: Option<&Path>, cwd: &Path, as_json: bool) -> ExitCode {
@@ -729,116 +724,99 @@ fn cmd_memory(args: MemoryArgs, ws: Option<&Path>, cwd: &Path, as_json: bool) ->
     };
 
     match args.command {
-        Some(MemoryCommand::Lint) | Some(MemoryCommand::Check) => {
-            let ledger = match MemoryLedger::load(&root) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("MEM_LINT_FAIL: load .agents/memory.md: {}; exit 1.", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            let report = ledger.lint();
-            if as_json {
-                let code = print_json(&report);
-                if code != ExitCode::SUCCESS {
-                    return code;
-                }
-            } else {
-                println!("{}", report.to_m2m_output());
-            }
-            if report.passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Some(MemoryCommand::Add(add_args)) => {
-            let mem_path = MemoryLedger::memory_path(&root);
-            if !mem_path.exists() {
-                if let Err(e) = MemoryLedger::scaffold(&root, false) {
-                    eprintln!("MEM_ADD_FAIL: scaffold .agents/memory.md: {}; exit 1.", e);
-                    return ExitCode::FAILURE;
-                }
-            }
-            let mut ledger = match MemoryLedger::load(&root) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("MEM_ADD_FAIL: load .agents/memory.md: {}; exit 1.", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            match ledger.add_entry(
-                &add_args.section,
-                &add_args.text,
-                add_args.scope.as_deref(),
-                add_args.sym.as_deref(),
-            ) {
-                Ok(entry) => {
-                    if as_json {
-                        print_json(&json!({
-                            "added": true,
-                            "section": add_args.section,
-                            "entry": entry,
-                        }))
-                    } else {
-                        println!(
-                            "MEM_ADD: appended to '{}': {}; exit 0.",
-                            add_args.section, entry
-                        );
-                        ExitCode::SUCCESS
-                    }
-                }
-                Err(e) => {
-                    eprintln!("MEM_ADD_FAIL: {}; exit 1.", e);
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some(MemoryCommand::Resolve(res_args)) => {
-            let mut ledger = match MemoryLedger::load(&root) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("MEM_RESOLVE_FAIL: load .agents/memory.md: {}; exit 1.", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            match ledger.resolve(&res_args.pattern, res_args.all) {
-                Ok(deleted_lines) => {
-                    let deleted = deleted_lines.len();
-                    if as_json {
-                        print_json(&json!({
-                            "deleted": deleted,
-                            "deleted_lines": deleted_lines,
-                            "pattern": res_args.pattern,
-                            "remaining_debt": ledger.raw_debt_lines.len(),
-                            "ceiling": MAX_DEBT_CEILING
-                        }))
-                    } else {
-                        println!(
-                            "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/{} lines; exit 0.",
-                            deleted,
-                            res_args.pattern,
-                            ledger.raw_debt_lines.len(),
-                            MAX_DEBT_CEILING
-                        );
-                        for line in &deleted_lines {
-                            println!("  removed: {}", line);
-                        }
-                        ExitCode::SUCCESS
-                    }
-                }
-                Err(e) => {
-                    eprintln!("MEM_RESOLVE_FAIL: {}; exit 1.", e);
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Some(MemoryCommand::Lint) | Some(MemoryCommand::Check) => cmd_memory_lint(&root, as_json),
+        Some(MemoryCommand::Add(add_args)) => cmd_memory_add(&root, add_args, as_json),
+        Some(MemoryCommand::Resolve(res_args)) => cmd_memory_resolve(&root, res_args, as_json),
         Some(MemoryCommand::Show(show_args)) => {
             let sec = show_args.section.as_deref().or(args.section.as_deref());
             let budget = show_args.budget.or(args.budget);
             show_memory(&root, sec, budget, as_json)
         }
         None => show_memory(&root, args.section.as_deref(), args.budget, as_json),
+    }
+}
+
+fn cmd_memory_lint(root: &Path, as_json: bool) -> ExitCode {
+    let ledger = match MemoryLedger::load(root) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("MEM_LINT_FAIL: load .agents/memory.md: {}; exit 1.", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = ledger.lint();
+    if as_json {
+        let code = print_json(&report);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    } else {
+        println!("{}", report.to_m2m_output());
+    }
+    if report.passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn cmd_memory_add(root: &Path, add_args: mimori::cli::MemoryAddArgs, as_json: bool) -> ExitCode {
+    match MemoryLedger::add_entry_locked(
+        root,
+        &add_args.section,
+        &add_args.text,
+        add_args.scope.as_deref(),
+        add_args.sym.as_deref(),
+    ) {
+        Ok(entry) if as_json => print_json(&json!({
+            "added": true,
+            "section": add_args.section,
+            "entry": entry,
+        })),
+        Ok(entry) => {
+            println!(
+                "MEM_ADD: appended to '{}': {}; exit 0.",
+                add_args.section, entry
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("MEM_ADD_FAIL: {}; exit 1.", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_memory_resolve(
+    root: &Path,
+    res_args: mimori::cli::MemoryResolveArgs,
+    as_json: bool,
+) -> ExitCode {
+    match MemoryLedger::resolve_debt_locked(root, &res_args.pattern, res_args.all) {
+        Ok((deleted_lines, remaining)) if as_json => print_json(&json!({
+            "deleted": deleted_lines.len(),
+            "deleted_lines": deleted_lines,
+            "pattern": res_args.pattern,
+            "remaining_debt": remaining,
+            "ceiling": MAX_DEBT_CEILING
+        })),
+        Ok((deleted_lines, remaining)) => {
+            println!(
+                "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/{} lines; exit 0.",
+                deleted_lines.len(),
+                res_args.pattern,
+                remaining,
+                MAX_DEBT_CEILING
+            );
+            for line in &deleted_lines {
+                println!("  removed: {}", line);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("MEM_RESOLVE_FAIL: {}; exit 1.", e);
+            ExitCode::FAILURE
+        }
     }
 }
 

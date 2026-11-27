@@ -1,6 +1,6 @@
 [package]
 name = "mimori"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2021"
 authors = ["mimori team"]
 description = "Fast in-repo AST navigation, blast-radius analysis, and JIT agent memory CLI/MCP"

@@ -3,11 +3,42 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Maximum file size indexed or scanned (16 MiB) to prevent OOM on giant blobs.
 pub const MAX_INDEX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum symlink indirections followed while resolving a confined path.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Read at most `max_bytes` from `path` using a bounded reader (zero TOCTOU).
+/// Returns `Ok(None)` when the file exceeds `max_bytes`.
+pub fn read_bounded(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+/// Read a UTF-8 file of at most `max_bytes` using a bounded reader (zero TOCTOU).
+/// Returns `Ok(None)` when the file exceeds `max_bytes`.
+pub fn read_to_string_bounded(path: &Path, max_bytes: u64) -> Result<Option<String>> {
+    let Some(bytes) = read_bounded(path, max_bytes)? else {
+        return Ok(None);
+    };
+    Ok(Some(String::from_utf8(bytes)?))
+}
+
+pub(crate) fn is_io_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
 
 /// Directory names never indexed, matched as whole path components relative to
 /// the workspace root.
@@ -71,6 +102,8 @@ pub struct WorkspaceScope {
     pub rel_prefix: String,
     /// Canonical filesystem path when the scope resolves to an existing file/directory.
     pub canon_path: Option<PathBuf>,
+    /// Secondary workspace-relative prefix when `--scope` traversed an internal symlink.
+    alias_rel_prefix: Option<String>,
 }
 
 impl WorkspaceScope {
@@ -84,9 +117,7 @@ impl WorkspaceScope {
         let normalized_sep = trimmed.replace('\\', "/");
         if normalized_sep.starts_with('/')
             || Path::new(trimmed).is_absolute()
-            || (normalized_sep.len() >= 2
-                && normalized_sep.as_bytes()[0].is_ascii_alphabetic()
-                && normalized_sep.as_bytes()[1] == b':')
+            || has_windows_drive_prefix(&normalized_sep)
         {
             bail!("Scope escapes workspace: {}", raw);
         }
@@ -108,27 +139,45 @@ impl WorkspaceScope {
             return Ok(Self {
                 rel_prefix: String::new(),
                 canon_path: Some(canon_root),
+                alias_rel_prefix: None,
             });
         }
 
-        let rel_prefix = parts.join("/");
-        let candidate = canon_root.join(&rel_prefix);
-        let canon_path = if candidate.exists() || candidate.symlink_metadata().is_ok() {
-            Some(confine_path(
-                &canon_root,
-                Path::new(&rel_prefix),
-                SymlinkPolicy::AllowWithinWorkspace,
-            )?)
-        } else if require_exists {
-            bail!("Scope path '{}' does not exist in workspace.", raw);
-        } else {
-            None
-        };
-
-        Ok(Self {
-            rel_prefix,
-            canon_path,
-        })
+        let raw_rel = parts.join("/");
+        match confine_path_inner(
+            workspace_root,
+            &canon_root,
+            Path::new(&raw_rel),
+            SymlinkPolicy::AllowWithinWorkspace,
+        ) {
+            Ok(canon) => {
+                let canon_rel = canon
+                    .strip_prefix(&canon_root)
+                    .map(normalize_rel_str)
+                    .unwrap_or_else(|_| raw_rel.clone());
+                let (rel_prefix, alias_rel_prefix) = if canon_rel == raw_rel {
+                    (raw_rel, None)
+                } else if canon.is_dir() {
+                    (canon_rel, Some(raw_rel))
+                } else {
+                    (raw_rel, Some(canon_rel))
+                };
+                Ok(Self {
+                    rel_prefix,
+                    canon_path: Some(canon),
+                    alias_rel_prefix,
+                })
+            }
+            Err(ConfineError::NotFound(_)) if !require_exists => Ok(Self {
+                rel_prefix: raw_rel,
+                canon_path: None,
+                alias_rel_prefix: None,
+            }),
+            Err(ConfineError::NotFound(_)) => {
+                bail!("Scope path '{}' does not exist in workspace.", raw);
+            }
+            Err(other) => Err(other.into_anyhow()),
+        }
     }
 
     /// True if `rel` (workspace-relative forward-slash path) is inside this scope
@@ -138,11 +187,25 @@ impl WorkspaceScope {
             return true;
         }
         let norm = rel.strip_prefix("./").unwrap_or(rel);
-        norm == self.rel_prefix
-            || norm
-                .strip_prefix(&self.rel_prefix)
-                .is_some_and(|rest| rest.starts_with('/'))
+        if matches_path_prefix(norm, &self.rel_prefix) {
+            return true;
+        }
+        self.alias_rel_prefix
+            .as_deref()
+            .is_some_and(|alias| alias.is_empty() || matches_path_prefix(norm, alias))
     }
+}
+
+fn has_windows_drive_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn matches_path_prefix(norm: &str, prefix: &str) -> bool {
+    norm == prefix
+        || norm
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Hash all discovered source files in parallel, dropping file byte buffers
@@ -163,11 +226,8 @@ pub fn hash_discovered_files(
             if *size > MAX_INDEX_FILE_BYTES {
                 return ReadOutcome::TransientErr(rel.clone());
             }
-            match fs::read(full) {
-                Ok(bytes) => {
-                    if bytes.len() as u64 > MAX_INDEX_FILE_BYTES {
-                        return ReadOutcome::TransientErr(rel.clone());
-                    }
+            match read_bounded(full, MAX_INDEX_FILE_BYTES) {
+                Ok(Some(bytes)) => {
                     let hash = format!("{:x}", fnv1a_hash(&bytes));
                     ReadOutcome::Hashed(HashedFile {
                         rel: rel.clone(),
@@ -176,7 +236,8 @@ pub fn hash_discovered_files(
                         hash,
                     })
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Gone,
+                Ok(None) => ReadOutcome::TransientErr(rel.clone()),
+                Err(e) if is_io_not_found(&e) => ReadOutcome::Gone,
                 Err(_) => ReadOutcome::TransientErr(rel.clone()),
             }
         })
@@ -195,6 +256,52 @@ pub fn hash_discovered_files(
     (hashed, transient_failed, indexed_count)
 }
 
+fn resolve_entry_meta(
+    entry: &ignore::DirEntry,
+    ft: fs::FileType,
+    canon_root: Option<&Path>,
+) -> Option<fs::Metadata> {
+    if ft.is_symlink() {
+        let cr = canon_root?;
+        let canon_target = entry.path().canonicalize().ok()?;
+        if !canon_target.starts_with(cr) {
+            return None;
+        }
+        if let Ok(target_rel) = canon_target.strip_prefix(cr) {
+            if is_ignored_rel(target_rel) {
+                return None;
+            }
+        }
+        let target_meta = fs::metadata(&canon_target).ok()?;
+        return target_meta.is_file().then_some(target_meta);
+    }
+    if ft.is_file() {
+        return entry.metadata().ok();
+    }
+    None
+}
+
+fn classify_manifest(
+    path: &Path,
+    package_manifests: &mut Vec<PathBuf>,
+    tsconfigs: &mut Vec<PathBuf>,
+    cargo_manifests: &mut Vec<PathBuf>,
+    go_mods: &mut Vec<PathBuf>,
+) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if name == "package.json" {
+        package_manifests.push(path.to_path_buf());
+    } else if name == "jsconfig.json" || (name.starts_with("tsconfig") && name.ends_with(".json")) {
+        tsconfigs.push(path.to_path_buf());
+    } else if name == "Cargo.toml" {
+        cargo_manifests.push(path.to_path_buf());
+    } else if name == "go.mod" {
+        go_mods.push(path.to_path_buf());
+    }
+}
+
 pub fn discover_workspace(root: &Path) -> WorkspaceDiscovery {
     let builder = walk_builder(root);
     let canon_root = root.canonicalize().ok();
@@ -208,47 +315,25 @@ pub fn discover_workspace(root: &Path) -> WorkspaceDiscovery {
     let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for entry in builder.build().flatten() {
-        let path = entry.path();
         let Some(ft) = entry.file_type() else {
             continue;
         };
-        if ft.is_symlink() {
-            let Some(ref cr) = canon_root else {
-                continue;
-            };
-            let Ok(canon_target) = path.canonicalize() else {
-                continue;
-            };
-            if !canon_target.starts_with(cr) || !canon_target.is_file() {
-                continue;
-            }
-            if let Ok(target_rel) = canon_target.strip_prefix(cr) {
-                if is_ignored_rel(target_rel) {
-                    continue;
-                }
-            }
-        } else if !ft.is_file() {
+        let Some(meta) = resolve_entry_meta(&entry, ft, canon_root.as_deref()) else {
             continue;
-        }
-
+        };
+        let path = entry.path();
         let rel_path = path.strip_prefix(root).unwrap_or(path);
         if is_ignored_rel(rel_path) {
             continue;
         }
 
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name == "package.json" {
-                package_manifests.push(path.to_path_buf());
-            } else if name == "jsconfig.json"
-                || (name.starts_with("tsconfig") && name.ends_with(".json"))
-            {
-                tsconfigs.push(path.to_path_buf());
-            } else if name == "Cargo.toml" {
-                cargo_manifests.push(path.to_path_buf());
-            } else if name == "go.mod" {
-                go_mods.push(path.to_path_buf());
-            }
-        }
+        classify_manifest(
+            path,
+            &mut package_manifests,
+            &mut tsconfigs,
+            &mut cargo_manifests,
+            &mut go_mods,
+        );
 
         crawled += 1;
         if !has_supported_extension(path) {
@@ -261,14 +346,13 @@ pub fn discover_workspace(root: &Path) -> WorkspaceDiscovery {
             continue;
         }
 
-        let meta = entry.metadata().ok();
         let mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let size = meta.len();
 
         let rel_norm = normalize_rel_str(rel_path);
         supported.push((rel_norm, path.to_path_buf(), mtime, size));
@@ -481,9 +565,253 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
+enum ConfineError {
+    Escape(String),
+    NotFound(String),
+    Other(String),
+}
+
+impl ConfineError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            ConfineError::Escape(m) | ConfineError::NotFound(m) | ConfineError::Other(m) => {
+                anyhow::anyhow!(m)
+            }
+        }
+    }
+}
+
+fn strip_workspace_prefix(path: &Path, canon_root: &Path, raw_root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(canon_root) {
+        return Some(rel.to_path_buf());
+    }
+    if raw_root.is_absolute() {
+        if let Ok(rel) = path.strip_prefix(raw_root) {
+            return Some(rel.to_path_buf());
+        }
+        let norm_raw = normalize_lexical(raw_root);
+        if norm_raw.is_absolute() {
+            if let Ok(rel) = path.strip_prefix(&norm_raw) {
+                return Some(rel.to_path_buf());
+            }
+        }
+    } else if let Ok(cwd) = std::env::current_dir() {
+        let abs_raw = normalize_lexical(&cwd.join(raw_root));
+        if let Ok(rel) = path.strip_prefix(&abs_raw) {
+            return Some(rel.to_path_buf());
+        }
+    }
+    None
+}
+
+fn check_remaining_for_escape(
+    canon_root: &Path,
+    current: &Path,
+    remaining: &[Component<'_>],
+    original: &Path,
+) -> std::result::Result<(), ConfineError> {
+    let mut sim = current.to_path_buf();
+    for comp in remaining {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if sim == canon_root || !sim.pop() || !sim.starts_with(canon_root) {
+                    return Err(ConfineError::Escape(format!(
+                        "Path escapes workspace: {}",
+                        original.display()
+                    )));
+                }
+            }
+            Component::Normal(seg) => sim.push(seg),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ConfineError::Escape(format!(
+                    "Path escapes workspace: {}",
+                    original.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_symlink_step(
+    raw_root: &Path,
+    canon_root: &Path,
+    original: &Path,
+    policy: SymlinkPolicy,
+    current: &mut PathBuf,
+    hops: &mut usize,
+) -> std::result::Result<(), ConfineError> {
+    if policy == SymlinkPolicy::Forbid {
+        return Err(ConfineError::Escape(format!(
+            "Path escapes workspace (symlink forbidden): {}",
+            original.display()
+        )));
+    }
+    *hops += 1;
+    if *hops > MAX_SYMLINK_HOPS {
+        return Err(ConfineError::Other(format!(
+            "Too many symlink levels resolving '{}'",
+            original.display()
+        )));
+    }
+    let link_target = fs::read_link(current.as_path()).map_err(|e| {
+        ConfineError::Other(format!(
+            "Cannot resolve path '{}': {}",
+            original.display(),
+            e
+        ))
+    })?;
+    current.pop();
+
+    let rel_target = if link_target.is_absolute() {
+        let Some(rel) = strip_workspace_prefix(&link_target, canon_root, raw_root) else {
+            return Err(ConfineError::Escape(format!(
+                "Path escapes workspace: {}",
+                original.display()
+            )));
+        };
+        *current = canon_root.to_path_buf();
+        rel
+    } else {
+        link_target
+    };
+
+    let target_comps: Vec<Component<'_>> = rel_target.components().collect();
+    resolve_confined_steps(
+        raw_root,
+        canon_root,
+        original,
+        policy,
+        current,
+        &target_comps,
+        hops,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_confined_steps(
+    raw_root: &Path,
+    canon_root: &Path,
+    original: &Path,
+    policy: SymlinkPolicy,
+    current: &mut PathBuf,
+    components: &[Component<'_>],
+    hops: &mut usize,
+) -> std::result::Result<(), ConfineError> {
+    for (idx, comp) in components.iter().enumerate() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if *current == canon_root || !current.pop() || !current.starts_with(canon_root) {
+                    return Err(ConfineError::Escape(format!(
+                        "Path escapes workspace: {}",
+                        original.display()
+                    )));
+                }
+            }
+            Component::Normal(seg) => {
+                current.push(seg);
+                let rest = &components[idx + 1..];
+                match fs::symlink_metadata(&*current) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        resolve_symlink_step(
+                            raw_root, canon_root, original, policy, current, hops,
+                        )?;
+                        if !rest.is_empty()
+                            && !fs::symlink_metadata(&*current).is_ok_and(|m| m.is_dir())
+                        {
+                            check_remaining_for_escape(canon_root, current, rest, original)?;
+                            return Err(ConfineError::Other(format!(
+                                "Cannot resolve path '{}': Not a directory",
+                                original.display()
+                            )));
+                        }
+                    }
+                    Ok(meta) => {
+                        if !rest.is_empty() && !meta.is_dir() {
+                            check_remaining_for_escape(canon_root, current, rest, original)?;
+                            return Err(ConfineError::Other(format!(
+                                "Cannot resolve path '{}': Not a directory",
+                                original.display()
+                            )));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        check_remaining_for_escape(canon_root, current, rest, original)?;
+                        return Err(ConfineError::NotFound(format!(
+                            "Cannot resolve path '{}': {}",
+                            original.display(),
+                            e
+                        )));
+                    }
+                    Err(e) => {
+                        check_remaining_for_escape(canon_root, current, rest, original)?;
+                        return Err(ConfineError::Other(format!(
+                            "Cannot resolve path '{}': {}",
+                            original.display(),
+                            e
+                        )));
+                    }
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ConfineError::Escape(format!(
+                    "Path escapes workspace: {}",
+                    original.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn confine_path_inner(
+    raw_root: &Path,
+    canon_root: &Path,
+    candidate: &Path,
+    policy: SymlinkPolicy,
+) -> std::result::Result<PathBuf, ConfineError> {
+    let rel_candidate = if candidate.is_absolute() {
+        let Some(rel) = strip_workspace_prefix(candidate, canon_root, raw_root) else {
+            return Err(ConfineError::Escape(format!(
+                "Path escapes workspace: {}",
+                candidate.display()
+            )));
+        };
+        rel
+    } else {
+        candidate.to_path_buf()
+    };
+
+    let mut current = canon_root.to_path_buf();
+    let mut hops = 0usize;
+    let comps: Vec<Component<'_>> = rel_candidate.components().collect();
+    resolve_confined_steps(
+        raw_root,
+        canon_root,
+        candidate,
+        policy,
+        &mut current,
+        &comps,
+        &mut hops,
+    )?;
+
+    if current.starts_with(canon_root) {
+        Ok(current)
+    } else {
+        Err(ConfineError::Escape(format!(
+            "Path escapes workspace: {}",
+            candidate.display()
+        )))
+    }
+}
+
 /// Confine `candidate` strictly within `workspace_root` under `policy`.
-/// Lexical `..` normalization runs before `canonicalize()` so missing outside
-/// paths return `"Path escapes workspace"` instead of leaking OS `ENOENT`.
+/// Resolves path components step-by-step from `canon_root` so escaping `..`
+/// or symlinks fail immediately before touching disk outside the workspace
+/// (zero external existence oracle, strict `SymlinkPolicy::Forbid`).
 pub fn confine_path(
     workspace_root: &Path,
     candidate: &Path,
@@ -492,44 +820,8 @@ pub fn confine_path(
     let canon_root = workspace_root
         .canonicalize()
         .with_context(|| format!("Invalid workspace root '{}'", workspace_root.display()))?;
-
-    let raw_target = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        canon_root.join(candidate)
-    };
-    let lexical = normalize_lexical(&raw_target);
-    if !lexical.starts_with(&canon_root) {
-        bail!("Path escapes workspace: {}", candidate.display());
-    }
-
-    if policy == SymlinkPolicy::Forbid {
-        if let Ok(rel) = lexical.strip_prefix(&canon_root) {
-            let mut cur = canon_root.clone();
-            for comp in rel.components() {
-                cur.push(comp);
-                if let Ok(meta) = fs::symlink_metadata(&cur) {
-                    if meta.file_type().is_symlink() {
-                        bail!(
-                            "Path escapes workspace (symlink forbidden): {}",
-                            candidate.display()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let canon_candidate = match raw_target.canonicalize() {
-        Ok(c) => c,
-        Err(e) => bail!("Cannot resolve path '{}': {}", candidate.display(), e),
-    };
-
-    if canon_candidate.starts_with(&canon_root) {
-        Ok(canon_candidate)
-    } else {
-        bail!("Path escapes workspace: {}", candidate.display());
-    }
+    confine_path_inner(workspace_root, &canon_root, candidate, policy)
+        .map_err(ConfineError::into_anyhow)
 }
 
 pub fn confine_to_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {

@@ -125,7 +125,7 @@ pub fn multiplicity_weight(count: u32) -> f64 {
 
 /// Counting-unit legend emitted on read headers.
 pub const COUNT_LEGEND: &str =
-    "*Units*: N = distinct symbols (callers/affected/mentioners); edge weights sum call-site multiplicity min(sqrt(n),8); blast affected = transitive closure over call edges only.";
+    "*Units*: N = distinct symbols (callers/affected/mentioners); edge weights use max call-site multiplicity min(sqrt(n),8); blast affected = transitive closure over call edges only.";
 
 #[derive(Debug, Clone)]
 pub struct SymbolGraph {
@@ -188,9 +188,13 @@ impl EdgeBuilder {
             .or_insert(weight);
     }
 
-    fn record_unresolved_member(&mut self, lookup_name: &str) {
+    fn record_unresolved_member(
+        &mut self,
+        lookup_name: &str,
+        workspace_method_leaves: &HashSet<&str>,
+    ) {
         let leaf = lookup_name.rsplit([':', '.']).next().unwrap_or(lookup_name);
-        if !leaf.is_empty() && !GENERIC_MEMBER_NAMES.contains(&leaf) {
+        if !leaf.is_empty() && workspace_method_leaves.contains(leaf) {
             *self
                 .unresolved_member_calls
                 .entry(leaf.to_string())
@@ -255,8 +259,26 @@ fn build_callable_index<'a>(
     by_name
 }
 
-fn is_external_call(ref_name: &str, is_member: bool, external_set: &HashSet<&str>) -> bool {
+fn symbol_owner(sym: &Symbol) -> Option<&str> {
+    sym.name
+        .rsplit_once("::")
+        .or_else(|| sym.name.rsplit_once('.'))
+        .map(|(owner, _)| owner)
+        .filter(|owner| !owner.is_empty())
+}
+
+fn is_external_call(
+    ref_name: &str,
+    is_member: bool,
+    external_set: &HashSet<&str>,
+    callable_by_name: &HashMap<&str, Vec<(u32, usize)>>,
+) -> bool {
     if external_set.is_empty() {
+        return false;
+    }
+    if (ref_name.contains("::") || ref_name.contains('.'))
+        && callable_by_name.contains_key(ref_name)
+    {
         return false;
     }
     if !is_member && external_set.contains(ref_name) {
@@ -283,7 +305,11 @@ fn is_cross_file_visible(caller_is_test: bool, same_dir: bool, target: &Symbol) 
     if target.signature.is_empty() {
         return true;
     }
-    if target.is_public() {
+    if target.is_public() || target.is_trait_impl() {
+        return true;
+    }
+    // Rust `pub(crate)` / `pub(super)` / `pub(in ...)` items are callable across files in the crate.
+    if target.file.ends_with(".rs") && target.signature.trim_start().starts_with("pub(") {
         return true;
     }
     // Go package-private symbols are callable within the same directory.
@@ -295,6 +321,7 @@ struct ResolveCtx<'a> {
     sym_file_id: &'a [u32],
     sym_dir: &'a [String],
     callable_by_name: &'a HashMap<&'a str, Vec<(u32, usize)>>,
+    workspace_method_leaves: &'a HashSet<&'a str>,
 }
 
 impl<'a> ResolveCtx<'a> {
@@ -315,7 +342,7 @@ impl<'a> ResolveCtx<'a> {
         };
         let Some(callable) = self.callable_by_name.get(lookup_name) else {
             if is_member {
-                eb.record_unresolved_member(lookup_name);
+                eb.record_unresolved_member(lookup_name, self.workspace_method_leaves);
             }
             eb.stats.unresolved += 1;
             return;
@@ -327,10 +354,6 @@ impl<'a> ResolveCtx<'a> {
         }
 
         let is_unqualified = !lookup_name.contains("::") && !lookup_name.contains('.');
-        if is_member && is_unqualified && GENERIC_MEMBER_NAMES.contains(&lookup_name) {
-            eb.stats.ambiguous_dropped += 1;
-            return;
-        }
 
         if self.try_resolve_same_file(
             u_idx,
@@ -346,7 +369,7 @@ impl<'a> ResolveCtx<'a> {
         }
 
         if is_member {
-            eb.record_unresolved_member(lookup_name);
+            eb.record_unresolved_member(lookup_name, self.workspace_method_leaves);
             eb.stats.ambiguous_dropped += 1;
             return;
         }
@@ -377,19 +400,21 @@ impl<'a> ResolveCtx<'a> {
             .map(|&(_, v)| v)
             .collect();
 
-        let target = if hint.is_empty() {
-            (foreign.len() == 1).then(|| foreign[0])
+        let (target, candidate_count) = if hint.is_empty() {
+            ((foreign.len() == 1).then(|| foreign[0]), foreign.len())
         } else {
             let hinted: Vec<usize> = foreign
                 .into_iter()
                 .filter(|&v| module_hint_matches(&self.symbols[v].file, hint))
                 .collect();
-            (hinted.len() == 1).then(|| hinted[0])
+            ((hinted.len() == 1).then(|| hinted[0]), hinted.len())
         };
 
         if let Some(v_idx) = target {
             eb.add_weighted_edge(u_idx, v_idx, w);
             eb.stats.resolved += 1;
+        } else if candidate_count == 0 {
+            eb.stats.unresolved += 1;
         } else {
             eb.stats.ambiguous_dropped += 1;
         }
@@ -408,12 +433,23 @@ impl<'a> ResolveCtx<'a> {
         eb: &mut EdgeBuilder,
     ) -> bool {
         let u_file = self.sym_file_id[u_idx];
+        let is_generic_member =
+            is_member && is_unqualified && GENERIC_MEMBER_NAMES.contains(&lookup_name);
+        let caller_owner = if is_generic_member {
+            symbol_owner(&self.symbols[u_idx])
+        } else {
+            None
+        };
         let pos = callable.partition_point(|&(f, _)| f < u_file);
         let mut same_file: Vec<usize> = Vec::new();
         let mut i = pos;
         while i < callable.len() && callable[i].0 == u_file {
             let v = callable[i].1;
-            if !is_unqualified
+            if is_generic_member {
+                if caller_owner.is_some() && symbol_owner(&self.symbols[v]) == caller_owner {
+                    same_file.push(v);
+                }
+            } else if !is_unqualified
                 || is_member
                 || self.symbols[v].kind != SymbolKind::Method
                 || self.symbols[v].name == lookup_name
@@ -435,6 +471,9 @@ impl<'a> ResolveCtx<'a> {
             eb.stats.resolved += 1;
             true
         } else if same_file.len() > 1 {
+            if is_member {
+                eb.record_unresolved_member(lookup_name, self.workspace_method_leaves);
+            }
             eb.stats.ambiguous_dropped += 1;
             true
         } else if has_self && is_member {
@@ -556,11 +595,18 @@ impl SymbolGraph {
             .collect();
 
         let callable_by_name = build_callable_index(&symbols, &name_to_indices, &sym_file_id);
+        let workspace_method_leaves: HashSet<&str> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .filter_map(|s| s.name.rsplit([':', '.']).next())
+            .filter(|leaf| !leaf.is_empty())
+            .collect();
         let ctx = ResolveCtx {
             symbols: &symbols,
             sym_file_id: &sym_file_id,
             sym_dir: &sym_dir,
             callable_by_name: &callable_by_name,
+            workspace_method_leaves: &workspace_method_leaves,
         };
         let mut eb = EdgeBuilder::new();
         let mut cached_ext_ptr: usize = 0;
@@ -580,7 +626,7 @@ impl SymbolGraph {
 
             for ref_name in &sym.calls {
                 let is_member = member_set.contains(ref_name.as_str());
-                if is_external_call(ref_name, is_member, &external_set) {
+                if is_external_call(ref_name, is_member, &external_set, &callable_by_name) {
                     eb.stats.external += 1;
                     continue;
                 }
@@ -628,31 +674,6 @@ impl SymbolGraph {
             })
             .map(|(idx, _)| idx)
             .collect()
-    }
-
-    pub fn apply_personalization(&mut self, indices: &[usize]) {
-        let pr = pagerank::compute_weighted_pagerank(
-            &mut self.symbols,
-            &self.callers_map,
-            &self.callees_map,
-            &self.edge_weights,
-            Some(indices),
-        );
-        self.pagerank_iters = pr.iters;
-        self.pagerank_converged = pr.converged;
-    }
-
-    pub fn compute_personalized_pagerank(&mut self, focus: &Coordinate) {
-        let focus_indices = self.resolve_all(focus);
-        let pr = pagerank::compute_weighted_pagerank(
-            &mut self.symbols,
-            &self.callers_map,
-            &self.callees_map,
-            &self.edge_weights,
-            Some(&focus_indices),
-        );
-        self.pagerank_iters = pr.iters;
-        self.pagerank_converged = pr.converged;
     }
 
     pub fn format_ambiguous_error(
@@ -979,29 +1000,24 @@ impl SymbolGraph {
         out.into_iter().map(|i| &self.symbols[i]).collect()
     }
 
+    fn read_file_content(&self, rel_file: &str) -> Result<String> {
+        let full_path = match &self.root {
+            Some(root) => {
+                crate::workspace::walker::confine_to_workspace(root, Path::new(rel_file))?
+            }
+            None => PathBuf::from(rel_file),
+        };
+        let bytes = fs::read(&full_path)
+            .with_context(|| format!("Failed to read source file '{}'", rel_file))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     pub fn read_symbol_body(&self, sym: &Symbol) -> Result<String> {
         if !sym.body.is_empty() {
             return Ok(sym.body.clone());
         }
-        let full_path = match &self.root {
-            Some(root) => {
-                crate::workspace::walker::confine_to_workspace(root, Path::new(&sym.file))?
-            }
-            None => PathBuf::from(&sym.file),
-        };
-        let bytes = fs::read(&full_path)
-            .with_context(|| format!("Failed to read source file '{}'", sym.file))?;
-        let content = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.is_empty() || sym.start_line == 0 || sym.start_line > lines.len() {
-            return Ok(String::new());
-        }
-        let start_idx = sym.start_line - 1;
-        let end_idx = sym.end_line.min(lines.len());
-        if start_idx >= end_idx {
-            return Ok(String::new());
-        }
-        Ok(lines[start_idx..end_idx].join("\n"))
+        let content = self.read_file_content(&sym.file)?;
+        Ok(slice_lines_from_str(&content, sym.start_line, sym.end_line))
     }
 
     pub fn build_slice(
@@ -1039,38 +1055,62 @@ impl SymbolGraph {
             .map(|s| format!("{} (L{}-L{})", s.coordinate(), s.start_line, s.end_line))
             .collect();
 
-        let raw_sym_body = self.read_symbol_body(sym)?;
+        let same_file_callees: Vec<&Symbol> = if follow_local {
+            callee_syms
+                .iter()
+                .copied()
+                .filter(|c| c.file == sym.file)
+                .take(MAX_INLINED_LOCALS)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let needs_file_read = sym.body.is_empty()
+            || with_imports
+            || same_file_callees.iter().any(|c| c.body.is_empty());
+        let cached_file = if needs_file_read {
+            if sym.body.is_empty() {
+                Some(self.read_file_content(&sym.file)?)
+            } else {
+                self.read_file_content(&sym.file).ok()
+            }
+        } else {
+            None
+        };
+
+        let raw_sym_body = if !sym.body.is_empty() {
+            sym.body.clone()
+        } else if let Some(ref content) = cached_file {
+            slice_lines_from_str(content, sym.start_line, sym.end_line)
+        } else {
+            String::new()
+        };
         let span = sym.end_line.saturating_sub(sym.start_line);
         let body = truncate_body(&raw_sym_body, span);
 
         let mut local_callees = Vec::new();
-        if follow_local {
-            for lc in callee_syms
-                .iter()
-                .filter(|c| c.file == sym.file)
-                .take(MAX_INLINED_LOCALS)
-            {
-                let lc_raw = self.read_symbol_body(lc).unwrap_or_default();
-                let lc_span = lc.end_line.saturating_sub(lc.start_line);
-                local_callees.push(InlinedCallee {
-                    name: lc.name.clone(),
-                    start_line: lc.start_line,
-                    end_line: lc.end_line,
-                    content: truncate_body(&lc_raw, lc_span),
-                });
-            }
+        for lc in same_file_callees {
+            let lc_raw = if !lc.body.is_empty() {
+                lc.body.clone()
+            } else if let Some(ref content) = cached_file {
+                slice_lines_from_str(content, lc.start_line, lc.end_line)
+            } else {
+                String::new()
+            };
+            let lc_span = lc.end_line.saturating_sub(lc.start_line);
+            local_callees.push(InlinedCallee {
+                name: lc.name.clone(),
+                start_line: lc.start_line,
+                end_line: lc.end_line,
+                content: truncate_body(&lc_raw, lc_span),
+            });
         }
 
         let imports = if with_imports {
-            let import_path = match &self.root {
-                Some(root) => {
-                    crate::workspace::walker::confine_to_workspace(root, Path::new(&sym.file)).ok()
-                }
-                None => Some(PathBuf::from(&sym.file)),
-            };
-            let imps = import_path
+            let imps = cached_file
                 .as_deref()
-                .map(extract_file_imports)
+                .map(extract_imports_from_str)
                 .unwrap_or_default();
             (!imps.is_empty()).then_some(imps)
         } else {
@@ -1224,11 +1264,27 @@ fn truncate_body(body: &str, span: usize) -> String {
     )
 }
 
+fn slice_lines_from_str(content: &str, start_line: usize, end_line: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() || start_line == 0 || start_line > lines.len() {
+        return String::new();
+    }
+    let start_idx = start_line - 1;
+    let end_idx = end_line.min(lines.len());
+    if start_idx >= end_idx {
+        return String::new();
+    }
+    lines[start_idx..end_idx].join("\n")
+}
+
 pub fn extract_file_imports(file_path: &Path) -> Vec<String> {
     let Ok(content) = fs::read_to_string(file_path) else {
         return Vec::new();
     };
+    extract_imports_from_str(&content)
+}
 
+fn extract_imports_from_str(content: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let mut in_multiline_import = false;
     let mut multiline_buf = String::new();
@@ -2028,5 +2084,82 @@ mod tests {
         };
         assert!(rank_of("prod_hub") > rank_of("test_only_hub"));
         assert!(rank_of("p") > rank_of("t"));
+    }
+
+    #[test]
+    fn rust_trait_impl_methods_are_cross_file_visible() {
+        let mut impl_method = method("packages/app/lib.rs", "S::exec");
+        impl_method.signature = "fn exec(&self)".to_string();
+        impl_method.flags = crate::model::symbol_flags::IS_TRAIT_IMPL;
+
+        let caller_sym = caller("caller.rs", "go", &["S::exec"], &[], &[]);
+        let g = SymbolGraph::new(vec![impl_method, caller_sym]);
+        let callers = g.callers(&Coordinate::parse("S::exec").unwrap());
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "go");
+    }
+
+    #[test]
+    fn generic_member_calls_record_unresolved_for_workspace_methods_without_hijacking() {
+        let g = SymbolGraph::new(vec![
+            caller(
+                "src/aliases.rs",
+                "collect",
+                &["is_empty"],
+                &["is_empty"],
+                &[],
+            ),
+            method("src/aliases.rs", "AliasSet::is_empty"),
+            caller("src/db.rs", "save", &["as_str"], &["as_str"], &[]),
+            method("src/symbol.rs", "SymbolKind::as_str"),
+        ]);
+        assert!(g
+            .callers(&Coordinate::parse("src/aliases.rs:AliasSet::is_empty").unwrap())
+            .is_empty());
+        assert_eq!(g.unresolved_member_calls.get("is_empty"), Some(&1));
+        assert_eq!(g.unresolved_member_calls.get("as_str"), Some(&1));
+    }
+
+    #[test]
+    fn ambiguous_same_file_member_calls_record_unresolved_warning() {
+        let g = SymbolGraph::new(vec![
+            caller("src/a.rs", "run", &["save"], &["save"], &[]),
+            method("src/a.rs", "A::save"),
+            method("src/a.rs", "B::save"),
+        ]);
+        assert!(g
+            .callees(&Coordinate::parse("src/a.rs:run").unwrap())
+            .is_empty());
+        assert_eq!(g.unresolved_member_calls.get("save"), Some(&1));
+    }
+
+    #[test]
+    fn exact_workspace_qualified_call_not_suppressed_by_external_prefix() {
+        let mut from_path = method("src/parser/lang.rs", "Language::from_path");
+        from_path.signature = "pub fn from_path(path: &Path) -> Self".to_string();
+        from_path.flags = crate::model::symbol_flags::IS_PUBLIC;
+
+        let parse_file = caller(
+            "src/parser/mod.rs",
+            "parse_file",
+            &["Language::from_path"],
+            &[],
+            &["Language"],
+        );
+        let g = SymbolGraph::new(vec![from_path, parse_file]);
+        let callers = g.callers(&Coordinate::parse("Language::from_path").unwrap());
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "parse_file");
+        assert_eq!(g.resolve_stats.external, 0);
+    }
+
+    #[test]
+    fn tier0_zero_match_hint_counts_as_unresolved_not_ambiguous() {
+        let g = SymbolGraph::new(vec![
+            caller("src/a.rs", "run", &["nonexistent_mod:foo"], &[], &[]),
+            sym("src/real_mod.rs", "foo"),
+        ]);
+        assert_eq!(g.resolve_stats.unresolved, 1);
+        assert_eq!(g.resolve_stats.ambiguous_dropped, 0);
     }
 }

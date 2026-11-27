@@ -132,21 +132,14 @@ impl SliceResult {
             keep[i] = false;
             dropped.push(name);
             let candidate = assemble(&keep);
+            let cand_tok = self.estimate_tokens(&candidate);
             let draft_notice = format!(
-                "\n_Truncated to fit --budget {budget_tokens} (~{} tokens): dropped {}._\n",
-                self.estimate_tokens(&candidate),
+                "\n_Truncated to fit --budget {budget_tokens} (~{cand_tok} tokens): dropped {}._\n",
                 dropped.join(", ")
             );
-            if self.estimate_tokens(&candidate) + self.estimate_tokens(&draft_notice)
-                <= budget_tokens
-            {
-                let mut out = candidate;
-                let final_tok = self.estimate_tokens(&out);
-                out.push_str(&format!(
-                    "\n_Truncated to fit --budget {budget_tokens} (~{final_tok} tokens): dropped {}._\n",
-                    dropped.join(", ")
-                ));
-                return out;
+            let with_notice = format!("{candidate}{draft_notice}");
+            if self.estimate_tokens(&with_notice) <= budget_tokens {
+                return with_notice;
             }
         }
 
@@ -160,10 +153,19 @@ impl SliceResult {
                 out.push_str(&format!("_Dropped: {}._\n", dropped.join(", ")));
             }
         } else if !dropped.is_empty() {
-            out.push_str(&format!(
+            let full_notice = format!(
                 "\n_Truncated to fit --budget {budget_tokens} (~{final_tok} tokens): dropped {}._\n",
                 dropped.join(", ")
-            ));
+            );
+            let with_full = format!("{out}{full_notice}");
+            if self.estimate_tokens(&with_full) <= budget_tokens {
+                return with_full;
+            }
+            let short_notice = format!("\n_Truncated to --budget {budget_tokens}._\n");
+            let with_short = format!("{out}{short_notice}");
+            if self.estimate_tokens(&with_short) <= budget_tokens {
+                return with_short;
+            }
         }
         out
     }
@@ -258,21 +260,7 @@ impl SliceResult {
                 lc.name, lc.start_line, lc.end_line
             ));
             if numbered {
-                let mut lno = lc.start_line.max(1);
-                for line in lc.content.lines() {
-                    if let Some(skipped) = parse_truncated_line_count(line) {
-                        out.push_str(line);
-                        out.push('\n');
-                        lno += skipped;
-                        continue;
-                    }
-                    if line.is_empty() {
-                        out.push_str(&format!("L{}:\n", lno));
-                    } else {
-                        out.push_str(&format!("L{}: {}\n", lno, line));
-                    }
-                    lno += 1;
-                }
+                write_numbered_body(&mut out, &lc.content, lc.start_line.max(1), false);
             } else {
                 out.push_str(&lc.content);
                 if !lc.content.ends_with('\n') {
@@ -308,52 +296,64 @@ impl SliceResult {
             .or_else(|| self.line_range.map(|r| r.0))
             .unwrap_or(1)
             .max(1);
+        write_numbered_body(out, &self.content, start_line, self.symbol.is_none());
+    }
+}
 
-        let mut cur_line = start_line;
-        let mut lines_iter = self.content.lines().peekable();
-        while let Some(line) = lines_iter.next() {
-            if line.is_empty() {
-                if let Some(&next_line) = lines_iter.peek() {
-                    if let Some(skipped) = parse_truncated_line_count(next_line) {
-                        if let Some(marker) = lines_iter.next() {
-                            if matches!(lines_iter.peek(), Some(&"")) {
-                                lines_iter.next();
-                            }
-                            out.push('\n');
-                            out.push_str(marker);
-                            out.push_str("\n\n");
-                            cur_line += skipped;
-                            continue;
+fn write_numbered_body(
+    out: &mut String,
+    content: &str,
+    start_line: usize,
+    strip_pipe_prefix: bool,
+) {
+    let mut cur_line = start_line.max(1);
+    let mut lines_iter = content.lines().peekable();
+    while let Some(line) = lines_iter.next() {
+        if line.is_empty() {
+            if let Some(&next_line) = lines_iter.peek() {
+                if let Some(skipped) = parse_truncated_line_count(next_line) {
+                    if let Some(marker) = lines_iter.next() {
+                        if matches!(lines_iter.peek(), Some(&"")) {
+                            lines_iter.next();
                         }
+                        out.push('\n');
+                        out.push_str(marker);
+                        out.push_str("\n\n");
+                        cur_line += skipped;
+                        continue;
                     }
                 }
             }
-            if let Some(skipped) = parse_truncated_line_count(line) {
-                if matches!(lines_iter.peek(), Some(&"")) {
-                    lines_iter.next();
-                }
-                out.push_str(line);
-                out.push('\n');
-                cur_line += skipped;
-                continue;
+        }
+        if let Some(skipped) = parse_truncated_line_count(line) {
+            if matches!(lines_iter.peek(), Some(&"")) {
+                lines_iter.next();
             }
+            out.push_str(line);
+            out.push('\n');
+            cur_line += skipped;
+            continue;
+        }
 
-            let (lineno, content) = if self.symbol.is_none() {
-                if let Some((num_part, code_part)) = line.split_once(" | ") {
-                    if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
-                        (parsed_num, code_part)
-                    } else {
-                        (cur_line, line)
-                    }
+        let (lineno, body_line) = if strip_pipe_prefix {
+            if let Some((num_part, code_part)) = line.split_once(" | ") {
+                if let Ok(parsed_num) = num_part.trim().parse::<usize>() {
+                    (parsed_num, code_part)
                 } else {
                     (cur_line, line)
                 }
             } else {
                 (cur_line, line)
-            };
-            out.push_str(&format!("L{}: {}\n", lineno, content));
-            cur_line += 1;
+            }
+        } else {
+            (cur_line, line)
+        };
+        if body_line.is_empty() {
+            out.push_str(&format!("L{}:\n", lineno));
+        } else {
+            out.push_str(&format!("L{}: {}\n", lineno, body_line));
         }
+        cur_line += 1;
     }
 }
 
@@ -504,5 +504,40 @@ mod tests {
         let md = s.to_markdown_numbered();
         assert!(md.contains("L1: match x {"));
         assert!(md.contains("L2:     1 | 2 => true,"));
+    }
+
+    #[test]
+    fn tight_budget_at_exact_core_size_never_exceeds_budget() {
+        let s = fixture();
+        let core_only = format!("{}{}", s.header_markdown(), s.format_body(false, false));
+        let core_tok = s.estimate_tokens(&core_only);
+        for budget in core_tok..=(core_tok + 30) {
+            let md = s.to_markdown_budgeted(budget);
+            assert!(
+                s.estimate_tokens(&md) <= budget,
+                "budget {budget} overrun: got {} in:\n{md}",
+                s.estimate_tokens(&md)
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_truncated_local_callee_has_zero_line_drift() {
+        let mut s = fixture();
+        s.local_callees = vec![InlinedCallee {
+            name: "big_helper".to_string(),
+            start_line: 10,
+            end_line: 45,
+            content: "fn big_helper() {\n    let a = 1;\n\n// ... [30 lines truncated for token efficiency] ...\n\n    let tail = 42;\n}"
+                .to_string(),
+        }];
+        let md = s.to_markdown_numbered();
+        assert!(md.contains("L10: fn big_helper() {"), "got:\n{md}");
+        assert!(md.contains("L11:     let a = 1;"), "got:\n{md}");
+        // L10, L11 (2 lines) + 30 skipped = L42 for `let tail = 42;`
+        assert!(md.contains("L42:     let tail = 42;"), "got:\n{md}");
+        assert!(md.contains("L43: }"), "got:\n{md}");
+        assert!(!md.contains("L12:"), "phantom blank line numbered:\n{md}");
+        assert!(!md.contains("L44:"), "+2 drift detected:\n{md}");
     }
 }

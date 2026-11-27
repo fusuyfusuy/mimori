@@ -1,6 +1,7 @@
 use crate::graph::blast::{is_program_entry, is_test_symbol};
 use crate::graph::SymbolGraph;
 use crate::model::{Symbol, SymbolKind};
+use crate::workspace::walker::WorkspaceScope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -160,9 +161,35 @@ pub(crate) fn is_framework_entry(sym: &Symbol) -> bool {
     false
 }
 
+fn in_doctor_scope(file: &str, scope: Option<&WorkspaceScope>) -> bool {
+    scope.is_none_or(|sc| sc.matches_rel(file))
+}
+
 pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
-    let files: HashSet<&str> = graph.symbols.iter().map(|s| s.file.as_str()).collect();
-    let edges: usize = graph.callees_map.values().map(|v| v.len()).sum();
+    run_doctor_scoped(graph, limit, None)
+}
+
+pub fn run_doctor_scoped(
+    graph: &SymbolGraph,
+    limit: Option<usize>,
+    scope: Option<&WorkspaceScope>,
+) -> DoctorResult {
+    let scoped_indices: Vec<usize> = graph
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| in_doctor_scope(&s.file, scope))
+        .map(|(i, _)| i)
+        .collect();
+
+    let files: HashSet<&str> = scoped_indices
+        .iter()
+        .map(|&i| graph.symbols[i].file.as_str())
+        .collect();
+    let edges: usize = scoped_indices
+        .iter()
+        .map(|&i| graph.callees_map.get(&i).map_or(0, Vec::len))
+        .sum();
     let mentioned_names: HashSet<&str> = graph
         .mention_to_indices
         .keys()
@@ -172,7 +199,8 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
     let mut isolated = 0usize;
     let mut likely_dead = Vec::new();
     let mut needs_review = Vec::new();
-    for (idx, sym) in graph.symbols.iter().enumerate() {
+    for &idx in &scoped_indices {
+        let sym = &graph.symbols[idx];
         let has_callers = graph.callers_map.get(&idx).is_some_and(|v| !v.is_empty());
         let has_callees = graph.callees_map.get(&idx).is_some_and(|v| !v.is_empty());
         if !has_callers && !has_callees {
@@ -184,8 +212,12 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
         let has_unresolved_member =
             sym.kind == SymbolKind::Method && graph.unresolved_member_calls.contains_key(leaf);
 
-        if !has_callers
-            && !has_callees
+        let is_unreferenced = (!has_callers && !has_callees)
+            || (!has_callers
+                && !sym.is_public()
+                && matches!(sym.kind, SymbolKind::Function | SymbolKind::Method));
+
+        if is_unreferenced
             && !is_mentioned
             && !has_unresolved_member
             && !is_program_entry(sym)
@@ -226,13 +258,17 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
     let likely_dead_total = (likely_dead.len() < raw_likely_total).then_some(raw_likely_total);
     let needs_review_total = (needs_review.len() < raw_review_total).then_some(raw_review_total);
 
-    let mut hubs: Vec<HubSymbol> = graph
-        .symbols
+    let mut hubs: Vec<HubSymbol> = scoped_indices
         .iter()
-        .enumerate()
+        .copied()
+        .map(|idx| (idx, &graph.symbols[idx]))
         .filter(|(_, s)| !is_test_symbol(s))
         .filter_map(|(idx, s)| {
-            let fan_in = graph.callers_map.get(&idx).map_or(0, |v| v.len());
+            let fan_in = graph.callers_map.get(&idx).map_or(0, |v| {
+                v.iter()
+                    .filter(|&&caller_idx| !is_test_symbol(&graph.symbols[caller_idx]))
+                    .count()
+            });
             (fan_in > 0).then(|| HubSymbol {
                 name: s.name.clone(),
                 kind: s.kind.as_str().to_string(),
@@ -252,7 +288,7 @@ pub fn run_doctor(graph: &SymbolGraph, limit: Option<usize>) -> DoctorResult {
 
     DoctorResult {
         files: files.len(),
-        symbols: graph.symbols.len(),
+        symbols: scoped_indices.len(),
         edges,
         isolated,
         likely_dead,
@@ -386,5 +422,57 @@ mod tests {
         let md = res.to_markdown();
         assert!(md.contains("ambiguous-dropped"));
         assert!(md.contains("PageRank"));
+    }
+
+    #[test]
+    fn uncalled_private_function_with_callees_is_flagged_likely_dead() {
+        let mut pub_entry = sym("src/a.rs", "pub_entry", vec!["helper".into()]);
+        pub_entry.flags = symbol_flags::IS_PUBLIC;
+        let dead_private = sym("src/a.rs", "dead_private", vec!["helper".into()]);
+        let helper = sym("src/a.rs", "helper", vec![]);
+
+        let g = SymbolGraph::new(vec![pub_entry, dead_private, helper]);
+        let res = run_doctor(&g, None);
+        assert!(res.likely_dead.iter().any(|d| d.name == "dead_private"));
+        assert!(!res.likely_dead.iter().any(|d| d.name == "pub_entry"));
+        assert!(!res.likely_dead.iter().any(|d| d.name == "helper"));
+    }
+
+    #[test]
+    fn top_hubs_excludes_test_callers_from_fan_in() {
+        let mut t1 = sym("tests/t.rs", "t1", vec!["hub".into()]);
+        t1.flags = symbol_flags::IS_TEST;
+        let mut t2 = sym("tests/t.rs", "t2", vec!["hub".into()]);
+        t2.flags = symbol_flags::IS_TEST;
+        let prod = sym("src/app.rs", "run", vec!["hub".into()]);
+        let hub = sym("src/core.rs", "hub", vec![]);
+
+        let g = SymbolGraph::new(vec![t1, t2, prod, hub]);
+        let res = run_doctor(&g, None);
+        let hub_entry = res.top_hubs.iter().find(|h| h.name == "hub").unwrap();
+        assert_eq!(hub_entry.fan_in, 1);
+    }
+
+    #[test]
+    fn run_doctor_scoped_filters_to_scope_while_preserving_cross_package_callers() {
+        let mut exported = sym("packages/app/api.rs", "used_from_web", vec![]);
+        exported.flags = symbol_flags::IS_PUBLIC;
+        let dead_in_app = sym("packages/app/dead.rs", "dead_in_app", vec![]);
+        let caller_in_web = sym(
+            "packages/web/page.rs",
+            "render",
+            vec!["used_from_web".into()],
+        );
+        let dead_in_web = sym("packages/web/dead.rs", "dead_in_web", vec![]);
+
+        let g = SymbolGraph::new(vec![exported, dead_in_app, caller_in_web, dead_in_web]);
+        let dir = tempfile::tempdir().unwrap();
+        let scope = WorkspaceScope::parse(dir.path(), "packages/app", false).unwrap();
+        let res = run_doctor_scoped(&g, None, Some(&scope));
+        assert_eq!(res.files, 2);
+        assert_eq!(res.symbols, 2);
+        assert!(res.likely_dead.iter().any(|d| d.name == "dead_in_app"));
+        assert!(!res.likely_dead.iter().any(|d| d.name == "dead_in_web"));
+        assert!(!res.likely_dead.iter().any(|d| d.name == "used_from_web"));
     }
 }

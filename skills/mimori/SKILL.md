@@ -12,7 +12,7 @@ description: >
 KERNEL:
   TARGET: Fast In-Repo Orientation, Blast-Radius Analysis & JIT Agent Memory
   BINARY: ~/.local/bin/mimori (CLI) | mimori mcp (JSON-RPC 2.0 stdio)
-  VERSION: 3.2.0
+  VERSION: 3.2.1
   INVARIANTS:
     1_HASH:       Content-Hash Governed (FNV-1a) — warm MCP uses POSIX ino+size+mtime+ctime stat gate
     2_PURITY:     Deterministic & Non-Interactive — byte-identical JSON & Markdown, zero background daemons
@@ -223,7 +223,7 @@ declare namespace mimori {
     budget: number; estimated_tokens: number; epics?: string; vocab_gotchas: string | null;
     active_debt: string[]; debt_count: number; adrs?: string[]; map: MapResult | null; markdown: string;
   };
-  // CLI: mimori slice <coord>... [-f] [-i] [-n] [--budget <N>] --json | MCP: mimori_slice({ coordinate: string | string[], follow_local?, with_imports?, numbered?, budget?, workspace_dir? }) -> string
+  // CLI: mimori slice <coord>... [-f] [-i] [-n] [--budget <N>] --json -> SliceJson | SliceJson[] | MCP: mimori_slice({ coordinate: string | string[], follow_local?, with_imports?, numbered?, budget?, workspace_dir? }) -> string
   type SliceJson = {
     coordinate: string; file: string; line_range: [number, number] | null; content: string;
     callers: string[]; callees: string[]; total_lines: number;
@@ -241,7 +241,7 @@ declare namespace mimori {
   type MapJson = MapResult;
   // CLI: mimori up|down|uses <target> --json | MCP: mimori_graph({ target: string | string[], direction: "up" | "down" | "uses", workspace_dir? }) -> string
   type GraphJson = { target: string; callers?: string[]; callees?: string[]; mentioners?: string[]; value_uses?: string[] };
-  // CLI: mimori blast <target>... [-d <N>] [--down] [--with-sinks <a,b>] --json | MCP: mimori_blast({ target: string | string[], depth?, down?, with_sinks?, workspace_dir? }) -> string
+  // CLI: mimori blast <target>... [-d <N>] [--down] [--with-sinks <a,b>] --json -> BlastJson | BlastJson[] | MCP: mimori_blast({ target: string | string[], depth?, down?, with_sinks?, workspace_dir? }) -> string
   type BlastJson = {
     target: string; direction: string; depth_limit: number;
     affected: BlastNode[]; entry_points: string[]; test_suites: string[];
@@ -254,16 +254,16 @@ declare namespace mimori {
     touched_files: string[]; deleted_files?: string[];
     mutated_symbols: Array<{ name: string; kind: string; file: string; coordinate: string; start_line: number; end_line: number }>;
     affected: BlastNode[]; entry_points: string[]; test_suites: string[];
-    literal_test_mentions: string[]; memory_notes?: string[];
+    literal_test_mentions: string[]; unverified_member_calls?: string; memory_notes?: string[];
     debt_status: string; memory_status: string;
   };
   // CLI: mimori missing <pattern> [--scope <dir>] [--defines <lit>] --json | MCP: mimori_missing({ pattern, scope?, defines?, workspace_dir? }) -> string
   type MissingJson = { pattern: string; scope: string | null; defines: string | null; missing: string[] };
-  // CLI: mimori memory [show|add|lint|resolve] [--section <sec>] --json | MCP: mimori_memory({ action: "show" | "add" | "lint" | "resolve", section?, text?, scope?, sym?, target?, all?, budget?, workspace_dir? })
+  // CLI: mimori memory [show|add|lint|check|resolve] [--section <sec>] --json | MCP: mimori_memory({ action: "show" | "add" | "lint" | "check" | "resolve", section?, text?, scope?, sym?, target?, all?, budget?, workspace_dir? })
   type MemoryShowJson = {
     debt_count: number; epics: string; vocab: string; gotchas: string; vocab_gotchas: string;
     debt_items: Array<{ line_number: number; what: string; why: string; trigger: string; is_accepted: boolean; raw: string }>;
-  };
+  } | { section: string; content: string };
   // CLI: mimori debt [list|check|sync] [--scope <dir>] --json | MCP: mimori_debt({ action: "list" | "check" | "sync", scope?, workspace_dir? })
   type DebtListJson = Array<{ file: string; line: number; what: string; ceiling: string; trigger: string; valid_trigger: boolean; error_reason: string | null; raw: string }>;
   // CLI: mimori doctor [--limit <N>] --json | MCP: mimori_doctor({ limit?, workspace_dir? }) -> string

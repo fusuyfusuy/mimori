@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 /// Bumped whenever parsing or the stored symbol/reference format changes.
 ///
-/// v15: AST `SymbolFlags` (`flags` column), normalized `files.external_imports_json`,
-/// dead `idx_symbols_name` removed, atomic `BEGIN IMMEDIATE` swap+load.
-pub const PARSER_VERSION: i64 = 15;
+/// v16: Parser symbol flags/references upgrade + locked corrupt-DB rebuild +
+/// snapshot-consistent file hash queries.
+pub const PARSER_VERSION: i64 = 16;
 
 pub struct Database {
     conn: Connection,
@@ -33,17 +33,57 @@ impl Database {
         Ok(db)
     }
 
-    /// Open the SQLite cache, automatically unlinking and rebuilding once if
-    /// the ephemeral `.mimori/index.db` file is corrupt (`SQLITE_NOTADB` / `SQLITE_CORRUPT`).
+    /// Open the SQLite cache, automatically acquiring an exclusive lockfile
+    /// (`index.db.lock`) to unlink and rebuild once if the ephemeral
+    /// `.mimori/index.db` file is corrupt (`SQLITE_NOTADB` / `SQLITE_CORRUPT`).
     pub fn open_or_rebuild(db_path: &Path) -> Result<Self> {
-        match Self::open_or_create(db_path) {
+        let lock_file = open_lock_file(db_path)?;
+        lock_file.lock_shared()?;
+        let open_res = Self::open_or_create(db_path);
+        let _ = lock_file.unlock();
+
+        match open_res {
             Ok(db) => Ok(db),
             Err(err) if is_corruption_error(&err) => {
-                unlink_db_artifacts(db_path);
-                Self::open_or_create(db_path)
+                Self::rebuild_with_lock(db_path, &lock_file, false)
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Acquire an exclusive rebuild lock, verify whether the database is still
+    /// corrupt (another process may have already rebuilt it), and if so unlink
+    /// its artifacts and recreate it cleanly.
+    pub fn rebuild_if_corrupt(db_path: &Path) -> Result<Self> {
+        let lock_file = open_lock_file(db_path)?;
+        Self::rebuild_with_lock(db_path, &lock_file, true)
+    }
+
+    fn rebuild_with_lock(
+        db_path: &Path,
+        lock_file: &std::fs::File,
+        verify_integrity: bool,
+    ) -> Result<Self> {
+        lock_file.lock()?;
+        let res = (|| {
+            // Re-attempt open first: another contender may have already rebuilt it.
+            if let Ok(db) = Self::open_or_create(db_path) {
+                if !verify_integrity || db.quick_check_ok() {
+                    return Ok(db);
+                }
+                drop(db);
+            }
+            unlink_db_artifacts(db_path)?;
+            Self::open_or_create(db_path)
+        })();
+        let _ = lock_file.unlock();
+        res
+    }
+
+    fn quick_check_ok(&self) -> bool {
+        self.conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+            .is_ok_and(|s| s.eq_ignore_ascii_case("ok"))
     }
 
     fn ensure_schema_and_version(&mut self) -> Result<()> {
@@ -51,7 +91,7 @@ impl Database {
             return Ok(());
         }
 
-        let _ = self.conn.execute_batch("PRAGMA journal_mode = WAL;");
+        self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -128,27 +168,26 @@ impl Database {
         Ok(stored)
     }
 
-    pub fn get_file_records(&self) -> Result<HashMap<String, (i64, i64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, mtime, hash FROM files")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                (
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ),
-            ))
-        })?;
+    pub fn get_file_records(&self) -> Result<HashMap<String, String>> {
+        get_file_records_conn(&self.conn)
+    }
 
-        let mut map = HashMap::new();
-        for r in rows {
-            let (path, data) = r?;
-            map.insert(path, data);
-        }
-        Ok(map)
+    /// Read `meta.alias_fingerprint` and `files(path, hash)` within a single
+    /// consistent SQLite read snapshot so concurrent alias swaps cannot split them.
+    pub fn read_sync_snapshot(&mut self) -> Result<(Option<String>, HashMap<String, String>)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let stored_fp: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'alias_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let files = get_file_records_conn(&tx)?;
+        tx.commit()?;
+        Ok((stored_fp, files))
     }
 
     /// Atomically apply file updates, path deletions, and optional full alias
@@ -331,14 +370,49 @@ fn load_all_symbols_conn(conn: &Connection) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
+fn get_file_records_conn(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT path, hash FROM files")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut map = HashMap::new();
+    for r in rows {
+        let (path, hash) = r?;
+        map.insert(path, hash);
+    }
+    Ok(map)
+}
+
+fn open_lock_file(db_path: &Path) -> Result<std::fs::File> {
+    let mut lock_os = db_path.as_os_str().to_os_string();
+    lock_os.push(".lock");
+    let lock_path = Path::new(&lock_os);
+    if let Ok(meta) = std::fs::symlink_metadata(lock_path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to use symlinked cache lock file '{}'",
+                lock_path.display()
+            );
+        }
+    }
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    Ok(file)
+}
+
 pub fn is_corruption_error(err: &anyhow::Error) -> bool {
     if let Some(sql_err) = err.downcast_ref::<rusqlite::Error>() {
         match sql_err {
             rusqlite::Error::SqliteFailure(e, _) => {
-                matches!(
-                    e.code,
-                    ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt | ErrorCode::SchemaChanged
-                )
+                matches!(e.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)
             }
             rusqlite::Error::FromSqlConversionFailure(_, _, _) => true,
             _ => false,
@@ -364,18 +438,30 @@ pub fn is_readonly_or_io_error(err: &anyhow::Error) -> bool {
     msg.contains("readonly") || msg.contains("permission denied") || msg.contains("read-only")
 }
 
-pub fn unlink_db_artifacts(db_path: &Path) {
+pub fn unlink_db_artifacts(db_path: &Path) -> Result<()> {
     let base = db_path.as_os_str().to_os_string();
-    for suffix in ["", "-wal", "-shm"] {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut p = base.clone();
         p.push(suffix);
         let path = Path::new(&p);
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if !meta.file_type().is_symlink() && meta.is_file() {
-                let _ = std::fs::remove_file(path);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "Refusing to remove symlinked cache artifact '{}'",
+                    path.display()
+                );
             }
+            Ok(meta) if meta.is_file() => match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
+    Ok(())
 }
 
 fn parse_symbol_kind(raw: String) -> SymbolKind {

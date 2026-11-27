@@ -12,7 +12,7 @@ use crate::graph::{
 };
 use crate::mcp::protocol::ToolError;
 use crate::memory::{MemoryLedger, MAX_DEBT_CEILING};
-use crate::model::Coordinate;
+use crate::model::{Coordinate, SliceResult};
 use crate::workspace::walker::{
     confine_to_workspace, is_disallowed_workspace_root, WorkspaceScope,
 };
@@ -254,7 +254,7 @@ pub fn list_tools() -> Vec<Value> {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of matches to return (default: 50)"
+                        "description": "Maximum number of matches to return (default: 50, capped at 500)"
                     },
                     "workspace_dir": {
                         "type": "string",
@@ -319,8 +319,8 @@ pub fn list_tools() -> Vec<Value> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["show", "add", "lint", "resolve"],
-                        "description": "Action: 'show', 'add' (append structured/scoped entry), 'lint', or 'resolve' (delete matched debt item)"
+                        "enum": ["show", "add", "lint", "check", "resolve"],
+                        "description": "Action: 'show', 'add' (append structured/scoped entry), 'lint'/'check', or 'resolve' (delete matched debt item)"
                     },
                     "section": {
                         "type": "string",
@@ -492,7 +492,21 @@ where
     }
 }
 
+const MAX_BATCH_TARGETS: usize = 64;
+const MAX_FIND_LIMIT: usize = 500;
+
+fn enforce_batch_limit(len: usize, tool_name: &str) -> Result<(), ToolError> {
+    if len > MAX_BATCH_TARGETS {
+        return Err(ToolError::InvalidParams(format!(
+            "Batch size {} for '{}' exceeds maximum of {} targets",
+            len, tool_name, MAX_BATCH_TARGETS
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SliceToolArgs {
     #[serde(alias = "coordinates", deserialize_with = "deserialize_targets")]
     coordinate: Vec<String>,
@@ -509,6 +523,7 @@ struct SliceToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DumpToolArgs {
     #[serde(default)]
     budget: Option<usize>,
@@ -519,6 +534,7 @@ struct DumpToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MapToolArgs {
     #[serde(default)]
     limit: Option<usize>,
@@ -533,6 +549,7 @@ struct MapToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FindToolArgs {
     pattern: String,
     #[serde(default)]
@@ -548,6 +565,7 @@ struct FindToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiffToolArgs {
     #[serde(default)]
     staged: Option<bool>,
@@ -560,6 +578,7 @@ struct DiffToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlastToolArgs {
     #[serde(alias = "targets", deserialize_with = "deserialize_targets")]
     target: Vec<String>,
@@ -574,6 +593,7 @@ struct BlastToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GraphToolArgs {
     #[serde(alias = "targets", deserialize_with = "deserialize_targets")]
     target: Vec<String>,
@@ -583,6 +603,7 @@ struct GraphToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MemoryToolArgs {
     action: String,
     #[serde(default)]
@@ -604,6 +625,7 @@ struct MemoryToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DebtToolArgs {
     action: String,
     #[serde(default)]
@@ -613,6 +635,7 @@ struct DebtToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MissingToolArgs {
     pattern: String,
     #[serde(default)]
@@ -624,6 +647,7 @@ struct MissingToolArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoctorToolArgs {
     #[serde(default)]
     limit: Option<usize>,
@@ -638,6 +662,203 @@ fn parse_args<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(arguments.clone()).map_err(|e| {
         ToolError::InvalidParams(format!("Invalid arguments for '{}': {}", tool_name, e))
     })
+}
+
+/// Uniform workspace boundary parsed once at MCP entry and consumed by all 11 tools.
+///
+/// When `scope_dir` is a plain subdirectory of `session_root` (no own `.git`,
+/// `.hg`, or `.mimori`), `graph_root` stays anchored at `session_root` with
+/// `sub_prefix = Some(rel)` so no tool ever creates nested `<subdir>/.mimori/`
+/// caches while every coordinate and scope filter remains strictly confined to
+/// `scope_dir`.
+struct ResolvedToolScope {
+    graph_root: PathBuf,
+    scope_dir: PathBuf,
+    sub_prefix: Option<String>,
+    is_session_subdir: bool,
+}
+
+impl ResolvedToolScope {
+    fn resolve(workspace_dir: Option<&str>, session_root: &Path) -> Result<Self, ToolError> {
+        let canon_session = session_root
+            .canonicalize()
+            .unwrap_or_else(|_| session_root.to_path_buf());
+        let scope_dir = resolve_workspace_scope(workspace_dir, &canon_session)?;
+        let canon_scope = scope_dir
+            .canonicalize()
+            .unwrap_or_else(|_| scope_dir.clone());
+
+        let has_own_root_marker = canon_scope == canon_session
+            || canon_scope.join(".git").exists()
+            || canon_scope.join(".hg").exists()
+            || canon_scope.join(".mimori").exists();
+
+        if !has_own_root_marker {
+            if let Ok(rel) = canon_scope.strip_prefix(&canon_session) {
+                let norm = crate::workspace::walker::normalize_rel_str(rel);
+                if !norm.is_empty() {
+                    return Ok(Self {
+                        graph_root: canon_session,
+                        scope_dir: canon_scope,
+                        sub_prefix: Some(norm),
+                        is_session_subdir: true,
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            graph_root: canon_scope.clone(),
+            scope_dir: canon_scope,
+            sub_prefix: None,
+            is_session_subdir: false,
+        })
+    }
+
+    /// Confine a line-slice file strictly to `scope_dir`, returning its canonical path.
+    fn confine_file(&self, file: &Path) -> Result<PathBuf, ToolError> {
+        confine(&self.scope_dir, file)
+    }
+
+    /// Confine any file component strictly against `scope_dir` and rebase it
+    /// relative to `graph_root` so it resolves cleanly inside the shared graph.
+    fn scope_coord(&self, coord: Coordinate) -> Result<Coordinate, ToolError> {
+        let Some(file) = coord.file() else {
+            return Ok(coord);
+        };
+
+        let is_lines = matches!(coord, Coordinate::Lines { .. });
+        let has_parent = file
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+
+        if is_lines || file.is_absolute() || has_parent {
+            let confined = confine(&self.scope_dir, file)?;
+            return self.rebase_confined(coord, &confined);
+        }
+
+        match confine_to_workspace(&self.scope_dir, file) {
+            Ok(confined) => self.rebase_confined(coord, &confined),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("escapes workspace") || msg.contains("symlink") {
+                    return Err(ToolError::InvalidParams(msg));
+                }
+                // Non-escaping relative file not found directly at `scope_dir/file`
+                // (e.g. suffix match like `tools.rs:foo` or genuinely missing file).
+                Ok(coord.normalize_against(&self.graph_root))
+            }
+        }
+    }
+
+    fn rebase_confined(&self, coord: Coordinate, confined: &Path) -> Result<Coordinate, ToolError> {
+        let rel = confined.strip_prefix(&self.graph_root).map_err(|_| {
+            ToolError::InvalidParams(format!("Path escapes workspace: {}", confined.display()))
+        })?;
+        let rel_buf = rel.to_path_buf();
+        Ok(match coord {
+            Coordinate::Symbol { name, .. } => Coordinate::Symbol {
+                file: rel_buf,
+                name,
+            },
+            Coordinate::Lines { start, end, .. } => Coordinate::Lines {
+                file: rel_buf,
+                start,
+                end,
+            },
+            other => other,
+        })
+    }
+
+    /// Verify a resolved symbol's graph-relative file stays within `scope_dir`
+    /// whenever `is_session_subdir` is active (blocks sibling suffix leaks).
+    fn verify_resolved_file(&self, rel_file: &str) -> Result<(), ToolError> {
+        let Some(prefix) = self.sub_prefix.as_deref() else {
+            return Ok(());
+        };
+        let norm = rel_file.replace('\\', "/");
+        let in_scope = norm == prefix
+            || norm
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'));
+        if !in_scope {
+            return Err(ToolError::InvalidParams(format!(
+                "Path escapes workspace_dir '{}': {}",
+                prefix, rel_file
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate an optional user `scope` strictly against `scope_dir`, then
+    /// combine it with `sub_prefix` for graph-root queries.
+    fn combine_extra_scope(&self, extra_scope: Option<&str>) -> Result<Option<String>, ToolError> {
+        let validated_extra = match extra_scope {
+            Some(raw) => {
+                let parsed = WorkspaceScope::parse(&self.scope_dir, raw, false)
+                    .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                if parsed.rel_prefix.is_empty() {
+                    None
+                } else {
+                    Some(parsed.rel_prefix)
+                }
+            }
+            None => None,
+        };
+        Ok(combine_scope_prefix(
+            self.sub_prefix.as_deref(),
+            validated_extra.as_deref(),
+        ))
+    }
+
+    /// Rebase an optional `focus` coordinate strictly through `scope_coord`.
+    fn scope_focus(&self, focus: Option<&str>) -> Result<Option<String>, ToolError> {
+        let Some(raw) = focus else {
+            return Ok(None);
+        };
+        let parsed = Coordinate::parse(raw)
+            .map_err(|e| ToolError::InvalidParams(format!("Invalid focus '{}': {}", raw, e)))?;
+        let rebased = self.scope_coord(parsed)?;
+        Ok(Some(rebased.to_string()))
+    }
+
+    /// Load `scope_dir/.agents/memory.md` read-only once per call when
+    /// `scope_dir != graph_root` so subpackage notes overlay root notes.
+    fn load_subpkg_ledger(&self) -> Option<MemoryLedger> {
+        if self.scope_dir == self.graph_root {
+            return None;
+        }
+        let mem_path = MemoryLedger::memory_path(&self.scope_dir);
+        if !mem_path.is_file() {
+            return None;
+        }
+        MemoryLedger::load(&self.scope_dir).ok()
+    }
+
+    /// Append deduplicated `@scope:`/`@sym:` notes from a subpackage ledger.
+    fn overlay_subpkg_memory(&self, sub_ledger: Option<&MemoryLedger>, slice: &mut SliceResult) {
+        let Some(ledger) = sub_ledger else {
+            return;
+        };
+        let sub_rel = self
+            .sub_prefix
+            .as_deref()
+            .and_then(|prefix| {
+                let norm = slice.file.replace('\\', "/");
+                norm.strip_prefix(prefix)
+                    .and_then(|r| r.strip_prefix('/'))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| slice.file.clone());
+        let sym_name = slice.symbol.as_ref().map(|s| s.name.as_str());
+        let syms: Vec<&str> = sym_name.into_iter().collect();
+        let extra = ledger.scoped_notes(&[sub_rel.as_str()], &syms);
+        for note in extra {
+            if !slice.memory_notes.contains(&note) {
+                slice.memory_notes.push(note);
+            }
+        }
+    }
 }
 
 fn resolve_workspace_scope(
@@ -669,6 +890,13 @@ fn resolve_workspace_scope(
         None => session_root.to_path_buf(),
     };
 
+    if !resolved.is_dir() {
+        return Err(ToolError::InvalidParams(format!(
+            "workspace_dir '{}' is not a directory",
+            workspace_dir.unwrap_or(".")
+        )));
+    }
+
     if is_disallowed_workspace_root(&resolved) {
         return Err(ToolError::Execution(format!(
             "Refusing to operate on home or system directory '{}' as workspace",
@@ -677,36 +905,6 @@ fn resolve_workspace_scope(
     }
 
     Ok(resolved)
-}
-
-/// If `scope_dir` is a plain subdirectory of `session.root` (no own `.git` or
-/// `.mimori`), reuse `session.root`'s cached graph plus a relative prefix so
-/// subdir calls never create stray `<subdir>/.mimori/index.db` caches.
-fn resolve_graph_root_and_prefix(
-    scope_dir: &Path,
-    session_root: &Path,
-) -> (PathBuf, Option<String>) {
-    let canon_session = session_root
-        .canonicalize()
-        .unwrap_or_else(|_| session_root.to_path_buf());
-    let canon_scope = scope_dir
-        .canonicalize()
-        .unwrap_or_else(|_| scope_dir.to_path_buf());
-
-    if canon_scope == canon_session
-        || canon_scope.join(".git").exists()
-        || canon_scope.join(".mimori").exists()
-    {
-        return (canon_scope, None);
-    }
-
-    if let Ok(rel) = canon_scope.strip_prefix(&canon_session) {
-        let norm = crate::workspace::walker::normalize_rel_str(rel);
-        if !norm.is_empty() {
-            return (canon_session, Some(norm));
-        }
-    }
-    (canon_scope, None)
 }
 
 fn combine_scope_prefix(base_prefix: Option<&str>, extra_scope: Option<&str>) -> Option<String> {
@@ -723,37 +921,6 @@ fn combine_scope_prefix(base_prefix: Option<&str>, extra_scope: Option<&str>) ->
             }
         }
     }
-}
-
-fn scope_coord_for_graph(coord: Coordinate, scope_dir: &Path, graph_root: &Path) -> Coordinate {
-    let Some(file) = coord.file() else {
-        return coord;
-    };
-    let candidate = if file.is_absolute() {
-        file.to_path_buf()
-    } else if scope_dir != graph_root {
-        scope_dir.join(file)
-    } else {
-        graph_root.join(file)
-    };
-    if let Ok(confined) = confine_to_workspace(graph_root, &candidate) {
-        if let Ok(rel) = confined.strip_prefix(graph_root) {
-            let rel_buf = rel.to_path_buf();
-            return match coord {
-                Coordinate::Symbol { name, .. } => Coordinate::Symbol {
-                    file: rel_buf,
-                    name,
-                },
-                Coordinate::Lines { start, end, .. } => Coordinate::Lines {
-                    file: rel_buf,
-                    start,
-                    end,
-                },
-                other => other,
-            };
-        }
-    }
-    coord.normalize_against(graph_root)
 }
 
 pub fn call_tool(
@@ -784,13 +951,14 @@ fn handle_slice(
     cache: &mut McpCache,
 ) -> Result<ToolOutcome, ToolError> {
     let args: SliceToolArgs = parse_args("mimori_slice", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-    let (graph_root, _) = resolve_graph_root_and_prefix(&scope_dir, &session.root);
+    enforce_batch_limit(args.coordinate.len(), "mimori_slice")?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
 
     let with_imports = args.with_imports.unwrap_or(false);
     let follow_local = args.follow_local.unwrap_or(false);
     let numbered = args.numbered.unwrap_or(false);
     let per_budget = args.budget.map(|b| b / args.coordinate.len().max(1));
+    let sub_ledger = scope.load_subpkg_ledger();
 
     let mut cached_graph: Option<Arc<SymbolGraph>> = None;
     let mut rendered = Vec::with_capacity(args.coordinate.len());
@@ -799,26 +967,36 @@ fn handle_slice(
             ToolError::InvalidParams(format!("Invalid coordinate '{}': {}", raw_coord, e))
         })?;
 
-        let slice = if let Coordinate::Lines { file, start, end } = &coord {
-            let confined = confine(&scope_dir, file)?;
-            slice_line_coordinate(&confined, *start, *end, with_imports, Some(&scope_dir))
-                .map_err(|e| ToolError::Execution(e.to_string()))?
+        let mut slice = if let Coordinate::Lines { file, start, end } = &coord {
+            let confined = scope.confine_file(file)?;
+            slice_line_coordinate(
+                &confined,
+                *start,
+                *end,
+                with_imports,
+                Some(&scope.graph_root),
+            )
+            .map_err(|e| ToolError::Execution(e.to_string()))?
         } else {
+            let norm_coord = scope.scope_coord(coord)?;
             let graph = match &cached_graph {
                 Some(g) => Arc::clone(g),
                 None => {
                     let g = cache
-                        .get_graph(&graph_root)
+                        .get_graph(&scope.graph_root)
                         .map_err(|e| ToolError::Execution(e.to_string()))?;
                     cached_graph = Some(Arc::clone(&g));
                     g
                 }
             };
-            let norm_coord = scope_coord_for_graph(coord, &scope_dir, &graph_root);
-            graph
+            let built = graph
                 .build_slice(&norm_coord, follow_local, with_imports)
-                .map_err(|e| ToolError::Execution(e.to_string()))?
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            scope.verify_resolved_file(&built.file)?;
+            built
         };
+
+        scope.overlay_subpkg_memory(sub_ledger.as_ref(), &mut slice);
 
         if let Some(b) = per_budget {
             rendered.push(slice.render_markdown_budgeted(b, numbered));
@@ -835,21 +1013,21 @@ fn handle_map(
     cache: &mut McpCache,
 ) -> Result<ToolOutcome, ToolError> {
     let args: MapToolArgs = parse_args("mimori_map", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-    let (graph_root, sub_prefix) = resolve_graph_root_and_prefix(&scope_dir, &session.root);
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
 
-    let effective_raw_scope = combine_scope_prefix(sub_prefix.as_deref(), args.scope.as_deref());
-    let validated_scope = validate_map_scope(&graph_root, effective_raw_scope.as_deref())
+    let effective_raw_scope = scope.combine_extra_scope(args.scope.as_deref())?;
+    let validated_scope = validate_map_scope(&scope.graph_root, effective_raw_scope.as_deref())
         .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+    let rebased_focus = scope.scope_focus(args.focus.as_deref())?;
 
     let base_graph = cache
-        .get_graph(&graph_root)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     let personalized = compute_personalized_scores(
         &base_graph,
-        args.focus.as_deref(),
+        rebased_focus.as_deref(),
         args.seed.as_deref(),
-        &scope_dir,
+        &scope.graph_root,
     )
     .map_err(|e| ToolError::Execution(e.to_string()))?;
     let scores_ref = personalized
@@ -885,20 +1063,19 @@ fn handle_find(
         ));
     }
 
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-    let (graph_root, sub_prefix) = resolve_graph_root_and_prefix(&scope_dir, &session.root);
-    let effective_scope = combine_scope_prefix(sub_prefix.as_deref(), args.scope.as_deref());
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
+    let effective_scope = scope.combine_extra_scope(args.scope.as_deref())?;
     if let Some(sc) = effective_scope.as_deref() {
-        WorkspaceScope::parse(&graph_root, sc, false)
+        WorkspaceScope::parse(&scope.graph_root, sc, false)
             .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
     }
 
     let graph = cache
-        .get_graph(&graph_root)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
-    let limit = args.limit.or(Some(50));
+    let limit = Some(args.limit.unwrap_or(50).min(MAX_FIND_LIMIT));
     let res = crate::workspace::execute_find_with_graph(
-        &graph_root,
+        &scope.graph_root,
         &graph,
         &args.pattern,
         symbols_only,
@@ -918,12 +1095,12 @@ fn handle_diff(
     let args: DiffToolArgs = parse_args("mimori_diff", arguments)?;
     crate::graph::diff::validate_diff_base(args.base.as_deref())
         .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     let graph = cache
-        .get_graph(&scope_dir)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     let report = crate::graph::diff::calculate_diff_blast(
-        &scope_dir,
+        &scope.graph_root,
         &graph,
         args.staged.unwrap_or(false),
         args.base.as_deref(),
@@ -933,16 +1110,30 @@ fn handle_diff(
     Ok(ToolOutcome::ok(report.to_markdown()))
 }
 
+fn verify_graph_target_in_scope(
+    scope: &ResolvedToolScope,
+    graph: &SymbolGraph,
+    coord: &Coordinate,
+) -> Result<(), ToolError> {
+    if !scope.is_session_subdir {
+        return Ok(());
+    }
+    if let Resolution::Unique(i) = graph.resolve(coord) {
+        scope.verify_resolved_file(&graph.symbols[i].file)?;
+    }
+    Ok(())
+}
+
 fn handle_blast(
     arguments: &Value,
     session: &McpSession,
     cache: &mut McpCache,
 ) -> Result<ToolOutcome, ToolError> {
     let args: BlastToolArgs = parse_args("mimori_blast", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-    let (graph_root, _) = resolve_graph_root_and_prefix(&scope_dir, &session.root);
+    enforce_batch_limit(args.target.len(), "mimori_blast")?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     let graph = cache
-        .get_graph(&graph_root)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
 
     let depth = args.depth.unwrap_or(3);
@@ -953,7 +1144,8 @@ fn handle_blast(
     for raw_target in &args.target {
         let parsed =
             Coordinate::parse(raw_target).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        let coord = scope_coord_for_graph(parsed, &scope_dir, &graph_root);
+        let coord = scope.scope_coord(parsed)?;
+        verify_graph_target_in_scope(&scope, &graph, &coord)?;
 
         let blast_res = if down {
             calculate_downstream_blast(&graph, &coord, depth)
@@ -980,7 +1172,7 @@ fn handle_blast(
             };
             let cone = blast_res.cone_files(target_file.as_deref());
             let (sink_hits, truncated) =
-                sweep_literal_sinks(&graph_root, &graph, &sinks, Some(&cone));
+                sweep_literal_sinks(&scope.graph_root, &graph, &sinks, Some(&cone));
             md.push_str(&format_sink_hits(&sinks, &sink_hits, truncated));
         } else {
             md.push_str("\nTip: blast follows call edges plus labeled value-use rows — raw literals (e.g. console.*, logPath) need a sweep: pass with_sinks or use rg.\n");
@@ -997,23 +1189,24 @@ fn handle_graph(
     cache: &mut McpCache,
 ) -> Result<ToolOutcome, ToolError> {
     let args: GraphToolArgs = parse_args("mimori_graph", arguments)?;
+    enforce_batch_limit(args.target.len(), "mimori_graph")?;
     if !matches!(args.direction.as_str(), "up" | "down" | "uses") {
         return Err(ToolError::InvalidParams(format!(
             "Invalid direction '{}': expected 'up', 'down', or 'uses'",
             args.direction
         )));
     }
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-    let (graph_root, _) = resolve_graph_root_and_prefix(&scope_dir, &session.root);
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     let graph = cache
-        .get_graph(&graph_root)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
 
     let mut blocks = Vec::with_capacity(args.target.len());
     for raw_target in &args.target {
         let parsed =
             Coordinate::parse(raw_target).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        let coord = scope_coord_for_graph(parsed, &scope_dir, &graph_root);
+        let coord = scope.scope_coord(parsed)?;
+        verify_graph_target_in_scope(&scope, &graph, &coord)?;
 
         let block = match args.direction.as_str() {
             "up" => {
@@ -1041,66 +1234,100 @@ fn handle_graph(
     Ok(ToolOutcome::ok(blocks.join("\n---\n")))
 }
 
+fn truncate_text_to_budget(text: String, budget: Option<usize>) -> String {
+    let Some(b) = budget else {
+        return text;
+    };
+    let max_chars = b.saturating_mul(4);
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    for line in text.lines() {
+        let line_chars = line.chars().count() + 1;
+        if used.saturating_add(line_chars) > max_chars {
+            truncated.push_str("... [truncated to fit token budget]\n");
+            break;
+        }
+        truncated.push_str(line);
+        truncated.push('\n');
+        used = used.saturating_add(line_chars);
+    }
+    truncated
+}
+
+fn handle_memory_show(
+    scope_dir: &Path,
+    section: Option<&str>,
+    budget: Option<usize>,
+) -> Result<ToolOutcome, ToolError> {
+    let ledger = MemoryLedger::load(scope_dir)
+        .map_err(|e| ToolError::Execution(format!("Load memory: {}", e)))?;
+    let text = match section {
+        Some(sec) => ledger
+            .get_section(sec)
+            .unwrap_or_else(|| format!("MEM_EMPTY: section '{}' not found; exit 0.", sec)),
+        None => ledger.raw_content,
+    };
+    Ok(ToolOutcome::ok(truncate_text_to_budget(text, budget)))
+}
+
+fn handle_memory_add(scope_dir: &Path, args: &MemoryToolArgs) -> Result<ToolOutcome, ToolError> {
+    let text = args.text.as_deref().ok_or_else(|| {
+        ToolError::InvalidParams("Missing required 'text' parameter for action 'add'".to_string())
+    })?;
+    let section = args.section.as_deref().unwrap_or("gotchas");
+    let entry = MemoryLedger::add_entry_locked(
+        scope_dir,
+        section,
+        text,
+        args.scope.as_deref(),
+        args.sym.as_deref(),
+    )
+    .map_err(|e| ToolError::Execution(format!("Add memory: {}", e)))?;
+    Ok(ToolOutcome::ok(format!(
+        "MEM_ADD: appended to '{}': {}; exit 0.",
+        section, entry
+    )))
+}
+
+fn handle_memory_resolve(
+    scope_dir: &Path,
+    args: &MemoryToolArgs,
+) -> Result<ToolOutcome, ToolError> {
+    let target = args.target.as_deref().ok_or_else(|| {
+        ToolError::InvalidParams(
+            "Missing required 'target' parameter for action 'resolve'".to_string(),
+        )
+    })?;
+    let (deleted, remaining) =
+        MemoryLedger::resolve_debt_locked(scope_dir, target, args.all.unwrap_or(false))
+            .map_err(|e| ToolError::Execution(format!("Resolve: {}", e)))?;
+    let removed_block = deleted
+        .iter()
+        .map(|l| format!("  removed: {}", l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ToolOutcome::ok(format!(
+        "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/{} lines; exit 0.\n{}",
+        deleted.len(),
+        target,
+        remaining,
+        MAX_DEBT_CEILING,
+        removed_block
+    )))
+}
+
 fn handle_memory(arguments: &Value, session: &McpSession) -> Result<ToolOutcome, ToolError> {
     let args: MemoryToolArgs = parse_args("mimori_memory", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
 
     match args.action.as_str() {
-        "show" => {
-            let ledger = MemoryLedger::load(&scope_dir)
-                .map_err(|e| ToolError::Execution(format!("Load memory: {}", e)))?;
-            let text = if let Some(sec) = args.section.as_deref() {
-                match ledger.get_section(sec) {
-                    Some(content) => content,
-                    None => format!("MEM_EMPTY: section '{}' not found; exit 0.", sec),
-                }
-            } else {
-                ledger.raw_content
-            };
-            if let Some(b) = args.budget {
-                let max_chars = b.saturating_mul(4);
-                if text.chars().count() > max_chars {
-                    let mut truncated = String::new();
-                    let mut used = 0usize;
-                    for line in text.lines() {
-                        let line_chars = line.chars().count() + 1;
-                        if used.saturating_add(line_chars) > max_chars {
-                            truncated.push_str("... [truncated to fit token budget]\n");
-                            break;
-                        }
-                        truncated.push_str(line);
-                        truncated.push('\n');
-                        used = used.saturating_add(line_chars);
-                    }
-                    return Ok(ToolOutcome::ok(truncated));
-                }
-            }
-            Ok(ToolOutcome::ok(text))
-        }
-        "add" => {
-            let text = args.text.ok_or_else(|| {
-                ToolError::InvalidParams(
-                    "Missing required 'text' parameter for action 'add'".to_string(),
-                )
-            })?;
-            let section = args.section.as_deref().unwrap_or("gotchas");
-            let mem_path = MemoryLedger::memory_path(&scope_dir);
-            if !mem_path.exists() {
-                MemoryLedger::scaffold(&scope_dir, false)
-                    .map_err(|e| ToolError::Execution(format!("Scaffold memory: {}", e)))?;
-            }
-            let mut ledger = MemoryLedger::load(&scope_dir)
-                .map_err(|e| ToolError::Execution(format!("Load memory: {}", e)))?;
-            let entry = ledger
-                .add_entry(section, &text, args.scope.as_deref(), args.sym.as_deref())
-                .map_err(|e| ToolError::Execution(format!("Add memory: {}", e)))?;
-            Ok(ToolOutcome::ok(format!(
-                "MEM_ADD: appended to '{}': {}; exit 0.",
-                section, entry
-            )))
-        }
+        "show" => handle_memory_show(&scope.scope_dir, args.section.as_deref(), args.budget),
+        "add" => handle_memory_add(&scope.scope_dir, &args),
         "lint" | "check" => {
-            let ledger = MemoryLedger::load(&scope_dir)
+            let ledger = MemoryLedger::load(&scope.scope_dir)
                 .map_err(|e| ToolError::Execution(format!("Load memory: {}", e)))?;
             let report = ledger.lint();
             Ok(ToolOutcome {
@@ -1108,32 +1335,9 @@ fn handle_memory(arguments: &Value, session: &McpSession) -> Result<ToolOutcome,
                 is_error: !report.passed,
             })
         }
-        "resolve" => {
-            let target = args.target.ok_or_else(|| {
-                ToolError::InvalidParams(
-                    "Missing required 'target' parameter for action 'resolve'".to_string(),
-                )
-            })?;
-            let mut ledger = MemoryLedger::load(&scope_dir)
-                .map_err(|e| ToolError::Execution(format!("Load memory: {}", e)))?;
-            let deleted = ledger
-                .resolve(&target, args.all.unwrap_or(false))
-                .map_err(|e| ToolError::Execution(format!("Resolve: {}", e)))?;
-            Ok(ToolOutcome::ok(format!(
-                "MEM_RESOLVE: deleted {} lines matching '{}'; debt: {}/{} lines; exit 0.\n{}",
-                deleted.len(),
-                target,
-                ledger.raw_debt_lines.len(),
-                MAX_DEBT_CEILING,
-                deleted
-                    .iter()
-                    .map(|l| format!("  removed: {}", l))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )))
-        }
+        "resolve" => handle_memory_resolve(&scope.scope_dir, &args),
         other => Err(ToolError::InvalidParams(format!(
-            "Invalid action '{}': expected 'show', 'add', 'lint', or 'resolve'",
+            "Invalid action '{}': expected 'show', 'add', 'lint', 'check', or 'resolve'",
             other
         ))),
     }
@@ -1141,28 +1345,30 @@ fn handle_memory(arguments: &Value, session: &McpSession) -> Result<ToolOutcome,
 
 fn handle_debt(arguments: &Value, session: &McpSession) -> Result<ToolOutcome, ToolError> {
     let args: DebtToolArgs = parse_args("mimori_debt", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     if let Some(s) = args.scope.as_deref() {
-        WorkspaceScope::parse(&scope_dir, s, true)
+        WorkspaceScope::parse(&scope.scope_dir, s, true)
             .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
     }
 
     match args.action.as_str() {
         "list" => {
-            let (_markers, output) = crate::memory::list_debt(&scope_dir, args.scope.as_deref())
-                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            let (_markers, output) =
+                crate::memory::list_debt(&scope.scope_dir, args.scope.as_deref())
+                    .map_err(|e| ToolError::Execution(e.to_string()))?;
             Ok(ToolOutcome::ok(output))
         }
         "check" => {
-            let (passed, output) = crate::memory::check_debt(&scope_dir);
+            let (passed, output) = crate::memory::check_debt(&scope.scope_dir);
             Ok(ToolOutcome {
                 text: output,
                 is_error: !passed,
             })
         }
         "sync" => {
-            let (_in_code, _manual, _synced, output) = crate::memory::sync_debt(&scope_dir)
-                .map_err(|e| ToolError::Execution(format!("Debt sync: {}", e)))?;
+            let (_in_code, _manual, _synced, output) =
+                crate::memory::sync_debt(&scope.scope_dir)
+                    .map_err(|e| ToolError::Execution(format!("Debt sync: {}", e)))?;
             Ok(ToolOutcome::ok(output))
         }
         other => Err(ToolError::InvalidParams(format!(
@@ -1178,16 +1384,17 @@ fn handle_dump(
     cache: &mut McpCache,
 ) -> Result<ToolOutcome, ToolError> {
     let args: DumpToolArgs = parse_args("mimori_dump", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     let budget = args.budget.unwrap_or(1500);
+    let rebased_focus = scope.scope_focus(args.focus.as_deref())?;
     let graph = cache
-        .get_graph(&scope_dir)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     let dump = crate::memory::dump::generate_dump_with_graph(
-        &scope_dir,
+        &scope.graph_root,
         Some(graph.as_ref()),
         budget,
-        args.focus.as_deref(),
+        rebased_focus.as_deref(),
     )
     .map_err(|e| ToolError::Execution(e.to_string()))?;
     Ok(ToolOutcome::ok(dump.markdown))
@@ -1207,14 +1414,14 @@ fn handle_missing(arguments: &Value, session: &McpSession) -> Result<ToolOutcome
             ));
         }
     }
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     if let Some(sc) = args.scope.as_deref() {
-        WorkspaceScope::parse(&scope_dir, sc, true)
+        WorkspaceScope::parse(&scope.scope_dir, sc, true)
             .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
     }
 
     let missing = crate::graph::missing::find_missing(
-        &scope_dir,
+        &scope.scope_dir,
         args.scope.as_deref(),
         &args.pattern,
         args.defines.as_deref(),
@@ -1236,12 +1443,18 @@ fn handle_doctor(
     cache: &mut McpCache,
 ) -> Result<ToolOutcome, ToolError> {
     let args: DoctorToolArgs = parse_args("mimori_doctor", arguments)?;
-    let scope_dir = resolve_workspace_scope(args.workspace_dir.as_deref(), &session.root)?;
-    let (graph_root, _) = resolve_graph_root_and_prefix(&scope_dir, &session.root);
+    let scope = ResolvedToolScope::resolve(args.workspace_dir.as_deref(), &session.root)?;
     let graph = cache
-        .get_graph(&graph_root)
+        .get_graph(&scope.graph_root)
         .map_err(|e| ToolError::Execution(e.to_string()))?;
+    let ws_scope = match scope.sub_prefix.as_deref() {
+        Some(prefix) => Some(
+            WorkspaceScope::parse(&scope.graph_root, prefix, false)
+                .map_err(|e| ToolError::InvalidParams(e.to_string()))?,
+        ),
+        None => None,
+    };
     let capped_limit = args.limit.map(|l| l.min(MAX_DOCTOR_LIMIT));
-    let report = crate::graph::doctor::run_doctor(&graph, capped_limit);
+    let report = crate::graph::doctor::run_doctor_scoped(&graph, capped_limit, ws_scope.as_ref());
     Ok(ToolOutcome::ok(report.to_markdown()))
 }

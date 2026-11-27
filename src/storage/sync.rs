@@ -1,12 +1,10 @@
 use crate::graph::SymbolGraph;
 use crate::model::Symbol;
 use crate::parser::parse_file;
-use crate::storage::db::{
-    is_corruption_error, is_readonly_or_io_error, unlink_db_artifacts, Database,
-};
+use crate::storage::db::{is_corruption_error, is_readonly_or_io_error, Database};
 use crate::workspace::walker::{
     discover_workspace, fnv1a_hash, hash_discovered_files, is_disallowed_workspace_root,
-    HashedFile, WorkspaceDiscovery, MAX_INDEX_FILE_BYTES,
+    is_io_not_found, read_bounded, HashedFile, WorkspaceDiscovery, MAX_INDEX_FILE_BYTES,
 };
 use crate::workspace::AliasSet;
 use anyhow::{bail, Result};
@@ -26,10 +24,12 @@ pub struct PreparedWorkspace {
 }
 
 /// Fast metadata-only fingerprint (`ino + size + mtime + ctime`) across all
-/// supported files and workspace manifests. On POSIX, kernel-maintained `ctime`
-/// changes on every write/rename/utime (cannot be spoofed by `cp -p` or `touch -r`),
-/// letting warm MCP requests skip full disk reads when nothing moved while still
-/// falling back to strict FNV-1a content-hash sync on any metadata delta.
+/// supported files and workspace manifests (including `tsconfig` `extends`/
+/// `references` targets, glob-discovered manifests, and `baseUrl` dirs).
+/// On POSIX, kernel-maintained `ctime` changes on every write/rename/utime,
+/// letting warm MCP requests skip source file reads when nothing moved.
+/// On non-Unix platforms (lacking `ino`/`ctime`), emits a fresh nonce to
+/// disable the fast path honestly and fall back to strict FNV-1a content hashes.
 pub fn quick_stat_fingerprint(root: &Path) -> Result<String> {
     if is_disallowed_workspace_root(root) {
         bail!(
@@ -37,47 +37,49 @@ pub fn quick_stat_fingerprint(root: &Path) -> Result<String> {
             root.display()
         );
     }
-    let discovery = discover_workspace(root);
-    let mut fp: u64 = 0xcbf29ce484222325;
-    let mix = |h: u64, bytes: &[u8]| fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3);
-    let mix_meta = |mut h: u64, path: &Path| -> u64 {
-        if let Ok(meta) = fs::metadata(path) {
-            h = mix(h, &meta.len().to_le_bytes());
-            if let Ok(m) = meta.modified() {
-                if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
-                    h = mix(h, &(d.as_nanos() as u64).to_le_bytes());
+
+    #[cfg(not(unix))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(1);
+        let n = NONCE.fetch_add(1, Ordering::Relaxed);
+        return Ok(format!("nonunix-{n:016x}"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let discovery = discover_workspace(root);
+        let aliases = AliasSet::collect_with_discovery(root, &discovery);
+        let mut fp: u64 = 0xcbf29ce484222325;
+        let mix = |h: u64, bytes: &[u8]| fnv1a_hash(bytes) ^ h.wrapping_mul(0x100000001b3);
+        let mix_meta = |mut h: u64, path: &Path| -> u64 {
+            if let Ok(meta) = fs::metadata(path) {
+                h = mix(h, &meta.len().to_le_bytes());
+                if let Ok(m) = meta.modified() {
+                    if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                        h = mix(h, &(d.as_nanos() as u64).to_le_bytes());
+                    }
                 }
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
                 h = mix(h, &meta.ino().to_le_bytes());
                 h = mix(h, &meta.ctime().to_le_bytes());
                 h = mix(h, &meta.ctime_nsec().to_le_bytes());
             }
+            h
+        };
+
+        fp = mix(fp, aliases.fingerprint().as_bytes());
+        for (rel, full, _, _) in &discovery.supported {
+            fp = mix(fp, rel.as_bytes());
+            fp = mix_meta(fp, full);
         }
-        h
-    };
-    for (rel, full, _, _) in &discovery.supported {
-        fp = mix(fp, rel.as_bytes());
-        fp = mix_meta(fp, full);
+        for extra in aliases.visited_configs() {
+            fp = mix(fp, extra.to_string_lossy().as_bytes());
+            fp = mix_meta(fp, extra);
+        }
+        Ok(format!("{fp:016x}"))
     }
-    for extra in discovery
-        .package_manifests
-        .iter()
-        .chain(discovery.tsconfigs.iter())
-        .chain(discovery.cargo_manifests.iter())
-        .chain(discovery.go_mods.iter())
-    {
-        fp = mix(fp, extra.to_string_lossy().as_bytes());
-        fp = mix_meta(fp, extra);
-    }
-    let pnpm = root.join("pnpm-workspace.yaml");
-    if pnpm.exists() {
-        fp = mix(fp, b"pnpm-workspace.yaml");
-        fp = mix_meta(fp, &pnpm);
-    }
-    Ok(format!("{fp:016x}"))
 }
 
 pub fn prepare_workspace(root: &Path) -> Result<PreparedWorkspace> {
@@ -132,11 +134,8 @@ enum ParseOutcome {
 fn parse_files_parallel(stale: &[&HashedFile], aliases: &AliasSet) -> Vec<ParseOutcome> {
     stale
         .par_iter()
-        .map(|h| match fs::read(&h.full) {
-            Ok(bytes) => {
-                if bytes.len() as u64 > MAX_INDEX_FILE_BYTES {
-                    return ParseOutcome::TransientErr;
-                }
+        .map(|h| match read_bounded(&h.full, MAX_INDEX_FILE_BYTES) {
+            Ok(Some(bytes)) => {
                 // Re-hash the exact bytes being parsed to eliminate read/hash TOCTOU.
                 let actual_hash = format!("{:x}", fnv1a_hash(&bytes));
                 let content = String::from_utf8_lossy(&bytes);
@@ -153,7 +152,8 @@ fn parse_files_parallel(stale: &[&HashedFile], aliases: &AliasSet) -> Vec<ParseO
                     symbols,
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ParseOutcome::Gone(h.rel.clone()),
+            Ok(None) => ParseOutcome::TransientErr,
+            Err(e) if is_io_not_found(&e) => ParseOutcome::Gone(h.rel.clone()),
             Err(_) => ParseOutcome::TransientErr,
         })
         .collect()
@@ -214,6 +214,24 @@ fn build_graph_with_meta(
     g
 }
 
+fn ensure_no_cache_symlinks(mimori_dir: &Path) -> Result<()> {
+    for name in [
+        "index.db",
+        "index.db-wal",
+        "index.db-shm",
+        "index.db-journal",
+        "index.db.lock",
+    ] {
+        let p = mimori_dir.join(name);
+        if let Ok(meta) = fs::symlink_metadata(&p) {
+            if meta.file_type().is_symlink() {
+                bail!("Refusing to use symlinked cache file '{}'", p.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_prepared_workspace(root: &Path, prep: &PreparedWorkspace) -> Result<SymbolGraph> {
     let mimori_dir = root.join(".mimori");
     if let Ok(meta) = fs::symlink_metadata(&mimori_dir) {
@@ -232,15 +250,8 @@ pub fn sync_prepared_workspace(root: &Path, prep: &PreparedWorkspace) -> Result<
         return Err(e.into());
     }
 
+    ensure_no_cache_symlinks(&mimori_dir)?;
     let db_path = mimori_dir.join("index.db");
-    if let Ok(meta) = fs::symlink_metadata(&db_path) {
-        if meta.file_type().is_symlink() {
-            bail!(
-                "Refusing to use symlinked cache database '{}'",
-                db_path.display()
-            );
-        }
-    }
 
     let db = match Database::open_or_rebuild(&db_path) {
         Ok(db) => db,
@@ -253,9 +264,18 @@ pub fn sync_prepared_workspace(root: &Path, prep: &PreparedWorkspace) -> Result<
     match run_db_sync(db, root, prep) {
         Ok(g) => Ok(g),
         Err(e) if is_corruption_error(&e) => {
-            unlink_db_artifacts(&db_path);
-            let fresh_db = Database::open_or_create(&db_path)?;
-            run_db_sync(fresh_db, root, prep)
+            let fresh_db = match Database::rebuild_if_corrupt(&db_path) {
+                Ok(db) => db,
+                Err(re) if is_readonly_or_io_error(&re) => {
+                    return Ok(parse_in_memory(root, prep));
+                }
+                Err(re) => return Err(re),
+            };
+            match run_db_sync(fresh_db, root, prep) {
+                Ok(g) => Ok(g),
+                Err(re) if is_readonly_or_io_error(&re) => Ok(parse_in_memory(root, prep)),
+                Err(re) => Err(re),
+            }
         }
         Err(e) if is_readonly_or_io_error(&e) => Ok(parse_in_memory(root, prep)),
         Err(e) => Err(e),
@@ -263,12 +283,12 @@ pub fn sync_prepared_workspace(root: &Path, prep: &PreparedWorkspace) -> Result<
 }
 
 fn run_db_sync(mut db: Database, root: &Path, prep: &PreparedWorkspace) -> Result<SymbolGraph> {
-    let stored_fp = db.alias_fingerprint()?;
+    let (stored_fp, snapshot_files) = db.read_sync_snapshot()?;
     let alias_changed = stored_fp.as_deref() != Some(prep.aliases.fingerprint());
     let db_files = if alias_changed {
         std::collections::HashMap::new()
     } else {
-        db.get_file_records()?
+        snapshot_files
     };
 
     let mut disk_paths: HashSet<&str> =
@@ -284,7 +304,7 @@ fn run_db_sync(mut db: Database, root: &Path, prep: &PreparedWorkspace) -> Resul
             stale.push(h);
         } else {
             let cached = db_files.get(&h.rel);
-            if !matches!(cached, Some((_, _, db_hash)) if *db_hash == h.hash) {
+            if !matches!(cached, Some(db_hash) if *db_hash == h.hash) {
                 stale.push(h);
             }
         }
@@ -367,6 +387,40 @@ fn preview(paths: &[String]) -> String {
     )
 }
 
+fn remove_cache_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            bail!(
+                "Refusing to clean symlinked cache file '{}'",
+                path.display()
+            );
+        }
+        Ok(m) if m.is_file() => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn remove_cache_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            bail!(
+                "Refusing to clean symlinked cache directory '{}'",
+                path.display()
+            );
+        }
+        Ok(m) if m.is_dir() => match fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        },
+        _ => Ok(()),
+    }
+}
+
 pub fn clean_cache(root: &Path, all: bool) -> Result<()> {
     if is_disallowed_workspace_root(root) {
         bail!(
@@ -391,37 +445,19 @@ pub fn clean_cache(root: &Path, all: bool) -> Result<()> {
         return Ok(());
     }
 
-    for f in ["index.db", "index.db-wal", "index.db-shm", "cache.bin"] {
-        let p = mimori_dir.join(f);
-        match fs::symlink_metadata(&p) {
-            Ok(m) if m.file_type().is_symlink() => {
-                bail!("Refusing to clean symlinked cache file '{}'", p.display());
-            }
-            Ok(m) if m.is_file() => match fs::remove_file(&p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            },
-            _ => {}
-        }
+    for f in [
+        "index.db",
+        "index.db-wal",
+        "index.db-shm",
+        "index.db-journal",
+        "index.db.lock",
+        "cache.bin",
+    ] {
+        remove_cache_file(&mimori_dir.join(f))?;
     }
 
     if all {
-        let cache_dir = mimori_dir.join(".cache");
-        match fs::symlink_metadata(&cache_dir) {
-            Ok(m) if m.file_type().is_symlink() => {
-                bail!(
-                    "Refusing to clean symlinked cache directory '{}'",
-                    cache_dir.display()
-                );
-            }
-            Ok(m) if m.is_dir() => match fs::remove_dir_all(&cache_dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            },
-            _ => {}
-        }
+        remove_cache_dir(&mimori_dir.join(".cache"))?;
     }
 
     Ok(())

@@ -1,10 +1,11 @@
 use crate::model::{symbol_flags, Symbol, SymbolKind};
 use crate::parser::common::{
-    extract_signature_ast, is_valid_ident, node_text, ImportSet, RefCollector, MAX_AST_DEPTH,
+    build_symbol, extract_signature_ast, is_valid_ident, node_text, ImportSet, ParseDiagnostics,
+    RefCollector, ScopeStack, MAX_AST_DEPTH,
 };
 use crate::workspace::AliasSet;
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};
@@ -30,6 +31,20 @@ struct TsWalkCtx<'a> {
     file_is_test: bool,
     aliases: &'a AliasSet,
     external_set: &'a HashSet<String>,
+    internal_namespaces: &'a HashMap<String, String>,
+    post_exported: &'a HashSet<String>,
+    depth_truncated: Cell<bool>,
+}
+
+impl<'a> TsWalkCtx<'a> {
+    fn check_depth(&self, depth: usize) -> bool {
+        if depth >= MAX_AST_DEPTH {
+            self.depth_truncated.set(true);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub fn parse_typescript(
@@ -38,6 +53,15 @@ pub fn parse_typescript(
     is_tsx: bool,
     aliases: &AliasSet,
 ) -> Result<Vec<Symbol>> {
+    Ok(parse_typescript_with_diagnostics(file, content, is_tsx, aliases)?.0)
+}
+
+pub fn parse_typescript_with_diagnostics(
+    file: &str,
+    content: &str,
+    is_tsx: bool,
+    aliases: &AliasSet,
+) -> Result<(Vec<Symbol>, ParseDiagnostics)> {
     let tree = if is_tsx {
         TSX_PARSER.with(|p| p.borrow_mut().parse(content, None))
     } else {
@@ -46,8 +70,13 @@ pub fn parse_typescript(
     .ok_or_else(|| anyhow::anyhow!("Failed to parse TypeScript source"))?;
 
     let root = tree.root_node();
-    let external_list = collect_external_imports(root, content, aliases);
+    let depth_truncated = Cell::new(false);
+    let external_list = collect_external_imports(root, content, aliases, &depth_truncated);
     let external_set: HashSet<String> = external_list.iter().cloned().collect();
+    let (import_aliases, internal_namespaces) =
+        collect_local_imports(root, content, aliases, &depth_truncated);
+    let post_exported = collect_post_exports(root, content);
+
     let file_is_test = file.starts_with("tests/")
         || file.contains("/tests/")
         || file.contains("/__tests__/")
@@ -60,12 +89,14 @@ pub fn parse_typescript(
         file_is_test,
         aliases,
         external_set: &external_set,
+        internal_namespaces: &internal_namespaces,
+        post_exported: &post_exported,
+        depth_truncated: Cell::new(depth_truncated.get()),
     };
 
     let mut symbols = Vec::new();
-    walk_ts_node(root, &ctx, None, &mut symbols, 0);
+    walk_ts_node(root, &ctx, None, false, &[], &mut symbols, 0);
 
-    let import_aliases = collect_local_import_aliases(root, content, aliases);
     super::apply_import_aliases(&mut symbols, &import_aliases);
 
     let external_imports: Arc<[String]> = external_list.into();
@@ -73,7 +104,11 @@ pub fn parse_typescript(
         s.external_imports = Arc::clone(&external_imports);
     }
 
-    Ok(symbols)
+    let diag = ParseDiagnostics {
+        has_error: root.has_error(),
+        depth_truncated: ctx.depth_truncated.get(),
+    };
+    Ok((symbols, diag))
 }
 
 fn unwrap_ts_expr(mut node: Node) -> Node {
@@ -118,43 +153,126 @@ fn is_top_level_declarator(declarator: Node) -> bool {
             && gp.parent().is_some_and(|ggp| ggp.kind() == "program"))
 }
 
-fn ts_flags(node: Node, file_is_test: bool, is_class_member: bool, content: &str) -> u8 {
-    let mut flags = 0u8;
-    if file_is_test {
-        flags |= symbol_flags::IS_TEST;
+fn has_own_or_export_decorator(node: Node) -> bool {
+    let mut cursor = node.walk();
+    if node.children(&mut cursor).any(|c| c.kind() == "decorator") {
+        return true;
     }
-    if is_exported_ts_node(node) {
-        flags |= symbol_flags::IS_PUBLIC;
-    } else if is_class_member {
-        let mut is_priv = false;
-        let mut cursor = node.walk();
-        for c in node.children(&mut cursor) {
-            if c.kind() == "accessibility_modifier" {
-                let m = node_text(c, content).trim();
-                if m == "private" {
-                    is_priv = true;
-                }
+    if let Some(parent) = node.parent().filter(|p| p.kind() == "export_statement") {
+        let mut pcur = parent.walk();
+        if parent.children(&mut pcur).any(|c| c.kind() == "decorator") {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_private_or_protected_member(node: Node, content: &str) -> bool {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if name_node.kind() == "private_property_identifier"
+            || node_text(name_node, content).trim().starts_with('#')
+        {
+            return true;
+        }
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if c.kind() == "accessibility_modifier" {
+            let m = node_text(c, content).trim();
+            if m == "private" || m == "protected" {
+                return true;
             }
         }
-        if !is_priv {
-            flags |= symbol_flags::IS_PUBLIC;
-        }
+    }
+    false
+}
+
+fn ts_top_flags(node: Node, name: &str, ctx: &TsWalkCtx<'_>, has_decorator: bool) -> u8 {
+    let mut flags = 0u8;
+    if ctx.file_is_test {
+        flags |= symbol_flags::IS_TEST;
+    }
+    if is_exported_ts_node(node) || ctx.post_exported.contains(name) {
+        flags |= symbol_flags::IS_PUBLIC;
+    }
+    if has_decorator || has_own_or_export_decorator(node) {
+        flags |= symbol_flags::IS_ATTR_ENTRY;
     }
     flags
 }
 
-fn walk_ts_node(
+fn ts_member_flags(
     node: Node,
+    parent_exported: bool,
+    has_decorator: bool,
     ctx: &TsWalkCtx<'_>,
-    parent_class: Option<&str>,
+) -> u8 {
+    let mut flags = 0u8;
+    if ctx.file_is_test {
+        flags |= symbol_flags::IS_TEST;
+    }
+    if parent_exported && !is_private_or_protected_member(node, ctx.content) {
+        flags |= symbol_flags::IS_PUBLIC;
+    }
+    if has_decorator || has_own_or_export_decorator(node) {
+        flags |= symbol_flags::IS_ATTR_ENTRY;
+    }
+    flags
+}
+
+fn collect_post_exports(root: Node, content: &str) -> HashSet<String> {
+    let mut exported = HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "export_statement" || child.child_by_field_name("source").is_some() {
+            continue;
+        }
+        let mut ccur = child.walk();
+        for item in child.children(&mut ccur) {
+            match item.kind() {
+                "export_clause" => {
+                    let mut ecur = item.walk();
+                    for spec in item.children(&mut ecur) {
+                        if spec.kind() == "export_specifier" {
+                            if let Some(name_node) = spec.child_by_field_name("name") {
+                                let name = node_text(name_node, content).trim();
+                                if is_valid_ident(name) {
+                                    exported.insert(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                "identifier" => {
+                    // `export default foo;`
+                    let name = node_text(item, content).trim();
+                    if is_valid_ident(name) {
+                        exported.insert(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    exported
+}
+
+fn walk_ts_node<'a>(
+    node: Node<'a>,
+    ctx: &TsWalkCtx<'a>,
+    parent_class: Option<&'a str>,
+    parent_exported: bool,
+    pending_decorators: &[Node<'a>],
     symbols: &mut Vec<Symbol>,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH {
+    if ctx.check_depth(depth) {
         return;
     }
     let content = ctx.content;
     let kind = node.kind();
+    let has_dec = !pending_decorators.is_empty();
+
     match kind {
         "export_statement" if node.child_by_field_name("source").is_some() => {
             extract_reexport_symbols(node, ctx, symbols);
@@ -163,100 +281,78 @@ fn walk_ts_node(
         "function_declaration" | "generator_function_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
-                let symbol = create_symbol(
+                let flags = ts_top_flags(node, name, ctx, has_dec);
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     name.to_string(),
                     SymbolKind::Function,
                     None,
-                    ts_flags(node, ctx.file_is_test, false, content),
-                );
-                symbols.push(symbol);
+                    flags,
+                    pending_decorators,
+                ));
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
-                let symbol = create_symbol(
+                let flags = ts_top_flags(node, name, ctx, has_dec);
+                let class_exported = (flags & symbol_flags::IS_PUBLIC) != 0;
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     name.to_string(),
                     SymbolKind::Class,
                     Some(name),
-                    ts_flags(node, ctx.file_is_test, false, content),
-                );
-                symbols.push(symbol);
-
+                    flags,
+                    pending_decorators,
+                ));
                 if let Some(body) = node.child_by_field_name("body") {
-                    let mut cursor = body.walk();
-                    for child in body.children(&mut cursor) {
-                        walk_ts_node(child, ctx, Some(name), symbols, depth + 1);
-                    }
+                    walk_ts_children(body, ctx, Some(name), class_exported, symbols, depth + 1);
                 }
                 return;
             }
         }
-        "interface_declaration" => {
+        "interface_declaration" | "type_alias_declaration" | "enum_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
-                let symbol = create_symbol(
+                let sym_kind = match kind {
+                    "interface_declaration" => SymbolKind::Interface,
+                    "type_alias_declaration" => SymbolKind::TypeAlias,
+                    _ => SymbolKind::Enum,
+                };
+                let flags = ts_top_flags(node, name, ctx, has_dec);
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     name.to_string(),
-                    SymbolKind::Interface,
+                    sym_kind,
                     None,
-                    ts_flags(node, ctx.file_is_test, false, content),
-                );
-                symbols.push(symbol);
-            }
-        }
-        "type_alias_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let symbol = create_symbol(
-                    node,
-                    ctx,
-                    name.to_string(),
-                    SymbolKind::TypeAlias,
-                    None,
-                    ts_flags(node, ctx.file_is_test, false, content),
-                );
-                symbols.push(symbol);
-            }
-        }
-        "enum_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let symbol = create_symbol(
-                    node,
-                    ctx,
-                    name.to_string(),
-                    SymbolKind::Enum,
-                    None,
-                    ts_flags(node, ctx.file_is_test, false, content),
-                );
-                symbols.push(symbol);
+                    flags,
+                    pending_decorators,
+                ));
             }
         }
         "method_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
                 let full_name = match parent_class {
-                    Some(pc) => format!("{}::{}", pc, name),
+                    Some(pc) => format!("{pc}::{name}"),
                     None => name.to_string(),
                 };
-                let symbol = create_symbol(
+                let flags = ts_member_flags(node, parent_exported, has_dec, ctx);
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     full_name,
                     SymbolKind::Method,
                     parent_class,
-                    ts_flags(node, ctx.file_is_test, parent_class.is_some(), content),
-                );
-                symbols.push(symbol);
+                    flags,
+                    pending_decorators,
+                ));
                 if name == "constructor" {
                     if let Some(pc) = parent_class {
-                        extract_ctor_param_fields(node, ctx, pc, symbols);
+                        extract_ctor_param_fields(node, ctx, pc, parent_exported, symbols);
                     }
                 }
             }
@@ -271,16 +367,17 @@ fn walk_ts_node(
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let fname = node_text(name_node, content).trim();
                     if !fname.is_empty() {
-                        let full_name = format!("{}::{}", pc, fname);
-                        let symbol = create_symbol(
+                        let full_name = format!("{pc}::{fname}");
+                        let flags = ts_member_flags(node, parent_exported, has_dec, ctx);
+                        symbols.push(create_symbol(
                             node,
                             ctx,
                             full_name,
                             SymbolKind::Field,
                             Some(pc),
-                            ts_flags(node, ctx.file_is_test, true, content),
-                        );
-                        symbols.push(symbol);
+                            flags,
+                            pending_decorators,
+                        ));
                     }
                 }
             }
@@ -297,10 +394,55 @@ fn walk_ts_node(
     } else {
         parent_class
     };
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_ts_node(child, ctx, next_parent, symbols, depth + 1);
+    let next_exported = if next_parent.is_some() {
+        parent_exported
+    } else {
+        false
+    };
+    walk_ts_children(node, ctx, next_parent, next_exported, symbols, depth + 1);
+}
+
+fn walk_ts_children<'a>(
+    parent: Node<'a>,
+    ctx: &TsWalkCtx<'a>,
+    parent_class: Option<&'a str>,
+    parent_exported: bool,
+    symbols: &mut Vec<Symbol>,
+    depth: usize,
+) {
+    if ctx.check_depth(depth) {
+        return;
     }
+    let mut pending_decorators: Vec<Node<'a>> = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        match child.kind() {
+            "decorator" => {
+                pending_decorators.push(child);
+            }
+            "comment" => {}
+            _ => {
+                walk_ts_node(
+                    child,
+                    ctx,
+                    parent_class,
+                    parent_exported,
+                    &pending_decorators,
+                    symbols,
+                    depth + 1,
+                );
+                pending_decorators.clear();
+            }
+        }
+    }
+}
+
+fn has_template_substitution(node: Node) -> bool {
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|c| c.kind() == "template_substitution");
+    found
 }
 
 fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec<Symbol>) -> bool {
@@ -313,28 +455,36 @@ fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec
     };
 
     let top_level = is_top_level_declarator(node);
-    let flags = ts_flags(node, ctx.file_is_test, false, content);
 
     if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
         if top_level {
             let mut names = Vec::new();
-            extract_pattern_names(name_node, content, &mut names, 0);
+            extract_pattern_names(name_node, content, &mut names, &ctx.depth_truncated, 0);
             for pname in names {
-                let symbol = create_symbol(
+                let flags = ts_top_flags(node, pname, ctx, false);
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     pname.to_string(),
                     SymbolKind::Variable,
                     None,
                     flags,
-                );
-                symbols.push(symbol);
+                    &[],
+                ));
             }
         }
         return true;
     }
 
     let name = node_text(name_node, content).trim();
+    let flags = if top_level {
+        ts_top_flags(node, name, ctx, false)
+    } else if ctx.file_is_test {
+        symbol_flags::IS_TEST
+    } else {
+        0
+    };
+    let is_exported = (flags & symbol_flags::IS_PUBLIC) != 0;
     let value_node = unwrap_ts_expr(raw_val_node);
     let val_kind = value_node.kind();
 
@@ -343,15 +493,15 @@ fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec
         "arrow_function" | "function" | "function_expression" | "generator_function"
     ) && top_level
     {
-        let symbol = create_symbol(
+        symbols.push(create_symbol(
             node,
             ctx,
             name.to_string(),
             SymbolKind::Function,
             None,
             flags,
-        );
-        symbols.push(symbol);
+            &[],
+        ));
     } else if val_kind == "object" && top_level {
         let sym_kind = if is_top_level_const(node, content) {
             SymbolKind::Constant
@@ -359,9 +509,16 @@ fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec
             SymbolKind::Variable
         };
         let mut members = Vec::new();
-        let mut skip_ids = Vec::new();
-        extract_object_literal_members(value_node, ctx, name, &mut members, &mut skip_ids);
-        let symbol = create_symbol_skipping(
+        let mut skip_ids = HashSet::new();
+        extract_object_literal_members(
+            value_node,
+            ctx,
+            name,
+            is_exported,
+            &mut members,
+            &mut skip_ids,
+        );
+        symbols.push(create_symbol_skipping(
             node,
             ctx,
             name.to_string(),
@@ -369,14 +526,14 @@ fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec
             None,
             flags,
             &skip_ids,
-        );
-        symbols.push(symbol);
+            &[],
+        ));
         symbols.extend(members);
         return true;
     } else if val_kind == "call_expression" && top_level {
         if let Some(args_node) = value_node.child_by_field_name("arguments") {
             let mut members = Vec::new();
-            let mut skip_ids = Vec::new();
+            let mut skip_ids = HashSet::new();
             let mut arg_cursor = args_node.walk();
             for arg in args_node.children(&mut arg_cursor) {
                 let unwrapped_arg = unwrap_ts_expr(arg);
@@ -385,12 +542,13 @@ fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec
                         unwrapped_arg,
                         ctx,
                         name,
+                        is_exported,
                         &mut members,
                         &mut skip_ids,
                     );
                 }
             }
-            let symbol = create_symbol_skipping(
+            symbols.push(create_symbol_skipping(
                 node,
                 ctx,
                 name.to_string(),
@@ -398,41 +556,49 @@ fn handle_variable_declarator(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec
                 None,
                 flags,
                 &skip_ids,
-            );
-            symbols.push(symbol);
+                &[],
+            ));
             symbols.extend(members);
             return true;
         }
-        let symbol = create_symbol(
+        symbols.push(create_symbol(
             node,
             ctx,
             name.to_string(),
             SymbolKind::Variable,
             None,
             flags,
-        );
-        symbols.push(symbol);
-    } else if val_kind == "template_string" {
-        // Preserved coarse dataflow node for template interpolation tracking (`up`/`uses`).
-        let symbol = create_symbol(
+            &[],
+        ));
+    } else if val_kind == "template_string" && (top_level || has_template_substitution(value_node))
+    {
+        // Emit top-level template bindings or function-local interpolated templates
+        // (`const cmd = `... ${x} ...``) for `up`/`uses` dataflow without leaking
+        // plain static local backtick strings (`const msg = `hi``).
+        let sym_kind = if top_level && is_top_level_const(node, content) {
+            SymbolKind::Constant
+        } else {
+            SymbolKind::Variable
+        };
+        symbols.push(create_symbol(
             node,
             ctx,
             name.to_string(),
-            SymbolKind::Variable,
+            sym_kind,
             None,
             flags,
-        );
-        symbols.push(symbol);
+            &[],
+        ));
     } else if is_top_level_const(node, content) {
-        let symbol = create_symbol(
+        symbols.push(create_symbol(
             node,
             ctx,
             name.to_string(),
             SymbolKind::Constant,
             None,
             flags,
-        );
-        symbols.push(symbol);
+            &[],
+        ));
     }
     false
 }
@@ -447,7 +613,7 @@ fn extract_reexport_symbols(node: Node, ctx: &TsWalkCtx<'_>, symbols: &mut Vec<S
     if !is_local {
         return;
     }
-    let hint = super::spec_to_module_hint(spec);
+    let hint = super::spec_to_module_hint(spec, ctx.aliases);
     let stmt_is_type = node_text(node, content)
         .trim_start()
         .starts_with("export type ");
@@ -462,60 +628,94 @@ fn collect_reexport_specifiers(
     symbols: &mut Vec<Symbol>,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH {
+    if ctx.check_depth(depth) {
         return;
     }
     let content = ctx.content;
-    if node.kind() == "export_specifier" {
-        if let (Some(orig_node), Some(alias_node)) = (
-            node.child_by_field_name("name"),
-            node.child_by_field_name("alias"),
-        ) {
-            let orig = node_text(orig_node, content).trim();
-            let alias = node_text(alias_node, content).trim();
-            if !orig.is_empty() && !alias.is_empty() && orig != alias {
-                let is_type =
-                    stmt_is_type || node_text(node, content).trim_start().starts_with("type ");
-                let kind = if is_type {
-                    SymbolKind::TypeAlias
-                } else {
-                    SymbolKind::Function
-                };
-                let start_pos = node.start_position();
-                let end_pos = node.end_position();
-                let mut calls = Vec::new();
-                let mut mentions = Vec::new();
-                let mut call_counts = BTreeMap::new();
-                if is_type {
-                    mentions.push(orig.to_string());
-                } else {
-                    let target = super::format_hinted_call(hint, orig);
-                    call_counts.insert(target.clone(), 1);
-                    calls.push(target);
+    match node.kind() {
+        "export_specifier" => {
+            if let Some(orig_node) = node.child_by_field_name("name") {
+                let orig = node_text(orig_node, content).trim();
+                let alias = node
+                    .child_by_field_name("alias")
+                    .map(|a| node_text(a, content).trim())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or(orig);
+                if !orig.is_empty() && !alias.is_empty() {
+                    let is_type =
+                        stmt_is_type || node_text(node, content).trim_start().starts_with("type ");
+                    let kind = if is_type {
+                        SymbolKind::TypeAlias
+                    } else {
+                        SymbolKind::Function
+                    };
+                    let mut calls = Vec::new();
+                    let mut mentions = Vec::new();
+                    let mut call_counts = BTreeMap::new();
+                    if is_type {
+                        mentions.push(orig.to_string());
+                    } else {
+                        let target = super::format_hinted_call(hint, orig);
+                        call_counts.insert(target.clone(), 1);
+                        calls.push(target);
+                    }
+                    let mut flags = symbol_flags::IS_PUBLIC;
+                    if ctx.file_is_test {
+                        flags |= symbol_flags::IS_TEST;
+                    }
+                    let sig = if orig == alias {
+                        format!("export {{ {orig} }}")
+                    } else {
+                        format!("export {{ {orig} as {alias} }}")
+                    };
+                    let start_pos = node.start_position();
+                    let end_pos = node.end_position();
+                    symbols.push(Symbol {
+                        name: alias.to_string(),
+                        kind,
+                        file: ctx.file.to_string(),
+                        start_line: start_pos.row + 1,
+                        end_line: end_pos.row + 1,
+                        signature: sig,
+                        body: String::new(),
+                        centrality: 0.0,
+                        calls,
+                        mentions,
+                        call_counts,
+                        member_calls: Vec::new(),
+                        external_imports: crate::model::symbol::empty_external_imports(),
+                        flags,
+                    });
                 }
-                let mut flags = symbol_flags::IS_PUBLIC;
-                if ctx.file_is_test {
-                    flags |= symbol_flags::IS_TEST;
-                }
-                symbols.push(Symbol {
-                    name: alias.to_string(),
-                    kind,
-                    file: ctx.file.to_string(),
-                    start_line: start_pos.row + 1,
-                    end_line: end_pos.row + 1,
-                    signature: format!("export {{ {orig} as {alias} }}"),
-                    body: String::new(),
-                    centrality: 0.0,
-                    calls,
-                    mentions,
-                    call_counts,
-                    member_calls: Vec::new(),
-                    external_imports: crate::model::symbol::empty_external_imports(),
-                    flags,
-                });
             }
+            return;
         }
-        return;
+        "namespace_export" => {
+            if let Some(id) = node.named_child(0) {
+                let alias = node_text(id, content).trim();
+                if is_valid_ident(alias) {
+                    let mut flags = symbol_flags::IS_PUBLIC;
+                    if ctx.file_is_test {
+                        flags |= symbol_flags::IS_TEST;
+                    }
+                    let mut refs = RefCollector::default();
+                    if !hint.is_empty() {
+                        refs.push_mention(hint);
+                    }
+                    symbols.push(build_symbol(
+                        node,
+                        ctx.file,
+                        alias.to_string(),
+                        SymbolKind::Module,
+                        format!("export * as {alias}"),
+                        refs,
+                        flags,
+                    ));
+                }
+            }
+            return;
+        }
+        _ => {}
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
@@ -527,6 +727,7 @@ fn extract_ctor_param_fields(
     ctor_node: Node,
     ctx: &TsWalkCtx<'_>,
     parent_class: &str,
+    parent_exported: bool,
     symbols: &mut Vec<Symbol>,
 ) {
     let content = ctx.content;
@@ -553,16 +754,17 @@ fn extract_ctor_param_fields(
         if let Some(pat) = param.child_by_field_name("pattern") {
             let fname = node_text(pat, content).trim();
             if !fname.is_empty() {
-                let full_name = format!("{}::{}", parent_class, fname);
-                let symbol = create_symbol(
+                let full_name = format!("{parent_class}::{fname}");
+                let flags = ts_member_flags(param, parent_exported, false, ctx);
+                symbols.push(create_symbol(
                     param,
                     ctx,
                     full_name,
                     SymbolKind::Field,
                     Some(parent_class),
-                    ts_flags(param, ctx.file_is_test, true, content),
-                );
-                symbols.push(symbol);
+                    flags,
+                    &[],
+                ));
             }
         }
     }
@@ -581,94 +783,139 @@ fn is_exported_ts_node(node: Node) -> bool {
             .is_some_and(|gp| gp.kind() == "export_statement"))
 }
 
-fn collect_ts_local_types(node: Node, content: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    collect_ts_typed_bindings(node, content, &mut map, 0);
-    map
+fn bind_ts_function_params(fn_node: Node, content: &str, scopes: &mut ScopeStack) {
+    if let Some(params) = fn_node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for p in params.children(&mut cursor) {
+            if matches!(p.kind(), "required_parameter" | "optional_parameter") {
+                if let Some(pat) = p.child_by_field_name("pattern") {
+                    let var = node_text(pat, content).trim();
+                    if is_valid_ident(var) {
+                        if let Some(ty) = p
+                            .child_by_field_name("type")
+                            .and_then(|t| extract_ts_type_ident(t, content))
+                        {
+                            scopes.insert(var.to_string(), ty);
+                        } else {
+                            scopes.shadow(var.to_string());
+                        }
+                    }
+                }
+            } else if p.kind() == "identifier" {
+                let var = node_text(p, content).trim();
+                if is_valid_ident(var) {
+                    scopes.shadow(var.to_string());
+                }
+            }
+        }
+    } else if let Some(single) = fn_node.child_by_field_name("parameter") {
+        let var = node_text(single, content).trim();
+        if is_valid_ident(var) {
+            scopes.shadow(var.to_string());
+        }
+    }
 }
 
-fn collect_ts_typed_bindings(
-    node: Node,
-    content: &str,
-    out: &mut HashMap<String, String>,
-    depth: usize,
-) {
-    if depth >= MAX_AST_DEPTH {
-        return;
-    }
-    match node.kind() {
-        "required_parameter" | "optional_parameter" => {
-            if let (Some(pat), Some(ty_ann)) = (
-                node.child_by_field_name("pattern"),
-                node.child_by_field_name("type"),
-            ) {
-                let var = node_text(pat, content).trim();
-                if let Some(ty) = extract_ts_type_ident(ty_ann, content) {
-                    if is_valid_ident(var) {
-                        out.insert(var.to_string(), ty);
-                    }
+fn init_ts_symbol_scope(node: Node, content: &str) -> ScopeStack {
+    let mut scopes = ScopeStack::new();
+    let fn_node = if node.kind() == "variable_declarator" {
+        node.child_by_field_name("value")
+            .map(unwrap_ts_expr)
+            .unwrap_or(node)
+    } else {
+        node
+    };
+    bind_ts_function_params(fn_node, content, &mut scopes);
+    scopes
+}
+
+fn infer_ts_var_type(declarator: Node, content: &str) -> Option<String> {
+    declarator
+        .child_by_field_name("type")
+        .and_then(|t| extract_ts_type_ident(t, content))
+        .or_else(|| {
+            declarator.child_by_field_name("value").and_then(|v| {
+                let u = unwrap_ts_expr(v);
+                if u.kind() == "new_expression" {
+                    u.child_by_field_name("constructor").and_then(|c| {
+                        let t = node_text(c, content)
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        (is_valid_ident(t)
+                            && t.starts_with(|ch: char| ch.is_ascii_uppercase())
+                            && !is_ts_builtin_type(t))
+                        .then(|| t.to_string())
+                    })
+                } else {
+                    None
                 }
-            }
-        }
-        "variable_declarator" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let var = node_text(name_node, content).trim();
-                if is_valid_ident(var) {
-                    let ty = node
-                        .child_by_field_name("type")
-                        .and_then(|t| extract_ts_type_ident(t, content))
-                        .or_else(|| {
-                            node.child_by_field_name("value").and_then(|v| {
-                                let u = unwrap_ts_expr(v);
-                                if u.kind() == "new_expression" {
-                                    u.child_by_field_name("constructor").and_then(|c| {
-                                        let t = node_text(c, content)
-                                            .rsplit('.')
-                                            .next()
-                                            .unwrap_or("")
-                                            .trim();
-                                        (is_valid_ident(t)
-                                            && t.starts_with(|ch: char| ch.is_ascii_uppercase()))
-                                        .then(|| t.to_string())
-                                    })
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                    if let Some(ty_name) = ty {
-                        out.insert(var.to_string(), ty_name);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for c in node.children(&mut cursor) {
-        if !matches!(
-            c.kind(),
-            "class_declaration"
-                | "abstract_class_declaration"
-                | "function_declaration"
-                | "method_definition"
-        ) {
-            collect_ts_typed_bindings(c, content, out, depth + 1);
-        }
-    }
+            })
+        })
+}
+
+fn is_ts_builtin_type(t: &str) -> bool {
+    matches!(
+        t,
+        "Array"
+            | "Promise"
+            | "Record"
+            | "Map"
+            | "Set"
+            | "WeakMap"
+            | "WeakSet"
+            | "Error"
+            | "Object"
+            | "Function"
+            | "String"
+            | "Number"
+            | "Boolean"
+            | "Date"
+            | "RegExp"
+            | "Symbol"
+            | "BigInt"
+            | "Math"
+            | "JSON"
+            | "Reflect"
+            | "Proxy"
+            | "Intl"
+            | "Buffer"
+            | "URL"
+            | "Uint8Array"
+    )
 }
 
 fn extract_ts_type_ident(node: Node, content: &str) -> Option<String> {
     let mut cur = node;
-    for _ in 0..6 {
+    for _ in 0..8 {
         match cur.kind() {
-            "type_annotation" => cur = cur.named_child(0)?,
+            "type_annotation" | "parenthesized_type" => cur = cur.named_child(0)?,
             "generic_type" => cur = cur.child_by_field_name("name")?,
+            "union_type" => {
+                // Unwrap `Foo | null` / `Foo | undefined` / `Foo | null | undefined`.
+                let mut cursor = cur.walk();
+                let mut found: Option<String> = None;
+                for c in cur.named_children(&mut cursor) {
+                    let txt = node_text(c, content).trim();
+                    if matches!(txt, "null" | "undefined" | "void")
+                        || matches!(c.kind(), "null" | "undefined")
+                    {
+                        continue;
+                    }
+                    let ty = extract_ts_type_ident(c, content)?;
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(ty);
+                }
+                return found;
+            }
             "type_identifier" => {
                 let t = node_text(cur, content).trim();
                 return (is_valid_ident(t)
                     && t.starts_with(|c: char| c.is_ascii_uppercase())
-                    && !matches!(t, "Array" | "Promise" | "Record" | "Map" | "Set" | "Error"))
+                    && !is_ts_builtin_type(t))
                 .then(|| t.to_string());
             }
             _ => return None,
@@ -684,10 +931,22 @@ fn create_symbol(
     kind: SymbolKind,
     enclosing_class: Option<&str>,
     flags: u8,
+    decorators: &[Node],
 ) -> Symbol {
-    create_symbol_skipping(node, ctx, name, kind, enclosing_class, flags, &[])
+    let empty = HashSet::new();
+    create_symbol_skipping(
+        node,
+        ctx,
+        name,
+        kind,
+        enclosing_class,
+        flags,
+        &empty,
+        decorators,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_symbol_skipping(
     node: Node,
     ctx: &TsWalkCtx<'_>,
@@ -695,11 +954,10 @@ fn create_symbol_skipping(
     kind: SymbolKind,
     enclosing_class: Option<&str>,
     flags: u8,
-    skip_ids: &[usize],
+    skip_ids: &HashSet<usize>,
+    decorators: &[Node],
 ) -> Symbol {
     let content = ctx.content;
-    let start_pos = node.start_position();
-    let end_pos = node.end_position();
     let raw_body = node_text(node, content);
     let first_line = raw_body.lines().next().unwrap_or("").trim();
     let raw_sig = match kind {
@@ -719,40 +977,54 @@ fn create_symbol_skipping(
         raw_sig
     };
 
-    let local_types = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-        collect_ts_local_types(node, content)
+    let mut scopes = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        init_ts_symbol_scope(node, content)
     } else {
-        HashMap::new()
+        ScopeStack::new()
     };
 
     let mut refs = RefCollector::default();
+    let root_fn_id = if node.kind() == "variable_declarator" {
+        node.child_by_field_name("value")
+            .map(unwrap_ts_expr)
+            .filter(|v| {
+                matches!(
+                    v.kind(),
+                    "arrow_function" | "function" | "function_expression" | "generator_function"
+                )
+            })
+            .map(|v| v.id())
+    } else {
+        None
+    };
+
+    for &dec in decorators {
+        visit_ts_ref(
+            dec,
+            ctx,
+            enclosing_class,
+            &mut scopes,
+            false,
+            skip_ids,
+            root_fn_id,
+            &mut refs,
+            0,
+        );
+    }
+
     collect_references(
         node,
         ctx,
         enclosing_class,
-        &local_types,
+        &mut scopes,
         false,
         skip_ids,
+        root_fn_id,
         &mut refs,
         0,
     );
 
-    Symbol {
-        name,
-        kind,
-        file: ctx.file.to_string(),
-        start_line: start_pos.row + 1,
-        end_line: end_pos.row + 1,
-        signature,
-        body: String::new(),
-        centrality: 0.0,
-        calls: refs.calls,
-        mentions: refs.mentions,
-        call_counts: refs.counts,
-        member_calls: refs.member_calls,
-        external_imports: crate::model::symbol::empty_external_imports(),
-        flags,
-    }
+    build_symbol(node, ctx.file, name, kind, signature, refs, flags)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,13 +1032,14 @@ fn collect_references(
     node: Node,
     ctx: &TsWalkCtx<'_>,
     enclosing_class: Option<&str>,
-    local_types: &HashMap<String, String>,
+    scopes: &mut ScopeStack,
     in_value_pos: bool,
-    skip_ids: &[usize],
+    skip_ids: &HashSet<usize>,
+    root_fn_id: Option<usize>,
     refs: &mut RefCollector,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH {
+    if ctx.check_depth(depth) {
         return;
     }
     let mut cursor = node.walk();
@@ -775,9 +1048,10 @@ fn collect_references(
             child,
             ctx,
             enclosing_class,
-            local_types,
+            scopes,
             in_value_pos,
             skip_ids,
+            root_fn_id,
             refs,
             depth + 1,
         );
@@ -789,13 +1063,14 @@ fn visit_ts_ref(
     node: Node,
     ctx: &TsWalkCtx<'_>,
     enclosing_class: Option<&str>,
-    local_types: &HashMap<String, String>,
+    scopes: &mut ScopeStack,
     in_value_pos: bool,
-    skip_ids: &[usize],
+    skip_ids: &HashSet<usize>,
+    root_fn_id: Option<usize>,
     refs: &mut RefCollector,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH || skip_ids.contains(&node.id()) {
+    if ctx.check_depth(depth) || skip_ids.contains(&node.id()) {
         return;
     }
     let content = ctx.content;
@@ -813,46 +1088,87 @@ fn visit_ts_ref(
     }
 
     match kind {
+        "statement_block" => {
+            scopes.push();
+            collect_references(
+                node,
+                ctx,
+                enclosing_class,
+                scopes,
+                in_value_pos,
+                skip_ids,
+                root_fn_id,
+                refs,
+                depth,
+            );
+            scopes.pop();
+        }
+        "arrow_function" | "function" | "function_expression" | "generator_function"
+            if Some(node.id()) != root_fn_id =>
+        {
+            scopes.push();
+            bind_ts_function_params(node, content, scopes);
+            collect_references(
+                node,
+                ctx,
+                enclosing_class,
+                scopes,
+                in_value_pos,
+                skip_ids,
+                root_fn_id,
+                refs,
+                depth,
+            );
+            scopes.pop();
+        }
+        "variable_declarator" => {
+            collect_references(
+                node,
+                ctx,
+                enclosing_class,
+                scopes,
+                in_value_pos,
+                skip_ids,
+                root_fn_id,
+                refs,
+                depth,
+            );
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let var = node_text(name_node, content).trim();
+                if is_valid_ident(var) {
+                    if let Some(ty) = infer_ts_var_type(node, content) {
+                        scopes.insert(var.to_string(), ty);
+                    } else {
+                        scopes.shadow(var.to_string());
+                    }
+                }
+            }
+        }
         "call_expression" => {
             visit_ts_call(
                 node,
                 ctx,
                 enclosing_class,
-                local_types,
+                scopes,
                 in_value_pos,
                 skip_ids,
+                root_fn_id,
                 refs,
                 depth,
             );
         }
         "new_expression" => {
-            let ctor_node = node.child_by_field_name("constructor");
-            if let Some(ctor) = ctor_node {
-                let text = node_text(ctor, content);
-                let short = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
-                if !short.is_empty() && short != "super" && short != "this" {
-                    refs.push_call(short, false);
-                    refs.push_call(&format!("{short}::constructor"), false);
-                }
-            }
-            let ctor_id = ctor_node.map(|c| c.id());
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if Some(child.id()) == ctor_id && !in_value_pos {
-                    continue;
-                }
-                let child_val = in_value_pos || child.kind() == "arguments";
-                visit_ts_ref(
-                    child,
-                    ctx,
-                    enclosing_class,
-                    local_types,
-                    child_val,
-                    skip_ids,
-                    refs,
-                    depth + 1,
-                );
-            }
+            visit_ts_new(
+                node,
+                ctx,
+                enclosing_class,
+                scopes,
+                in_value_pos,
+                skip_ids,
+                root_fn_id,
+                refs,
+                depth,
+            );
         }
         "jsx_self_closing_element" | "jsx_opening_element" => {
             if let Some(tag_node) = node.child_by_field_name("name") {
@@ -873,21 +1189,23 @@ fn visit_ts_ref(
                 node,
                 ctx,
                 enclosing_class,
-                local_types,
+                scopes,
                 in_value_pos,
                 skip_ids,
+                root_fn_id,
                 refs,
                 depth,
             );
         }
-        "jsx_expression" => {
+        "jsx_expression" | "template_substitution" => {
             collect_references(
                 node,
                 ctx,
                 enclosing_class,
-                local_types,
+                scopes,
                 true,
                 skip_ids,
+                root_fn_id,
                 refs,
                 depth,
             );
@@ -904,25 +1222,14 @@ fn visit_ts_ref(
                     obj,
                     ctx,
                     enclosing_class,
-                    local_types,
+                    scopes,
                     in_value_pos,
                     skip_ids,
+                    root_fn_id,
                     refs,
                     depth + 1,
                 );
             }
-        }
-        "template_substitution" => {
-            collect_references(
-                node,
-                ctx,
-                enclosing_class,
-                local_types,
-                true,
-                skip_ids,
-                refs,
-                depth,
-            );
         }
         "type_identifier" => {
             refs.push_mention(node_text(node, content).trim());
@@ -940,9 +1247,10 @@ fn visit_ts_ref(
                 node,
                 ctx,
                 enclosing_class,
-                local_types,
+                scopes,
                 in_value_pos,
                 skip_ids,
+                root_fn_id,
                 refs,
                 depth,
             );
@@ -951,13 +1259,60 @@ fn visit_ts_ref(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn visit_ts_new(
+    node: Node,
+    ctx: &TsWalkCtx<'_>,
+    enclosing_class: Option<&str>,
+    scopes: &mut ScopeStack,
+    in_value_pos: bool,
+    skip_ids: &HashSet<usize>,
+    root_fn_id: Option<usize>,
+    refs: &mut RefCollector,
+    depth: usize,
+) {
+    let ctor_node = node.child_by_field_name("constructor");
+    if let Some(ctor) = ctor_node {
+        let text = node_text(ctor, ctx.content);
+        let short = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
+        if !short.is_empty() && short != "super" && short != "this" {
+            refs.push_call(short, false);
+            refs.push_call(&format!("{short}::constructor"), false);
+        }
+    }
+    let ctor_id = ctor_node.map(|c| c.id());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if Some(child.id()) == ctor_id && !in_value_pos {
+            continue;
+        }
+        let child_val = in_value_pos || child.kind() == "arguments";
+        visit_ts_ref(
+            child,
+            ctx,
+            enclosing_class,
+            scopes,
+            child_val,
+            skip_ids,
+            root_fn_id,
+            refs,
+            depth + 1,
+        );
+    }
+}
+
+fn is_ts_static_class_ident(s: &str) -> bool {
+    is_valid_ident(s) && s.starts_with(|c: char| c.is_ascii_uppercase()) && !is_ts_builtin_type(s)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn visit_ts_call(
     node: Node,
     ctx: &TsWalkCtx<'_>,
     enclosing_class: Option<&str>,
-    local_types: &HashMap<String, String>,
+    scopes: &mut ScopeStack,
     in_value_pos: bool,
-    skip_ids: &[usize],
+    skip_ids: &HashSet<usize>,
+    root_fn_id: Option<usize>,
     refs: &mut RefCollector,
     depth: usize,
 ) {
@@ -966,40 +1321,17 @@ fn visit_ts_call(
     if let Some(raw_fn) = func_node {
         let fn_node = unwrap_ts_expr(raw_fn);
         if fn_node.kind() == "member_expression" {
-            if let Some(prop) = fn_node.child_by_field_name("property") {
-                let func_name = node_text(prop, content).trim();
-                if let Some(obj) = fn_node.child_by_field_name("object") {
-                    let unwrapped_obj = unwrap_ts_expr(obj);
-                    let obj_text = node_text(unwrapped_obj, content).trim();
-                    if ctx.external_set.contains(obj_text) && is_valid_ident(func_name) {
-                        refs.push_call(&format!("{obj_text}.{func_name}"), false);
-                    } else {
-                        if func_name != "this" && func_name != "super" {
-                            refs.push_call(func_name, true);
-                        }
-                        let is_this = unwrapped_obj.kind() == "this" || obj_text == "this";
-                        if let Some(cls) =
-                            enclosing_class.filter(|_| is_this && !func_name.is_empty())
-                        {
-                            refs.push_call(&format!("{cls}::{func_name}"), false);
-                        } else if let Some(ty) = local_types.get(obj_text) {
-                            refs.push_call(&format!("{ty}::{func_name}"), false);
-                        }
-                    }
-                    visit_ts_ref(
-                        obj,
-                        ctx,
-                        enclosing_class,
-                        local_types,
-                        in_value_pos,
-                        skip_ids,
-                        refs,
-                        depth + 1,
-                    );
-                } else if func_name != "this" && func_name != "super" {
-                    refs.push_call(func_name, true);
-                }
-            }
+            extract_ts_member_call(
+                fn_node,
+                ctx,
+                enclosing_class,
+                scopes,
+                in_value_pos,
+                skip_ids,
+                root_fn_id,
+                refs,
+                depth,
+            );
         } else if fn_node.kind() == "identifier" {
             let t = node_text(fn_node, content).trim();
             if t != "this" && t != "super" {
@@ -1010,9 +1342,10 @@ fn visit_ts_call(
                 fn_node,
                 ctx,
                 enclosing_class,
-                local_types,
+                scopes,
                 in_value_pos,
                 skip_ids,
+                root_fn_id,
                 refs,
                 depth + 1,
             );
@@ -1029,12 +1362,63 @@ fn visit_ts_call(
             child,
             ctx,
             enclosing_class,
-            local_types,
+            scopes,
             child_val,
             skip_ids,
+            root_fn_id,
             refs,
             depth + 1,
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_ts_member_call(
+    fn_node: Node,
+    ctx: &TsWalkCtx<'_>,
+    enclosing_class: Option<&str>,
+    scopes: &mut ScopeStack,
+    in_value_pos: bool,
+    skip_ids: &HashSet<usize>,
+    root_fn_id: Option<usize>,
+    refs: &mut RefCollector,
+    depth: usize,
+) {
+    let content = ctx.content;
+    let Some(prop) = fn_node.child_by_field_name("property") else {
+        return;
+    };
+    let func_name = node_text(prop, content).trim();
+    if let Some(obj) = fn_node.child_by_field_name("object") {
+        let unwrapped_obj = unwrap_ts_expr(obj);
+        let obj_text = node_text(unwrapped_obj, content).trim();
+        let is_this = unwrapped_obj.kind() == "this" || obj_text == "this";
+        if ctx.external_set.contains(obj_text) && is_valid_ident(func_name) {
+            refs.push_call(&format!("{obj_text}.{func_name}"), false);
+        } else if let Some(hint) = ctx.internal_namespaces.get(obj_text) {
+            refs.push_call(&super::format_hinted_call(hint, func_name), false);
+        } else if let Some(cls) = enclosing_class.filter(|_| is_this && !func_name.is_empty()) {
+            refs.push_call(&format!("{cls}::{func_name}"), false);
+        } else if let Some(ty) = scopes.get(obj_text) {
+            refs.push_call(&format!("{ty}::{func_name}"), false);
+        } else if is_ts_static_class_ident(obj_text) && is_valid_ident(func_name) {
+            refs.push_call(&format!("{obj_text}::{func_name}"), false);
+        } else if func_name != "this" && func_name != "super" {
+            refs.push_call(func_name, true);
+        }
+        visit_ts_ref(
+            obj,
+            ctx,
+            enclosing_class,
+            scopes,
+            in_value_pos,
+            skip_ids,
+            root_fn_id,
+            refs,
+            depth + 1,
+        );
+    } else if func_name != "this" && func_name != "super" {
+        refs.push_call(func_name, true);
     }
 }
 
@@ -1042,10 +1426,18 @@ fn extract_object_literal_members(
     object_node: Node,
     ctx: &TsWalkCtx<'_>,
     parent_name: &str,
+    parent_exported: bool,
     symbols: &mut Vec<Symbol>,
-    skip_ids: &mut Vec<usize>,
+    skip_ids: &mut HashSet<usize>,
 ) {
     let content = ctx.content;
+    let mut member_flags = 0u8;
+    if parent_exported {
+        member_flags |= symbol_flags::IS_PUBLIC;
+    }
+    if ctx.file_is_test {
+        member_flags |= symbol_flags::IS_TEST;
+    }
     let mut cursor = object_node.walk();
     for child in object_node.children(&mut cursor) {
         if child.kind() == "pair" {
@@ -1063,20 +1455,22 @@ fn extract_object_literal_members(
                                 | "generator_function"
                         )
                     });
-                    let full_name = format!("{}::{}", parent_name, key_name);
+                    let full_name = format!("{parent_name}::{key_name}");
                     let kind = if callable {
                         SymbolKind::Method
                     } else {
                         SymbolKind::Field
                     };
-                    let mut flags = symbol_flags::IS_PUBLIC;
-                    if ctx.file_is_test {
-                        flags |= symbol_flags::IS_TEST;
-                    }
-                    let symbol =
-                        create_symbol(child, ctx, full_name, kind, Some(parent_name), flags);
-                    skip_ids.push(child.id());
-                    symbols.push(symbol);
+                    symbols.push(create_symbol(
+                        child,
+                        ctx,
+                        full_name,
+                        kind,
+                        Some(parent_name),
+                        member_flags,
+                        &[],
+                    ));
+                    skip_ids.insert(child.id());
                 }
             }
         } else if child.kind() == "method_definition" {
@@ -1085,21 +1479,17 @@ fn extract_object_literal_members(
                     .trim_matches('\'')
                     .trim_matches('"');
                 if !key_name.is_empty() {
-                    let full_name = format!("{}::{}", parent_name, key_name);
-                    let mut flags = symbol_flags::IS_PUBLIC;
-                    if ctx.file_is_test {
-                        flags |= symbol_flags::IS_TEST;
-                    }
-                    let symbol = create_symbol(
+                    let full_name = format!("{parent_name}::{key_name}");
+                    symbols.push(create_symbol(
                         child,
                         ctx,
                         full_name,
                         SymbolKind::Method,
                         Some(parent_name),
-                        flags,
-                    );
-                    skip_ids.push(child.id());
-                    symbols.push(symbol);
+                        member_flags,
+                        &[],
+                    ));
+                    skip_ids.insert(child.id());
                 }
             }
         }
@@ -1122,85 +1512,250 @@ fn is_top_level_const(node: Node, content: &str) -> bool {
     false
 }
 
-fn collect_external_imports(root: Node, content: &str, aliases: &AliasSet) -> Vec<String> {
+fn extract_require_spec<'a>(val: Node, content: &'a str) -> Option<&'a str> {
+    let u = unwrap_ts_expr(val);
+    if u.kind() != "call_expression" {
+        return None;
+    }
+    let fn_node = u.child_by_field_name("function")?;
+    if node_text(fn_node, content).trim() != "require" {
+        return None;
+    }
+    let args = u.child_by_field_name("arguments")?;
+    let first = args.named_child(0)?;
+    if first.kind() == "string" {
+        return Some(node_text(first, content).trim_matches(['\'', '"', ' ']));
+    }
+    None
+}
+
+fn collect_external_imports(
+    root: Node,
+    content: &str,
+    aliases: &AliasSet,
+    depth_truncated: &Cell<bool>,
+) -> Vec<String> {
     let mut out = ImportSet::default();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        if child.kind() != "import_statement" {
-            continue;
-        }
-        let Some(source) = child.child_by_field_name("source") else {
-            continue;
-        };
-        let spec = node_text(source, content).trim_matches(['\'', '"', ' ']);
-        if spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec) {
-            continue;
-        }
-        let mut ccursor = child.walk();
-        for item in child.children(&mut ccursor) {
-            collect_import_binding(item, content, &mut out, 0);
+        if child.kind() == "import_statement" {
+            let Some(source) = child.child_by_field_name("source") else {
+                continue;
+            };
+            let spec = node_text(source, content).trim_matches(['\'', '"', ' ']);
+            if spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec) {
+                continue;
+            }
+            let mut ccursor = child.walk();
+            for item in child.children(&mut ccursor) {
+                collect_import_binding(item, content, &mut out, depth_truncated, 0);
+            }
+        } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            let mut dcur = child.walk();
+            for decl in child.children(&mut dcur) {
+                if decl.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(spec) = decl
+                    .child_by_field_name("value")
+                    .and_then(|v| extract_require_spec(v, content))
+                else {
+                    continue;
+                };
+                if spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec) {
+                    continue;
+                }
+                if let Some(name_node) = decl.child_by_field_name("name") {
+                    let mut names = Vec::new();
+                    extract_pattern_names(name_node, content, &mut names, depth_truncated, 0);
+                    for n in names {
+                        out.push(n);
+                    }
+                }
+            }
         }
     }
     out.items
 }
 
-fn collect_local_import_aliases(
+fn collect_local_imports(
     root: Node,
     content: &str,
     aliases: &AliasSet,
-) -> HashMap<String, (String, String)> {
-    let mut out = HashMap::new();
+    depth_truncated: &Cell<bool>,
+) -> (HashMap<String, (String, String)>, HashMap<String, String>) {
+    let mut import_aliases = HashMap::new();
+    let mut namespaces = HashMap::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        // Strictly `import_statement` — re-exports (`export { a as b } from ...`) do not bind local names.
-        if child.kind() != "import_statement" {
-            continue;
+        if child.kind() == "import_statement" {
+            let Some(source) = child.child_by_field_name("source") else {
+                continue;
+            };
+            let spec = node_text(source, content).trim_matches(['\'', '"', ' ']);
+            let is_local = spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec);
+            if !is_local {
+                continue;
+            }
+            let hint = super::spec_to_module_hint(spec, aliases);
+            collect_local_specifiers(
+                child,
+                content,
+                &hint,
+                &mut import_aliases,
+                &mut namespaces,
+                depth_truncated,
+                0,
+            );
+        } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            let mut dcur = child.walk();
+            for decl in child.children(&mut dcur) {
+                if decl.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(spec) = decl
+                    .child_by_field_name("value")
+                    .and_then(|v| extract_require_spec(v, content))
+                else {
+                    continue;
+                };
+                if !(spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec)) {
+                    continue;
+                }
+                let hint = super::spec_to_module_hint(spec, aliases);
+                if let Some(name_node) = decl.child_by_field_name("name") {
+                    collect_require_local_bindings(
+                        name_node,
+                        content,
+                        &hint,
+                        &mut import_aliases,
+                        &mut namespaces,
+                    );
+                }
+            }
         }
-        let Some(source) = child.child_by_field_name("source") else {
-            continue;
-        };
-        let spec = node_text(source, content).trim_matches(['\'', '"', ' ']);
-        let is_local = spec.starts_with('.') || spec.starts_with('/') || aliases.matches(spec);
-        if !is_local {
-            continue;
-        }
-        let hint = super::spec_to_module_hint(spec);
-        collect_aliased_specifiers(child, content, &hint, &mut out, 0);
     }
-    out
+    (import_aliases, namespaces)
 }
 
-fn collect_aliased_specifiers(
+fn collect_require_local_bindings(
+    name_node: Node,
+    content: &str,
+    hint: &str,
+    import_aliases: &mut HashMap<String, (String, String)>,
+    namespaces: &mut HashMap<String, String>,
+) {
+    match name_node.kind() {
+        "identifier" => {
+            let ns = node_text(name_node, content).trim();
+            if is_valid_ident(ns) && !hint.is_empty() {
+                namespaces.insert(ns.to_string(), hint.to_string());
+            }
+        }
+        "object_pattern" => {
+            let mut cur = name_node.walk();
+            for item in name_node.named_children(&mut cur) {
+                match item.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let name = node_text(item, content).trim();
+                        if is_valid_ident(name) && !hint.is_empty() {
+                            import_aliases
+                                .insert(name.to_string(), (hint.to_string(), name.to_string()));
+                        }
+                    }
+                    "pair_pattern" => {
+                        if let (Some(k), Some(v)) = (
+                            item.child_by_field_name("key"),
+                            item.child_by_field_name("value"),
+                        ) {
+                            let orig = node_text(k, content).trim();
+                            let local = node_text(v, content).trim();
+                            if is_valid_ident(orig) && is_valid_ident(local) {
+                                import_aliases.insert(
+                                    local.to_string(),
+                                    (hint.to_string(), orig.to_string()),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_local_specifiers(
     node: Node,
     content: &str,
     hint: &str,
     out: &mut HashMap<String, (String, String)>,
+    namespaces: &mut HashMap<String, String>,
+    depth_truncated: &Cell<bool>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
-    if node.kind() == "import_specifier" {
-        if let (Some(orig_node), Some(alias_node)) = (
-            node.child_by_field_name("name"),
-            node.child_by_field_name("alias"),
-        ) {
-            let orig = node_text(orig_node, content).trim();
-            let alias = node_text(alias_node, content).trim();
-            if !orig.is_empty() && !alias.is_empty() && orig != alias {
-                out.insert(alias.to_string(), (hint.to_string(), orig.to_string()));
+    match node.kind() {
+        "import_specifier" => {
+            if let Some(orig_node) = node.child_by_field_name("name") {
+                let orig = node_text(orig_node, content).trim();
+                let alias = node
+                    .child_by_field_name("alias")
+                    .map(|a| node_text(a, content).trim())
+                    .filter(|a| !a.is_empty());
+                if !orig.is_empty() {
+                    match alias {
+                        Some(a) if a != orig => {
+                            out.insert(a.to_string(), (hint.to_string(), orig.to_string()));
+                        }
+                        None if !hint.is_empty() => {
+                            out.entry(orig.to_string())
+                                .or_insert_with(|| (hint.to_string(), orig.to_string()));
+                        }
+                        _ => {}
+                    }
+                }
             }
+            return;
         }
-        return;
+        "namespace_import" => {
+            if let Some(id) = node.named_child(0) {
+                let ns = node_text(id, content).trim();
+                if is_valid_ident(ns) && !hint.is_empty() {
+                    namespaces.insert(ns.to_string(), hint.to_string());
+                }
+            }
+            return;
+        }
+        _ => {}
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_aliased_specifiers(c, content, hint, out, depth + 1);
+        collect_local_specifiers(
+            c,
+            content,
+            hint,
+            out,
+            namespaces,
+            depth_truncated,
+            depth + 1,
+        );
     }
 }
 
-fn collect_import_binding(node: Node, content: &str, out: &mut ImportSet, depth: usize) {
+fn collect_import_binding(
+    node: Node,
+    content: &str,
+    out: &mut ImportSet,
+    depth_truncated: &Cell<bool>,
+    depth: usize,
+) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     match node.kind() {
@@ -1223,14 +1778,21 @@ fn collect_import_binding(node: Node, content: &str, out: &mut ImportSet, depth:
         _ => {
             let mut cursor = node.walk();
             for c in node.children(&mut cursor) {
-                collect_import_binding(c, content, out, depth + 1);
+                collect_import_binding(c, content, out, depth_truncated, depth + 1);
             }
         }
     }
 }
 
-fn extract_pattern_names<'a>(node: Node, content: &'a str, out: &mut Vec<&'a str>, depth: usize) {
+fn extract_pattern_names<'a>(
+    node: Node,
+    content: &'a str,
+    out: &mut Vec<&'a str>,
+    depth_truncated: &Cell<bool>,
+    depth: usize,
+) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     match node.kind() {
@@ -1242,7 +1804,7 @@ fn extract_pattern_names<'a>(node: Node, content: &'a str, out: &mut Vec<&'a str
         }
         "pair_pattern" => {
             if let Some(val) = node.child_by_field_name("value") {
-                extract_pattern_names(val, content, out, depth + 1);
+                extract_pattern_names(val, content, out, depth_truncated, depth + 1);
             }
         }
         "assignment_pattern" | "object_assignment_pattern" => {
@@ -1250,13 +1812,13 @@ fn extract_pattern_names<'a>(node: Node, content: &'a str, out: &mut Vec<&'a str
                 .child_by_field_name("left")
                 .or_else(|| node.named_child(0));
             if let Some(lhs) = left {
-                extract_pattern_names(lhs, content, out, depth + 1);
+                extract_pattern_names(lhs, content, out, depth_truncated, depth + 1);
             }
         }
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                extract_pattern_names(child, content, out, depth + 1);
+                extract_pattern_names(child, content, out, depth_truncated, depth + 1);
             }
         }
     }
@@ -1344,5 +1906,76 @@ mod tests {
         );
         assert!(page.mentions.contains(&"MyButton".to_string()));
         assert!(page.calls.contains(&"MyButton".to_string()));
+    }
+
+    #[test]
+    fn ts_visibility_decorators_reexports_scopes_and_local_template_fix() {
+        let src = r#"
+            import * as ns from "./helpers";
+            import { dup } from "./a";
+            export { f } from "./b";
+
+            @Controller()
+            export class Svc {
+                #secret() {}
+                private priv() {}
+                protected prot() {}
+                @Get()
+                pubMethod(x: Foo | null) {
+                    const msg = `hi`;
+                    [1].map((x: Bar) => x.b());
+                    x.a();
+                    Svc.staticFn();
+                    ns.help();
+                    dup();
+                }
+                static staticFn() {}
+            }
+
+            class Internal {
+                hidden() {}
+            }
+
+            const localObj = { fn: () => {} };
+
+            function postExported() {}
+            export { postExported };
+        "#;
+        let syms = parse_typescript("svc.ts", src, false, &no_aliases()).unwrap();
+        assert!(!syms.iter().any(|s| s.name == "msg"));
+        assert!(syms.iter().any(|s| s.name == "f" && s.is_public()));
+
+        let svc = syms.iter().find(|s| s.name == "Svc").unwrap();
+        assert!(svc.is_public() && svc.is_attr_entry());
+        let secret = syms.iter().find(|s| s.name == "Svc::#secret").unwrap();
+        assert!(!secret.is_public());
+        let priv_m = syms.iter().find(|s| s.name == "Svc::priv").unwrap();
+        assert!(!priv_m.is_public());
+        let prot_m = syms.iter().find(|s| s.name == "Svc::prot").unwrap();
+        assert!(!prot_m.is_public());
+        let hidden = syms.iter().find(|s| s.name == "Internal::hidden").unwrap();
+        assert!(!hidden.is_public());
+        let obj_fn = syms.iter().find(|s| s.name == "localObj::fn").unwrap();
+        assert!(!obj_fn.is_public());
+        let post = syms.iter().find(|s| s.name == "postExported").unwrap();
+        assert!(post.is_public());
+
+        let pm = syms.iter().find(|s| s.name == "Svc::pubMethod").unwrap();
+        assert!(pm.is_public() && pm.is_attr_entry());
+        assert!(pm.calls.contains(&"Foo::a".to_string()), "{:?}", pm.calls);
+        assert!(!pm.calls.contains(&"Bar::a".to_string()), "{:?}", pm.calls);
+        assert!(pm.calls.contains(&"Bar::b".to_string()), "{:?}", pm.calls);
+        assert!(
+            pm.calls.contains(&"Svc::staticFn".to_string()),
+            "{:?}",
+            pm.calls
+        );
+        assert!(
+            pm.calls.contains(&"helpers:help".to_string()),
+            "{:?}",
+            pm.calls
+        );
+        assert!(pm.calls.contains(&"a:dup".to_string()), "{:?}", pm.calls);
+        assert!(!pm.member_calls.contains(&"a".to_string()));
     }
 }

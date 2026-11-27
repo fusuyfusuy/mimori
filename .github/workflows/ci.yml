@@ -22,21 +22,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build
-      - name: byte-identical markdown and JSON determinism gate
+      - name: byte-identical skill mirror gate
+        run: cmp -s SKILL.md skills/mimori/SKILL.md
+      - name: byte-identical cold-vs-warm markdown and JSON determinism gate
         run: |
           set -euo pipefail
           for cmd in \
             "map" \
             "map --json" \
+            "find SymbolGraph --json" \
             "slice src/graph/mod.rs:SymbolGraph::new --json" \
+            "blast src/model/coordinate.rs:Coordinate::parse -d 2 --json" \
             "dump --budget 1500 --json" \
             "doctor --json"
           do
-            ./target/debug/mimori $cmd > /tmp/det_a.out
-            ./target/debug/mimori $cmd > /tmp/det_b.out
-            diff -u /tmp/det_a.out /tmp/det_b.out
+            ./target/debug/mimori clean >/dev/null 2>&1 || true
+            ./target/debug/mimori $cmd > /tmp/det_cold.out
+            ./target/debug/mimori $cmd > /tmp/det_warm.out
+            diff -u /tmp/det_cold.out /tmp/det_warm.out
           done
-          echo "determinism gate: all markdown and JSON outputs byte-identical"
+          echo "determinism gate: all cold/warm markdown and JSON outputs byte-identical"
       - name: self-hosted memory lint and debt check
         run: |
           ./target/debug/mimori memory lint

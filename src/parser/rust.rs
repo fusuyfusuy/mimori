@@ -1,10 +1,11 @@
 use crate::model::{symbol_flags, Symbol, SymbolKind};
 use crate::parser::common::{
-    extract_signature_ast, is_valid_ident, node_text, ImportSet, RefCollector, MAX_AST_DEPTH,
+    build_symbol, extract_signature_ast, is_valid_ident, node_text, ImportSet, ParseDiagnostics,
+    RefCollector, ScopeStack, MAX_AST_DEPTH,
 };
 use crate::workspace::AliasSet;
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};
@@ -24,17 +25,50 @@ struct RustWalkCtx<'a> {
     file_is_test: bool,
     external_set: &'a HashSet<String>,
     serde_targets: &'a HashSet<String>,
+    outline_mods: &'a HashSet<String>,
+    depth_truncated: Cell<bool>,
+}
+
+impl<'a> RustWalkCtx<'a> {
+    fn check_depth(&self, depth: usize) -> bool {
+        if depth >= MAX_AST_DEPTH {
+            self.depth_truncated.set(true);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct RustWalkState<'a> {
+    parent_type: Option<&'a str>,
+    in_test: bool,
+    in_trait_impl: bool,
+    in_fn: bool,
+    in_serde_mod: bool,
 }
 
 pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<Symbol>> {
+    Ok(parse_rust_with_diagnostics(file, content, aliases)?.0)
+}
+
+pub fn parse_rust_with_diagnostics(
+    file: &str,
+    content: &str,
+    aliases: &AliasSet,
+) -> Result<(Vec<Symbol>, ParseDiagnostics)> {
     let tree = RUST_PARSER
         .with(|p| p.borrow_mut().parse(content, None))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse Rust source"))?;
 
     let root = tree.root_node();
-    let external_list = collect_file_external_imports(root, content, aliases);
+    let depth_truncated = Cell::new(false);
+    let (local_mods, outline_mods) = collect_declared_mods(root, content, &depth_truncated);
+    let external_list =
+        collect_file_external_imports(root, content, aliases, &local_mods, &depth_truncated);
     let external_set: HashSet<String> = external_list.iter().cloned().collect();
-    let serde_targets = collect_serde_hook_targets(root, content);
+    let serde_targets = collect_serde_hook_targets(root, content, &depth_truncated);
 
     let file_is_test = file.starts_with("tests/")
         || file.contains("/tests/")
@@ -47,23 +81,27 @@ pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<S
         file_is_test,
         external_set: &external_set,
         serde_targets: &serde_targets,
+        outline_mods: &outline_mods,
+        depth_truncated: Cell::new(depth_truncated.get()),
     };
 
     let mut symbols = Vec::new();
-    walk_rust_node(
-        root,
-        &ctx,
-        None,
-        false,
-        false,
-        false,
-        false,
-        &mut symbols,
-        0,
-    );
+    let initial = RustWalkState {
+        in_test: file_is_test,
+        ..Default::default()
+    };
+    walk_rust_children(root, &ctx, initial, &mut symbols, 0);
 
     let mut import_aliases = HashMap::new();
-    collect_local_use_aliases(root, content, &mut import_aliases, aliases, 0);
+    collect_local_use_aliases(
+        root,
+        content,
+        &mut import_aliases,
+        aliases,
+        &local_mods,
+        &ctx.depth_truncated,
+        0,
+    );
     super::apply_import_aliases(&mut symbols, &import_aliases);
 
     let external_imports: Arc<[String]> = external_list.into();
@@ -71,29 +109,67 @@ pub fn parse_rust(file: &str, content: &str, aliases: &AliasSet) -> Result<Vec<S
         s.external_imports = Arc::clone(&external_imports);
     }
 
-    Ok(symbols)
+    let diag = ParseDiagnostics {
+        has_error: root.has_error(),
+        depth_truncated: ctx.depth_truncated.get(),
+    };
+    Ok((symbols, diag))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk_rust_node(
-    node: Node,
-    ctx: &RustWalkCtx<'_>,
-    parent_type: Option<&str>,
-    in_test: bool,
-    in_trait_impl: bool,
-    in_fn: bool,
-    in_serde_mod: bool,
+/// Linear forward sibling walk that accumulates `attribute_item` slices without
+/// backward `prev_sibling()` scans (prevents O(N^3) blowup on comment/attr runs)
+/// and applies inner `#![...]` attributes to the enclosing block/module scope.
+fn walk_rust_children<'a>(
+    parent: Node<'a>,
+    ctx: &RustWalkCtx<'a>,
+    mut state: RustWalkState<'a>,
     symbols: &mut Vec<Symbol>,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH {
+    if ctx.check_depth(depth) {
+        return;
+    }
+    let content = ctx.content;
+    let mut pending_attrs: Vec<&'a str> = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        match child.kind() {
+            "attribute_item" => {
+                pending_attrs.push(node_text(child, content));
+            }
+            "inner_attribute_item" => {
+                let raw = node_text(child, content);
+                if attr_marks_test(raw) {
+                    state.in_test = true;
+                }
+                if attr_marks_entry(raw) {
+                    state.in_serde_mod = true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => {
+                walk_rust_node(child, ctx, state, &pending_attrs, symbols, depth + 1);
+                pending_attrs.clear();
+            }
+        }
+    }
+}
+
+fn walk_rust_node<'a>(
+    node: Node<'a>,
+    ctx: &RustWalkCtx<'a>,
+    state: RustWalkState<'a>,
+    attrs: &[&'a str],
+    symbols: &mut Vec<Symbol>,
+    depth: usize,
+) {
+    if ctx.check_depth(depth) {
         return;
     }
     let kind = node.kind();
     let content = ctx.content;
-    let attrs = collect_preceding_attrs(node, content);
-    let node_is_test = in_test || ctx.file_is_test || attrs_mark_test(&attrs);
-    let node_is_attr_entry = in_serde_mod || attrs_mark_entry(&attrs);
+    let node_is_test = state.in_test || ctx.file_is_test || attrs_mark_test(attrs);
+    let node_is_attr_entry = state.in_serde_mod || attrs_mark_entry(attrs);
 
     match kind {
         "mod_item" => {
@@ -101,123 +177,86 @@ fn walk_rust_node(
                 .child_by_field_name("name")
                 .map(|n| node_text(n, content).trim())
                 .unwrap_or("");
-            let next_serde_mod = in_serde_mod || ctx.serde_targets.contains(mod_name);
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk_rust_node(
-                    child,
-                    ctx,
-                    None,
-                    node_is_test,
-                    false,
-                    false,
-                    next_serde_mod,
-                    symbols,
-                    depth + 1,
-                );
+            let next = RustWalkState {
+                parent_type: None,
+                in_test: node_is_test,
+                in_trait_impl: false,
+                in_fn: false,
+                in_serde_mod: state.in_serde_mod || ctx.serde_targets.contains(mod_name),
+            };
+            if let Some(body) = node.child_by_field_name("body") {
+                walk_rust_children(body, ctx, next, symbols, depth + 1);
             }
             return;
         }
         "function_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let full_name = match parent_type {
-                    Some(pt) => format!("{}::{}", pt, name),
-                    None => name.to_string(),
-                };
-                let sym_kind = if parent_type.is_some() {
+            emit_named_rust_item(
+                node,
+                ctx,
+                state.parent_type,
+                if state.parent_type.is_some() {
                     SymbolKind::Method
                 } else {
                     SymbolKind::Function
-                };
-                let flags = compute_flags(
-                    node,
-                    name,
-                    ctx,
-                    node_is_test,
-                    in_trait_impl,
-                    node_is_attr_entry,
-                );
-                let symbol =
-                    create_symbol(node, ctx, full_name, sym_kind, parent_type, flags, None);
-                symbols.push(symbol);
-            }
-            // Walk nested items inside functions (e.g. nested helper fns) with in_fn = true
-            // so function-local `const` items are skipped.
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk_rust_node(
-                    child,
-                    ctx,
-                    None,
-                    node_is_test,
-                    false,
-                    true,
-                    in_serde_mod,
-                    symbols,
-                    depth + 1,
-                );
+                },
+                node_is_test,
+                state.in_trait_impl,
+                node_is_attr_entry,
+                None,
+                symbols,
+            );
+            let next = RustWalkState {
+                parent_type: None,
+                in_test: node_is_test,
+                in_trait_impl: false,
+                in_fn: true,
+                in_serde_mod: state.in_serde_mod,
+            };
+            if let Some(body) = node.child_by_field_name("body") {
+                walk_rust_children(body, ctx, next, symbols, depth + 1);
             }
             return;
         }
         "function_signature_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let full_name = match parent_type {
-                    Some(pt) => format!("{}::{}", pt, name),
-                    None => name.to_string(),
-                };
-                let flags = compute_flags(node, name, ctx, node_is_test, true, node_is_attr_entry);
-                let symbol = create_symbol(
-                    node,
-                    ctx,
-                    full_name,
-                    SymbolKind::Method,
-                    parent_type,
-                    flags,
-                    None,
-                );
-                symbols.push(symbol);
-            }
+            emit_named_rust_item(
+                node,
+                ctx,
+                state.parent_type,
+                SymbolKind::Method,
+                node_is_test,
+                true,
+                node_is_attr_entry,
+                None,
+                symbols,
+            );
             return;
         }
-        "struct_item" => {
+        "struct_item" | "enum_item" => {
+            let sym_kind = if kind == "struct_item" {
+                SymbolKind::Struct
+            } else {
+                SymbolKind::Enum
+            };
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
                 let flags = compute_flags(node, name, ctx, node_is_test, false, node_is_attr_entry);
-                let symbol = create_symbol(
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     name.to_string(),
-                    SymbolKind::Struct,
+                    sym_kind,
                     Some(name),
                     flags,
                     None,
-                );
-                symbols.push(symbol);
+                ));
             }
-        }
-        "enum_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let flags = compute_flags(node, name, ctx, node_is_test, false, node_is_attr_entry);
-                let symbol = create_symbol(
-                    node,
-                    ctx,
-                    name.to_string(),
-                    SymbolKind::Enum,
-                    Some(name),
-                    flags,
-                    None,
-                );
-                symbols.push(symbol);
-            }
+            return;
         }
         "trait_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, content).trim();
                 let flags = compute_flags(node, name, ctx, node_is_test, false, node_is_attr_entry);
-                let symbol = create_symbol(
+                symbols.push(create_symbol(
                     node,
                     ctx,
                     name.to_string(),
@@ -225,152 +264,176 @@ fn walk_rust_node(
                     Some(name),
                     flags,
                     None,
-                );
-                symbols.push(symbol);
-
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    walk_rust_node(
-                        child,
-                        ctx,
-                        Some(name),
-                        node_is_test,
-                        true,
-                        false,
-                        in_serde_mod,
-                        symbols,
-                        depth + 1,
-                    );
+                ));
+                if let Some(body) = node.child_by_field_name("body") {
+                    let next = RustWalkState {
+                        parent_type: Some(name),
+                        in_test: node_is_test,
+                        in_trait_impl: true,
+                        in_fn: false,
+                        in_serde_mod: state.in_serde_mod,
+                    };
+                    walk_rust_children(body, ctx, next, symbols, depth + 1);
                 }
                 return;
             }
         }
         "impl_item" => {
-            let type_name = extract_impl_type_name(node, content);
-            let trait_name = extract_impl_trait_name(node, content);
-            let is_trait_impl = trait_name.is_some();
-
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for child in body.children(&mut cursor) {
-                    if let Some(tr) = trait_name {
-                        // Record trait mention on methods of `impl Trait for Type`.
-                        if child.kind() == "function_item" {
-                            if let Some(name_node) = child.child_by_field_name("name") {
-                                let name = node_text(name_node, content).trim();
-                                let full_name = match type_name {
-                                    Some(pt) => format!("{}::{}", pt, name),
-                                    None => name.to_string(),
-                                };
-                                let child_attrs = collect_preceding_attrs(child, content);
-                                let child_test = node_is_test || attrs_mark_test(&child_attrs);
-                                let flags = compute_flags(
-                                    child,
-                                    name,
-                                    ctx,
-                                    child_test,
-                                    true,
-                                    node_is_attr_entry || attrs_mark_entry(&child_attrs),
-                                );
-                                let symbol = create_symbol(
-                                    child,
-                                    ctx,
-                                    full_name,
-                                    SymbolKind::Method,
-                                    type_name,
-                                    flags,
-                                    Some(tr),
-                                );
-                                symbols.push(symbol);
-                                continue;
-                            }
-                        }
-                    }
-                    walk_rust_node(
-                        child,
-                        ctx,
-                        type_name,
-                        node_is_test,
-                        is_trait_impl,
-                        false,
-                        in_serde_mod,
-                        symbols,
-                        depth + 1,
-                    );
-                }
-                return;
-            }
+            walk_rust_impl(
+                node,
+                ctx,
+                node_is_test,
+                node_is_attr_entry,
+                state,
+                symbols,
+                depth,
+            );
+            return;
         }
         "type_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let full_name = match parent_type {
-                    Some(pt) => format!("{}::{}", pt, name),
-                    None => name.to_string(),
-                };
-                let flags = compute_flags(
-                    node,
-                    name,
-                    ctx,
-                    node_is_test,
-                    in_trait_impl,
-                    node_is_attr_entry,
-                );
-                let symbol = create_symbol(
-                    node,
-                    ctx,
-                    full_name,
-                    SymbolKind::TypeAlias,
-                    parent_type,
-                    flags,
-                    None,
-                );
-                symbols.push(symbol);
-            }
+            emit_named_rust_item(
+                node,
+                ctx,
+                state.parent_type,
+                SymbolKind::TypeAlias,
+                node_is_test,
+                state.in_trait_impl,
+                node_is_attr_entry,
+                None,
+                symbols,
+            );
+            return;
         }
-        "const_item" | "static_item" if !in_fn => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, content).trim();
-                let full_name = match parent_type {
-                    Some(pt) => format!("{}::{}", pt, name),
-                    None => name.to_string(),
-                };
-                let flags = compute_flags(
-                    node,
-                    name,
-                    ctx,
-                    node_is_test,
-                    in_trait_impl,
-                    node_is_attr_entry,
-                );
-                let symbol = create_symbol(
-                    node,
-                    ctx,
-                    full_name,
-                    SymbolKind::Constant,
-                    parent_type,
-                    flags,
-                    None,
-                );
-                symbols.push(symbol);
-            }
+        "const_item" | "static_item" if !state.in_fn => {
+            emit_named_rust_item(
+                node,
+                ctx,
+                state.parent_type,
+                SymbolKind::Constant,
+                node_is_test,
+                state.in_trait_impl,
+                node_is_attr_entry,
+                None,
+                symbols,
+            );
+            return;
         }
         _ => {}
     }
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_rust_node(
-            child,
-            ctx,
-            parent_type,
-            node_is_test,
-            in_trait_impl,
-            in_fn,
-            in_serde_mod,
-            symbols,
-            depth + 1,
-        );
+    let next = RustWalkState {
+        in_test: node_is_test,
+        ..state
+    };
+    walk_rust_children(node, ctx, next, symbols, depth + 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_named_rust_item(
+    node: Node,
+    ctx: &RustWalkCtx<'_>,
+    parent_type: Option<&str>,
+    sym_kind: SymbolKind,
+    is_test: bool,
+    is_trait_impl: bool,
+    is_attr_entry: bool,
+    impl_trait_mention: Option<&str>,
+    symbols: &mut Vec<Symbol>,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = node_text(name_node, ctx.content).trim();
+    let full_name = match parent_type {
+        Some(pt) => format!("{pt}::{name}"),
+        None => name.to_string(),
+    };
+    let flags = compute_flags(node, name, ctx, is_test, is_trait_impl, is_attr_entry);
+    symbols.push(create_symbol(
+        node,
+        ctx,
+        full_name,
+        sym_kind,
+        parent_type,
+        flags,
+        impl_trait_mention,
+    ));
+}
+
+fn walk_rust_impl<'a>(
+    node: Node<'a>,
+    ctx: &RustWalkCtx<'a>,
+    node_is_test: bool,
+    node_is_attr_entry: bool,
+    state: RustWalkState<'a>,
+    symbols: &mut Vec<Symbol>,
+    depth: usize,
+) {
+    let content = ctx.content;
+    let type_name = extract_impl_type_name(node, content);
+    let trait_name = extract_impl_trait_name(node, content);
+    let is_trait_impl = trait_name.is_some();
+
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut impl_in_test = node_is_test;
+    let mut impl_in_entry = node_is_attr_entry;
+    let mut pending_attrs: Vec<&'a str> = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            "attribute_item" => {
+                pending_attrs.push(node_text(child, content));
+            }
+            "inner_attribute_item" => {
+                let raw = node_text(child, content);
+                if attr_marks_test(raw) {
+                    impl_in_test = true;
+                }
+                if attr_marks_entry(raw) {
+                    impl_in_entry = true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            "function_item" if trait_name.is_some() => {
+                let child_test = impl_in_test || attrs_mark_test(&pending_attrs);
+                let child_entry = impl_in_entry || attrs_mark_entry(&pending_attrs);
+                emit_named_rust_item(
+                    child,
+                    ctx,
+                    type_name,
+                    SymbolKind::Method,
+                    child_test,
+                    true,
+                    child_entry,
+                    trait_name,
+                    symbols,
+                );
+                if let Some(fn_body) = child.child_by_field_name("body") {
+                    let next = RustWalkState {
+                        parent_type: None,
+                        in_test: child_test,
+                        in_trait_impl: false,
+                        in_fn: true,
+                        in_serde_mod: state.in_serde_mod,
+                    };
+                    walk_rust_children(fn_body, ctx, next, symbols, depth + 2);
+                }
+                pending_attrs.clear();
+            }
+            _ => {
+                let next = RustWalkState {
+                    parent_type: type_name,
+                    in_test: impl_in_test,
+                    in_trait_impl: is_trait_impl,
+                    in_fn: false,
+                    in_serde_mod: state.in_serde_mod || impl_in_entry,
+                };
+                walk_rust_node(child, ctx, next, &pending_attrs, symbols, depth + 1);
+                pending_attrs.clear();
+            }
+        }
     }
 }
 
@@ -386,7 +449,7 @@ fn compute_flags(
     if is_test {
         flags |= symbol_flags::IS_TEST;
     }
-    if has_pub_visibility(node) {
+    if has_pub_visibility(node, ctx.content) {
         flags |= symbol_flags::IS_PUBLIC;
     }
     if is_trait_impl {
@@ -398,83 +461,305 @@ fn compute_flags(
     flags
 }
 
-fn has_pub_visibility(node: Node) -> bool {
+/// Only unrestricted `pub` marks a Rust item `IS_PUBLIC`.
+/// Scoped modifiers (`pub(crate)`, `pub(super)`, `pub(in ...)`) remain crate-internal.
+fn has_pub_visibility(node: Node, content: &str) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "visibility_modifier" {
-            return true;
+            return node_text(child, content).trim() == "pub";
         }
     }
     false
 }
 
-fn collect_preceding_attrs<'a>(node: Node, content: &'a str) -> Vec<&'a str> {
-    let mut attrs = Vec::new();
-    let mut prev = node.prev_sibling();
-    while let Some(p) = prev {
-        match p.kind() {
-            "attribute_item" => attrs.push(node_text(p, content)),
-            "line_comment" | "block_comment" => {}
-            _ => break,
-        }
-        prev = p.prev_sibling();
+fn strip_attr_brackets(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix("#![")
+        .or_else(|| trimmed.strip_prefix("#["))?
+        .strip_suffix(']')?
+        .trim();
+    Some(inner)
+}
+
+fn split_attr_path_and_args(inner: &str) -> (&str, Option<&str>) {
+    if let Some(open) = inner.find('(') {
+        let path = inner[..open].trim();
+        let rest = inner[open + 1..].trim();
+        let args = rest.strip_suffix(')').map(str::trim);
+        (path, args)
+    } else if let Some(eq) = inner.find('=') {
+        (inner[..eq].trim(), Some(inner[eq + 1..].trim()))
+    } else {
+        (inner.trim(), None)
     }
-    attrs
+}
+
+fn split_top_level_comma(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn cfg_expr_is_test(expr: &str) -> bool {
+    let e = expr.trim();
+    if e == "test" {
+        return true;
+    }
+    if e.starts_with("not(") && e.ends_with(')') {
+        return false;
+    }
+    if let Some(inner) = e
+        .strip_prefix("all(")
+        .or_else(|| e.strip_prefix("any("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        return split_top_level_comma(inner)
+            .into_iter()
+            .any(cfg_expr_is_test);
+    }
+    false
+}
+
+fn attr_marks_test(raw: &str) -> bool {
+    let Some(inner) = strip_attr_brackets(raw) else {
+        return false;
+    };
+    let (path, args) = split_attr_path_and_args(inner);
+    let compact_path: String = path.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact_path == "test"
+        || compact_path.ends_with("::test")
+        || compact_path == "rstest"
+        || compact_path.ends_with("::rstest")
+        || compact_path == "test_case"
+        || compact_path.ends_with("::test_case")
+    {
+        return true;
+    }
+    if compact_path == "cfg" || compact_path == "cfg_attr" {
+        if let Some(a) = args {
+            let cond = if compact_path == "cfg_attr" {
+                split_top_level_comma(a).into_iter().next().unwrap_or("")
+            } else {
+                a
+            };
+            return cfg_expr_is_test(cond);
+        }
+    }
+    false
 }
 
 fn attrs_mark_test(attrs: &[&str]) -> bool {
-    attrs.iter().any(|raw| {
-        let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-        compact == "#[test]"
-            || compact.ends_with("::test]")
-            || compact.contains("::test(")
-            || compact.starts_with("#[cfg(test)]")
-            || (compact.starts_with("#[cfg(") && compact.contains("test"))
-    })
+    attrs.iter().any(|raw| attr_marks_test(raw))
+}
+
+fn attr_marks_entry(raw: &str) -> bool {
+    let Some(inner) = strip_attr_brackets(raw) else {
+        return false;
+    };
+    let (path, args) = split_attr_path_and_args(inner);
+    let compact_path: String = path.chars().filter(|c| !c.is_whitespace()).collect();
+    if matches!(
+        compact_path.as_str(),
+        "no_mangle" | "export_name" | "proc_macro" | "proc_macro_derive" | "proc_macro_attribute"
+    ) || compact_path.ends_with("::main")
+        || compact_path.ends_with("::no_mangle")
+        || compact_path.ends_with("::export_name")
+        || compact_path.ends_with("::proc_macro")
+        || compact_path.ends_with("::proc_macro_derive")
+        || compact_path.ends_with("::proc_macro_attribute")
+    {
+        return true;
+    }
+    if compact_path == "unsafe" {
+        if let Some(a) = args {
+            let (inner_path, _) = split_attr_path_and_args(a);
+            if matches!(inner_path.trim(), "no_mangle" | "export_name") {
+                return true;
+            }
+        }
+    }
+    (compact_path == "serde" || compact_path.ends_with("::serde")) && args.is_some()
 }
 
 fn attrs_mark_entry(attrs: &[&str]) -> bool {
-    attrs.iter().any(|raw| {
-        let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-        compact.contains("no_mangle")
-            || compact.contains("export_name")
-            || compact.contains("serde(")
-    })
+    attrs.iter().any(|raw| attr_marks_entry(raw))
 }
 
-/// Scan file-level `#[serde(default = "fn", with = "mod", serialize_with = "fn", deserialize_with = "fn")]`
-/// so referenced serde callback functions/modules are marked `IS_ATTR_ENTRY`.
-fn collect_serde_hook_targets(root: Node, content: &str) -> HashSet<String> {
+const SERDE_CALLBACK_KEYS: &[&str] = &[
+    "default",
+    "with",
+    "serialize_with",
+    "deserialize_with",
+    "skip_serializing_if",
+    "from",
+    "try_from",
+    "into",
+    "remote",
+];
+
+/// Scan file-level `#[serde(...)]` attributes using Tree-sitter token streams
+/// (immune to raw-string literal injection) so referenced callback hooks and
+/// modules receive `IS_ATTR_ENTRY`.
+fn collect_serde_hook_targets(
+    root: Node,
+    content: &str,
+    depth_truncated: &Cell<bool>,
+) -> HashSet<String> {
     let mut targets = HashSet::new();
-    walk_serde_attrs(root, content, &mut targets, 0);
+    walk_serde_attrs(root, content, &mut targets, depth_truncated, 0);
     targets
 }
 
-fn walk_serde_attrs(node: Node, content: &str, out: &mut HashSet<String>, depth: usize) {
+fn walk_serde_attrs(
+    node: Node,
+    content: &str,
+    out: &mut HashSet<String>,
+    depth_truncated: &Cell<bool>,
+    depth: usize,
+) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
-    if node.kind() == "attribute_item" {
-        let text = node_text(node, content);
-        if text.contains("serde(") {
-            for key in ["default", "with", "serialize_with", "deserialize_with"] {
-                let mut rest = text;
-                while let Some(idx) = rest.find(key) {
-                    rest = &rest[idx + key.len()..];
-                    let trimmed = rest.trim_start();
-                    if let Some(after_eq) = trimmed.strip_prefix('=') {
-                        let after_eq = after_eq.trim_start();
-                        if let Some(after_q) = after_eq.strip_prefix('"') {
-                            if let Some(end_q) = after_q.find('"') {
-                                let target = after_q[..end_q].trim();
-                                if let Some(last) = target.rsplit("::").next() {
-                                    if is_valid_ident(last) {
-                                        out.insert(last.to_string());
-                                    }
-                                }
-                            }
-                        }
+    if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+        extract_serde_attr_targets(node, content, out);
+        return;
+    }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        walk_serde_attrs(c, content, out, depth_truncated, depth + 1);
+    }
+}
+
+fn extract_serde_attr_targets(attr_item: Node, content: &str, out: &mut HashSet<String>) {
+    let mut cursor = attr_item.walk();
+    let Some(attr) = attr_item
+        .children(&mut cursor)
+        .find(|c| c.kind() == "attribute")
+    else {
+        return;
+    };
+    let Some(path_node) = attr.named_child(0) else {
+        return;
+    };
+    let path = node_text(path_node, content).trim();
+    if path != "serde" && !path.ends_with("::serde") {
+        return;
+    }
+    let Some(args) = attr.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut tcursor = args.walk();
+    let tokens: Vec<Node> = args.children(&mut tcursor).collect();
+    let mut i = 0;
+    while i + 2 < tokens.len() {
+        let key_node = tokens[i];
+        let eq_node = tokens[i + 1];
+        let val_node = tokens[i + 2];
+        if key_node.kind() == "identifier"
+            && eq_node.kind() == "="
+            && matches!(val_node.kind(), "string_literal" | "raw_string_literal")
+            && SERDE_CALLBACK_KEYS.contains(&node_text(key_node, content).trim())
+        {
+            if let Some(unquoted) = unquote_rust_string(node_text(val_node, content)) {
+                if let Some(last) = unquoted.trim().rsplit("::").next() {
+                    if is_valid_ident(last) {
+                        out.insert(last.to_string());
                     }
+                }
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn unquote_rust_string(raw: &str) -> Option<&str> {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return Some(rest);
+    }
+    let rest = s.strip_prefix('r')?;
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    let body = rest.get(hashes..)?.strip_prefix('"')?;
+    let end = body.len().checked_sub(hashes + 1)?;
+    if body.as_bytes().get(end) == Some(&b'"') && body[end + 1..].bytes().all(|b| b == b'#') {
+        return Some(&body[..end]);
+    }
+    None
+}
+
+/// Collect `mod <name>;` and inline `mod <name> { ... }` items declared in this file.
+/// Returns `(all_mods, outline_mods)` where `outline_mods` excludes inline `{ ... }` modules.
+fn collect_declared_mods(
+    root: Node,
+    content: &str,
+    depth_truncated: &Cell<bool>,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut all_mods = HashSet::new();
+    let mut outline_mods = HashSet::new();
+    walk_declared_mods(
+        root,
+        content,
+        &mut all_mods,
+        &mut outline_mods,
+        depth_truncated,
+        0,
+    );
+    (all_mods, outline_mods)
+}
+
+fn walk_declared_mods(
+    node: Node,
+    content: &str,
+    all_mods: &mut HashSet<String>,
+    outline_mods: &mut HashSet<String>,
+    depth_truncated: &Cell<bool>,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
+        return;
+    }
+    if node.kind() == "mod_item" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let name = node_text(name_node, content).trim();
+            if is_valid_ident(name) {
+                all_mods.insert(name.to_string());
+                if node.child_by_field_name("body").is_none() {
+                    outline_mods.insert(name.to_string());
                 }
             }
         }
@@ -482,7 +767,14 @@ fn walk_serde_attrs(node: Node, content: &str, out: &mut HashSet<String>, depth:
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        walk_serde_attrs(c, content, out, depth + 1);
+        walk_declared_mods(
+            c,
+            content,
+            all_mods,
+            outline_mods,
+            depth_truncated,
+            depth + 1,
+        );
     }
 }
 
@@ -519,15 +811,8 @@ fn extract_simple_type_ident<'a>(mut cur: Node, content: &'a str) -> Option<&'a 
     (!name.is_empty()).then_some(name)
 }
 
-/// Infer simple local variable -> type name mappings inside a Rust function
-/// (parameters, typed `let` bindings, `Type::ctor(...)` calls, `Type { ... }`)
-/// so `var.method()` emits a qualified `Type::method` cross-file call.
-fn collect_local_receiver_types(
-    fn_node: Node,
-    content: &str,
-    enclosing_type: Option<&str>,
-) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+fn init_fn_param_scope(fn_node: Node, content: &str, enclosing_type: Option<&str>) -> ScopeStack {
+    let mut scopes = ScopeStack::new();
     if let Some(params) = fn_node.child_by_field_name("parameters") {
         let mut cursor = params.walk();
         for p in params.children(&mut cursor) {
@@ -539,15 +824,43 @@ fn collect_local_receiver_types(
                     .child_by_field_name("type")
                     .and_then(|t| unwrap_receiver_type(t, content, enclosing_type));
                 if let (Some(var), Some(ty_name)) = (pat, ty) {
-                    map.insert(var.to_string(), ty_name);
+                    scopes.insert(var.to_string(), ty_name);
                 }
             }
         }
     }
-    if let Some(body) = fn_node.child_by_field_name("body") {
-        collect_let_types(body, content, enclosing_type, &mut map, 0);
+    scopes
+}
+
+fn bind_closure_params(
+    closure_node: Node,
+    content: &str,
+    enclosing_type: Option<&str>,
+    scopes: &mut ScopeStack,
+) {
+    let Some(params) = closure_node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = params.walk();
+    for p in params.named_children(&mut cursor) {
+        if p.kind() == "parameter" {
+            if let Some(var) = p
+                .child_by_field_name("pattern")
+                .and_then(|n| extract_ident_pattern(n, content))
+            {
+                if let Some(ty) = p
+                    .child_by_field_name("type")
+                    .and_then(|t| unwrap_receiver_type(t, content, enclosing_type))
+                {
+                    scopes.insert(var.to_string(), ty);
+                } else {
+                    scopes.shadow(var.to_string());
+                }
+            }
+        } else if let Some(var) = extract_ident_pattern(p, content) {
+            scopes.shadow(var.to_string());
+        }
     }
-    map
 }
 
 fn extract_ident_pattern<'a>(mut node: Node, content: &'a str) -> Option<&'a str> {
@@ -637,44 +950,12 @@ fn is_user_type_name(ty: &str) -> bool {
         )
 }
 
-fn collect_let_types(
-    node: Node,
-    content: &str,
-    enclosing_type: Option<&str>,
-    out: &mut HashMap<String, String>,
-    depth: usize,
-) {
-    if depth >= MAX_AST_DEPTH {
-        return;
-    }
-    let kind = node.kind();
-    if matches!(
-        kind,
-        "function_item" | "struct_item" | "enum_item" | "trait_item" | "impl_item" | "mod_item"
-    ) {
-        return;
-    }
-    if kind == "let_declaration" {
-        if let Some(var) = node
-            .child_by_field_name("pattern")
-            .and_then(|p| extract_ident_pattern(p, content))
-        {
-            let ty = node
-                .child_by_field_name("type")
-                .and_then(|t| unwrap_receiver_type(t, content, enclosing_type))
-                .or_else(|| {
-                    node.child_by_field_name("value")
-                        .and_then(|v| infer_expr_type(v, content, enclosing_type))
-                });
-            if let Some(ty_name) = ty {
-                out.insert(var.to_string(), ty_name);
-            }
-        }
-    }
-    let mut cursor = node.walk();
-    for c in node.children(&mut cursor) {
-        collect_let_types(c, content, enclosing_type, out, depth + 1);
-    }
+fn is_constructor_fn(name: &str) -> bool {
+    matches!(name, "new" | "default" | "from" | "try_from" | "builder")
+        || name.starts_with("with_")
+        || name.starts_with("open")
+        || name.starts_with("load")
+        || name.starts_with("parse")
 }
 
 fn infer_expr_type(mut expr: Node, content: &str, enclosing_type: Option<&str>) -> Option<String> {
@@ -686,16 +967,19 @@ fn infer_expr_type(mut expr: Node, content: &str, enclosing_type: Option<&str>) 
             "reference_expression" => {
                 expr = expr.child_by_field_name("value")?;
             }
-            "match_expression" => {
-                // Handle `let x = match Type::load(...) { Ok(v) => v, ... }`
-                expr = expr.child_by_field_name("value")?;
-            }
             "call_expression" => {
                 let mut fn_node = expr.child_by_field_name("function")?;
                 while fn_node.kind() == "generic_function" {
                     fn_node = fn_node.child_by_field_name("function")?;
                 }
                 if fn_node.kind() == "scoped_identifier" {
+                    let fn_name = fn_node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, content).trim())
+                        .unwrap_or("");
+                    if !is_constructor_fn(fn_name) {
+                        return None;
+                    }
                     let path = fn_node.child_by_field_name("path")?;
                     let ty = extract_scoped_type(path, content, enclosing_type)?;
                     return is_user_type_name(ty).then(|| ty.to_string());
@@ -723,8 +1007,6 @@ fn create_symbol(
     impl_trait_mention: Option<&str>,
 ) -> Symbol {
     let content = ctx.content;
-    let start_pos = node.start_position();
-    let end_pos = node.end_position();
     let raw_body = node_text(node, content);
     let first_line = raw_body.lines().next().unwrap_or("").trim();
     let signature = if matches!(kind, SymbolKind::Constant | SymbolKind::Variable) {
@@ -733,45 +1015,30 @@ fn create_symbol(
         extract_signature_ast(node, content, first_line)
     };
 
-    let local_types = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-        collect_local_receiver_types(node, content, enclosing_type)
+    let mut scopes = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        init_fn_param_scope(node, content, enclosing_type)
     } else {
-        HashMap::new()
+        ScopeStack::new()
     };
 
     let mut refs = RefCollector::default();
     if let Some(tr) = impl_trait_mention {
         refs.push_mention(tr);
     }
-    collect_references(node, ctx, enclosing_type, &local_types, &mut refs, 0);
+    collect_references(node, ctx, enclosing_type, &mut scopes, &mut refs, 0);
 
-    Symbol {
-        name,
-        kind,
-        file: ctx.file.to_string(),
-        start_line: start_pos.row + 1,
-        end_line: end_pos.row + 1,
-        signature,
-        body: String::new(),
-        centrality: 0.0,
-        calls: refs.calls,
-        mentions: refs.mentions,
-        call_counts: refs.counts,
-        member_calls: refs.member_calls,
-        external_imports: crate::model::symbol::empty_external_imports(),
-        flags,
-    }
+    build_symbol(node, ctx.file, name, kind, signature, refs, flags)
 }
 
 fn collect_references(
     node: Node,
     ctx: &RustWalkCtx<'_>,
     enclosing_type: Option<&str>,
-    local_types: &HashMap<String, String>,
+    scopes: &mut ScopeStack,
     refs: &mut RefCollector,
     depth: usize,
 ) {
-    if depth >= MAX_AST_DEPTH {
+    if ctx.check_depth(depth) {
         return;
     }
     let content = ctx.content;
@@ -792,21 +1059,62 @@ fn collect_references(
         ) {
             continue;
         }
-        if kind == "call_expression" {
-            extract_rust_call(child, ctx, enclosing_type, local_types, refs);
-        } else if kind == "type_identifier" {
-            refs.push_mention(node_text(child, content));
-        } else if kind == "identifier" {
-            if let Some((name, is_member)) = macro_token_call(child, content) {
-                refs.push_call(name, is_member);
-            } else {
-                let ident = node_text(child, content).trim();
-                if is_const_ident(ident) {
-                    refs.push_mention(ident);
+        match kind {
+            "block" | "for_expression" | "match_arm" => {
+                scopes.push();
+                collect_references(child, ctx, enclosing_type, scopes, refs, depth + 1);
+                scopes.pop();
+                continue;
+            }
+            "closure_expression" => {
+                scopes.push();
+                bind_closure_params(child, content, enclosing_type, scopes);
+                collect_references(child, ctx, enclosing_type, scopes, refs, depth + 1);
+                scopes.pop();
+                continue;
+            }
+            "let_declaration" => {
+                // Evaluate RHS/type under existing scope BEFORE binding/shadowing LHS.
+                collect_references(child, ctx, enclosing_type, scopes, refs, depth + 1);
+                if let Some(var) = child
+                    .child_by_field_name("pattern")
+                    .and_then(|p| extract_ident_pattern(p, content))
+                {
+                    let ty = child
+                        .child_by_field_name("type")
+                        .and_then(|t| unwrap_receiver_type(t, content, enclosing_type))
+                        .or_else(|| {
+                            child
+                                .child_by_field_name("value")
+                                .and_then(|v| infer_expr_type(v, content, enclosing_type))
+                        });
+                    if let Some(ty_name) = ty {
+                        scopes.insert(var.to_string(), ty_name);
+                    } else {
+                        scopes.shadow(var.to_string());
+                    }
+                }
+                continue;
+            }
+            "call_expression" => {
+                extract_rust_call(child, ctx, enclosing_type, scopes, refs);
+            }
+            "type_identifier" => {
+                refs.push_mention(node_text(child, content));
+            }
+            "identifier" => {
+                if let Some((name, is_member)) = macro_token_call(child, content) {
+                    refs.push_call(name, is_member);
+                } else {
+                    let ident = node_text(child, content).trim();
+                    if is_const_ident(ident) {
+                        refs.push_mention(ident);
+                    }
                 }
             }
+            _ => {}
         }
-        collect_references(child, ctx, enclosing_type, local_types, refs, depth + 1);
+        collect_references(child, ctx, enclosing_type, scopes, refs, depth + 1);
     }
 }
 
@@ -821,7 +1129,7 @@ fn extract_rust_call(
     call_node: Node,
     ctx: &RustWalkCtx<'_>,
     enclosing_type: Option<&str>,
-    local_types: &HashMap<String, String>,
+    scopes: &ScopeStack,
     refs: &mut RefCollector,
 ) {
     let content = ctx.content;
@@ -836,26 +1144,32 @@ fn extract_rust_call(
     }
     match func_node.kind() {
         "identifier" => {
-            refs.push_call(node_text(func_node, content), false);
+            let name = node_text(func_node, content).trim();
+            if !matches!(name, "Some" | "Ok" | "Err") {
+                refs.push_call(name, false);
+            }
         }
         "field_expression" => {
             let Some(field_node) = func_node.child_by_field_name("field") else {
                 return;
             };
             let func_name = node_text(field_node, content).trim();
-            refs.push_call(func_name, true);
+            if func_name.is_empty() {
+                return;
+            }
             if let Some(val_node) = func_node.child_by_field_name("value") {
                 let recv = node_text(val_node, content).trim();
-                if !func_name.is_empty() {
-                    if recv == "self" {
-                        if let Some(ty) = enclosing_type {
-                            refs.push_call(&format!("{ty}::{func_name}"), false);
-                        }
-                    } else if let Some(ty) = local_types.get(recv) {
+                if recv == "self" {
+                    if let Some(ty) = enclosing_type {
                         refs.push_call(&format!("{ty}::{func_name}"), false);
+                        return;
                     }
+                } else if let Some(ty) = scopes.get(recv) {
+                    refs.push_call(&format!("{ty}::{func_name}"), false);
+                    return;
                 }
             }
+            refs.push_call(func_name, true);
         }
         "scoped_identifier" => {
             let Some(name_node) = func_node.child_by_field_name("name") else {
@@ -873,11 +1187,20 @@ fn extract_rust_call(
                     refs.push_call(&format!("{ty}::{func_name}"), false);
                     return;
                 }
-                // Preserve external module qualifier (e.g. `fs::write`, `serde_json::from_str`)
-                // so it hits `external_imports` instead of collapsing to bare `"write"`.
                 let (root_seg, last_seg) = extract_path_ends(path_node, content);
-                if ctx.external_set.contains(root_seg) || ctx.external_set.contains(last_seg) {
+                if is_rust_primitive_type(root_seg) {
+                    return;
+                }
+                if ctx.external_set.contains(root_seg) {
+                    refs.push_call(&format!("{root_seg}::{func_name}"), false);
+                    return;
+                }
+                if ctx.external_set.contains(last_seg) {
                     refs.push_call(&format!("{last_seg}::{func_name}"), false);
+                    return;
+                }
+                if ctx.outline_mods.contains(last_seg) {
+                    refs.push_call(&format!("{last_seg}:{func_name}"), false);
                     return;
                 }
             }
@@ -939,7 +1262,7 @@ fn extract_scoped_type<'a>(
     if seg == "Self" {
         return Some(enclosing_type.unwrap_or("Self"));
     }
-    if seg.starts_with(|c: char| c.is_ascii_uppercase()) || is_rust_primitive_type(seg) {
+    if seg.starts_with(|c: char| c.is_ascii_uppercase()) {
         return Some(seg);
     }
     if matches!(root_seg, "std" | "core" | "alloc") {
@@ -983,8 +1306,10 @@ fn macro_token_call<'a>(node: Node, content: &'a str) -> Option<(&'a str, bool)>
     Some((node_text(node, content), is_member))
 }
 
-fn is_local_use_root(first_seg: &str, aliases: &AliasSet) -> bool {
-    matches!(first_seg, "crate" | "self" | "super") || aliases.matches_rust(first_seg)
+fn is_local_use_root(first_seg: &str, aliases: &AliasSet, local_mods: &HashSet<String>) -> bool {
+    matches!(first_seg, "crate" | "self" | "super")
+        || aliases.matches_rust(first_seg)
+        || local_mods.contains(first_seg)
 }
 
 fn use_arg_root_segment<'a>(arg: Node, content: &'a str) -> &'a str {
@@ -1018,47 +1343,105 @@ fn collect_local_use_aliases(
     content: &str,
     out: &mut HashMap<String, (String, String)>,
     aliases: &AliasSet,
+    local_mods: &HashSet<String>,
+    depth_truncated: &Cell<bool>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     if node.kind() == "use_declaration" {
         if let Some(arg) = node.child_by_field_name("argument") {
             let first = use_arg_root_segment(arg, content);
-            if is_local_use_root(first, aliases) {
+            if is_local_use_root(first, aliases, local_mods) {
                 let mut prefix = Vec::new();
-                walk_use_ast_aliases(arg, content, &mut prefix, out, 0);
+                walk_use_ast_aliases(arg, content, aliases, &mut prefix, out, depth_truncated, 0);
             }
         }
         return;
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_local_use_aliases(c, content, out, aliases, depth + 1);
+        collect_local_use_aliases(
+            c,
+            content,
+            out,
+            aliases,
+            local_mods,
+            depth_truncated,
+            depth + 1,
+        );
+    }
+}
+
+fn record_use_binding(
+    prefix: &[String],
+    alias: Option<&str>,
+    aliases: &AliasSet,
+    out: &mut HashMap<String, (String, String)>,
+) {
+    let mut segs: Vec<&str> = prefix
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+        .collect();
+    if segs
+        .first()
+        .is_some_and(|first| aliases.matches_rust(first))
+    {
+        segs.remove(0);
+    }
+    let Some(orig) = segs.pop() else {
+        return;
+    };
+    if orig.is_empty() || orig == "self" || orig == "_" {
+        return;
+    }
+    let hint = segs.join("/");
+    match alias {
+        Some(a) if !a.is_empty() && a != "_" && a != orig => {
+            out.insert(a.to_string(), (hint, orig.to_string()));
+        }
+        None if !hint.is_empty() => {
+            out.entry(orig.to_string())
+                .or_insert_with(|| (hint, orig.to_string()));
+        }
+        _ => {}
     }
 }
 
 fn walk_use_ast_aliases(
     node: Node,
     content: &str,
+    aliases: &AliasSet,
     prefix: &mut Vec<String>,
     out: &mut HashMap<String, (String, String)>,
+    depth_truncated: &Cell<bool>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     match node.kind() {
         "scoped_use_list" => {
             let base_len = prefix.len();
             if let Some(path) = node.child_by_field_name("path") {
-                push_path_segments(path, content, prefix, depth + 1);
+                push_path_segments(path, content, prefix, depth_truncated, depth + 1);
             }
             if let Some(list) = node.child_by_field_name("list") {
                 let mut cursor = list.walk();
                 for c in list.named_children(&mut cursor) {
-                    walk_use_ast_aliases(c, content, prefix, out, depth + 1);
+                    walk_use_ast_aliases(
+                        c,
+                        content,
+                        aliases,
+                        prefix,
+                        out,
+                        depth_truncated,
+                        depth + 1,
+                    );
                 }
             }
             prefix.truncate(base_len);
@@ -1066,43 +1449,45 @@ fn walk_use_ast_aliases(
         "use_list" => {
             let mut cursor = node.walk();
             for c in node.named_children(&mut cursor) {
-                walk_use_ast_aliases(c, content, prefix, out, depth + 1);
+                walk_use_ast_aliases(c, content, aliases, prefix, out, depth_truncated, depth + 1);
             }
         }
         "use_as_clause" => {
             let base_len = prefix.len();
             if let Some(path) = node.child_by_field_name("path") {
-                push_path_segments(path, content, prefix, depth + 1);
+                push_path_segments(path, content, prefix, depth_truncated, depth + 1);
             }
             let alias = node
                 .child_by_field_name("alias")
-                .map(|a| node_text(a, content).trim())
-                .unwrap_or("");
-            let mut segs: Vec<&str> = prefix
-                .iter()
-                .map(String::as_str)
-                .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
-                .collect();
-            if let Some(orig) = segs.pop() {
-                if !orig.is_empty() && !alias.is_empty() && alias != "_" && orig != alias {
-                    let hint = segs.join("/");
-                    out.insert(alias.to_string(), (hint, orig.to_string()));
-                }
-            }
+                .map(|a| node_text(a, content).trim());
+            record_use_binding(prefix, alias, aliases, out);
+            prefix.truncate(base_len);
+        }
+        "scoped_identifier" | "identifier" => {
+            let base_len = prefix.len();
+            push_path_segments(node, content, prefix, depth_truncated, depth + 1);
+            record_use_binding(prefix, None, aliases, out);
             prefix.truncate(base_len);
         }
         _ => {}
     }
 }
 
-fn push_path_segments(node: Node, content: &str, prefix: &mut Vec<String>, depth: usize) {
+fn push_path_segments(
+    node: Node,
+    content: &str,
+    prefix: &mut Vec<String>,
+    depth_truncated: &Cell<bool>,
+    depth: usize,
+) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     match node.kind() {
         "scoped_identifier" => {
             if let Some(p) = node.child_by_field_name("path") {
-                push_path_segments(p, content, prefix, depth + 1);
+                push_path_segments(p, content, prefix, depth_truncated, depth + 1);
             }
             if let Some(n) = node.child_by_field_name("name") {
                 let seg = node_text(n, content).trim();
@@ -1121,9 +1506,23 @@ fn push_path_segments(node: Node, content: &str, prefix: &mut Vec<String>, depth
     }
 }
 
-fn collect_file_external_imports(root: Node, content: &str, aliases: &AliasSet) -> Vec<String> {
+fn collect_file_external_imports(
+    root: Node,
+    content: &str,
+    aliases: &AliasSet,
+    local_mods: &HashSet<String>,
+    depth_truncated: &Cell<bool>,
+) -> Vec<String> {
     let mut out = ImportSet::default();
-    collect_uses_external(root, content, &mut out, aliases, 0);
+    collect_uses_external(
+        root,
+        content,
+        &mut out,
+        aliases,
+        local_mods,
+        depth_truncated,
+        0,
+    );
     out.items
 }
 
@@ -1132,35 +1531,57 @@ fn collect_uses_external(
     content: &str,
     out: &mut ImportSet,
     aliases: &AliasSet,
+    local_mods: &HashSet<String>,
+    depth_truncated: &Cell<bool>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     if node.kind() == "use_declaration" {
         if let Some(arg) = node.child_by_field_name("argument") {
             let first = use_arg_root_segment(arg, content);
-            if !first.is_empty() && !is_local_use_root(first, aliases) {
+            if !first.is_empty() && !is_local_use_root(first, aliases, local_mods) {
                 let mut parent_seg: Option<String> = None;
-                walk_use_ast_externals(arg, content, &mut parent_seg, out, 0);
+                walk_use_ast_externals(
+                    arg,
+                    content,
+                    first,
+                    &mut parent_seg,
+                    out,
+                    depth_truncated,
+                    0,
+                );
             }
         }
         return;
     }
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
-        collect_uses_external(c, content, out, aliases, depth + 1);
+        collect_uses_external(
+            c,
+            content,
+            out,
+            aliases,
+            local_mods,
+            depth_truncated,
+            depth + 1,
+        );
     }
 }
 
 fn walk_use_ast_externals(
     node: Node,
     content: &str,
+    root_crate: &str,
     parent_seg: &mut Option<String>,
     out: &mut ImportSet,
+    depth_truncated: &Cell<bool>,
     depth: usize,
 ) {
     if depth >= MAX_AST_DEPTH {
+        depth_truncated.set(true);
         return;
     }
     match node.kind() {
@@ -1175,7 +1596,15 @@ fn walk_use_ast_externals(
             if let Some(list) = node.child_by_field_name("list") {
                 let mut cursor = list.walk();
                 for c in list.named_children(&mut cursor) {
-                    walk_use_ast_externals(c, content, parent_seg, out, depth + 1);
+                    walk_use_ast_externals(
+                        c,
+                        content,
+                        root_crate,
+                        parent_seg,
+                        out,
+                        depth_truncated,
+                        depth + 1,
+                    );
                 }
             }
             *parent_seg = prev;
@@ -1183,7 +1612,15 @@ fn walk_use_ast_externals(
         "use_list" => {
             let mut cursor = node.walk();
             for c in node.named_children(&mut cursor) {
-                walk_use_ast_externals(c, content, parent_seg, out, depth + 1);
+                walk_use_ast_externals(
+                    c,
+                    content,
+                    root_crate,
+                    parent_seg,
+                    out,
+                    depth_truncated,
+                    depth + 1,
+                );
             }
         }
         "use_as_clause" => {
@@ -1214,7 +1651,11 @@ fn walk_use_ast_externals(
                 out.push(p);
             }
         }
-        "use_wildcard" => {}
+        "use_wildcard" => {
+            // Record the root crate (e.g. `predicates` from `use predicates::prelude::*;`)
+            // so `predicates::str::contains` classifies as external.
+            out.push(root_crate);
+        }
         _ => {}
     }
 }
@@ -1222,6 +1663,7 @@ fn walk_use_ast_externals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn refs_of(src: &str, symbol: &str) -> Vec<String> {
         parse_rust("t.rs", src, &AliasSet::default())
@@ -1263,7 +1705,8 @@ mod tests {
             "a as b",
             "}".repeat(2000)
         );
-        let _ = parse_rust("b.rs", &src, &AliasSet::default());
+        let (_, diag) = parse_rust_with_diagnostics("b.rs", &src, &AliasSet::default()).unwrap();
+        assert!(diag.depth_truncated);
     }
 
     #[test]
@@ -1308,6 +1751,12 @@ mod tests {
             "{:?}",
             run.calls
         );
+        // Typed receiver must not double-emit bare member call.
+        assert!(
+            !run.member_calls.contains(&"load_all_symbols".to_string()),
+            "{:?}",
+            run.member_calls
+        );
         assert!(
             !syms.iter().any(|s| s.name == "LOCAL_ONLY"),
             "function-local const leaked: {:?}",
@@ -1315,5 +1764,131 @@ mod tests {
         );
         let test_fn = syms.iter().find(|s| s.name == "checks_it").unwrap();
         assert!(test_fn.is_test_flag());
+    }
+
+    #[test]
+    fn linear_comment_run_is_fast() {
+        let mut src = "// c\n".repeat(1000);
+        src.push_str("pub fn f() {}\n");
+        let start = Instant::now();
+        let syms = parse_rust("c.rs", &src, &AliasSet::default()).unwrap();
+        let dt = start.elapsed();
+        assert_eq!(syms.len(), 1);
+        assert!(dt.as_millis() < 100, "took {:?}", dt);
+    }
+
+    #[test]
+    fn serde_skip_serializing_if_and_raw_string_injection_defense() {
+        let src = r##"
+            struct S {
+                #[serde(default, skip_serializing_if = "is_zero_u8")]
+                flags: u8,
+                #[serde(rename = r#"default = "evil""#)]
+                name: String,
+            }
+            fn is_zero_u8(v: &u8) -> bool { *v == 0 }
+            fn evil() {}
+        "##;
+        let syms = parse_rust("s.rs", src, &AliasSet::default()).unwrap();
+        let is_zero = syms.iter().find(|s| s.name == "is_zero_u8").unwrap();
+        let evil = syms.iter().find(|s| s.name == "evil").unwrap();
+        assert!(is_zero.is_attr_entry());
+        assert!(!evil.is_attr_entry());
+    }
+
+    #[test]
+    fn rust_flags_reject_cfg_not_test_and_pub_crate_and_detect_attr_entries() {
+        let src = r#"
+            #![cfg_attr(feature = "latest", allow(dead_code))]
+            #[cfg(not(test))]
+            pub(crate) fn f() {}
+            #[cfg(feature = "latest")]
+            pub fn g() {}
+            #[tokio::main]
+            async fn main() {}
+            #[proc_macro_derive(MyDerive)]
+            pub fn my_derive() {}
+        "#;
+        let syms = parse_rust("a.rs", src, &AliasSet::default()).unwrap();
+        let f = syms.iter().find(|s| s.name == "f").unwrap();
+        assert_eq!(f.flags, 0, "flags={:#b}", f.flags);
+        let g = syms.iter().find(|s| s.name == "g").unwrap();
+        assert!(g.is_public());
+        assert!(!g.is_test_flag());
+        let main = syms.iter().find(|s| s.name == "main").unwrap();
+        assert!(main.is_attr_entry());
+        let md = syms.iter().find(|s| s.name == "my_derive").unwrap();
+        assert!(md.is_attr_entry());
+        assert!(md.is_public());
+    }
+
+    #[test]
+    fn inner_cfg_test_marks_file_and_module_items() {
+        let src = "#![cfg(test)]\nfn helper() {}\n";
+        let syms = parse_rust("src/t.rs", src, &AliasSet::default()).unwrap();
+        assert!(syms[0].is_test_flag());
+    }
+
+    #[test]
+    fn sibling_mod_use_is_local_not_external() {
+        let src = r#"
+            pub mod lang;
+            pub use lang::Language;
+            pub fn parse_file() { Language::from_path(); }
+        "#;
+        let syms = parse_rust("src/parser/mod.rs", src, &AliasSet::default()).unwrap();
+        let pf = syms.iter().find(|s| s.name == "parse_file").unwrap();
+        assert!(!pf.external_imports.contains(&"Language".to_string()));
+        assert!(pf.calls.contains(&"Language::from_path".to_string()));
+    }
+
+    #[test]
+    fn lexical_scope_prevents_shadowing_and_match_scrutinee_phantoms() {
+        let src = r#"
+            struct Foo;
+            struct Bar;
+            impl Bar { fn new() -> Self { Self } fn to_other() -> i32 { 0 } }
+            fn f(x: Foo) {
+                x.a();
+                let x = Bar::new();
+                x.b();
+                let y = Bar::to_other();
+                y.c();
+                let z = match Order::parse() { _ => Report::new() };
+                z.render();
+            }
+        "#;
+        let calls = refs_of(src, "f");
+        assert!(calls.contains(&"Foo::a".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"Bar::a".to_string()), "{calls:?}");
+        assert!(calls.contains(&"Bar::b".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"Bar::c".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"Order::render".to_string()), "{calls:?}");
+    }
+
+    #[test]
+    fn non_aliased_local_use_emits_module_hint_and_primitive_not_struct() {
+        let src = r#"
+            use crate::a::dup;
+            use predicates::prelude::*;
+            pub fn c() {
+                dup();
+                let _ = predicates::str::contains("x");
+                let _ = u32::from_be_bytes([0; 4]);
+            }
+        "#;
+        let syms = parse_rust("lib.rs", src, &AliasSet::default()).unwrap();
+        let c = syms.iter().find(|s| s.name == "c").unwrap();
+        assert!(c.calls.contains(&"a:dup".to_string()), "{:?}", c.calls);
+        assert!(
+            !c.calls.contains(&"str::contains".to_string()),
+            "{:?}",
+            c.calls
+        );
+        assert!(
+            !c.calls.contains(&"u32::from_be_bytes".to_string()),
+            "{:?}",
+            c.calls
+        );
     }
 }

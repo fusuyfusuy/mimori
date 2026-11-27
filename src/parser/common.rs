@@ -1,9 +1,70 @@
-use std::collections::{BTreeMap, HashSet};
+use crate::model::{Symbol, SymbolKind};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tree_sitter::Node;
 
 /// Hard AST recursion bound shared across all polyglot parsers to prevent stack
 /// overflow on pathological or adversarial syntax trees.
 pub const MAX_AST_DEPTH: usize = 128;
+
+/// Structured parse health diagnostics surfaced alongside extracted symbols.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseDiagnostics {
+    pub has_error: bool,
+    pub depth_truncated: bool,
+}
+
+impl ParseDiagnostics {
+    pub fn has_issues(&self) -> bool {
+        self.has_error || self.depth_truncated
+    }
+}
+
+/// Lexical scope stack tracking local variable -> inferred receiver type mappings.
+/// Storing `Option<String>` ensures an untyped inner re-binding (`let x = unknown()`)
+/// shadows an outer typed binding instead of leaking the outer type.
+#[derive(Default)]
+pub struct ScopeStack {
+    frames: Vec<HashMap<String, Option<String>>>,
+}
+
+impl ScopeStack {
+    pub fn new() -> Self {
+        Self {
+            frames: vec![HashMap::new()],
+        }
+    }
+
+    pub fn push(&mut self) {
+        self.frames.push(HashMap::new());
+    }
+
+    pub fn pop(&mut self) {
+        if self.frames.len() > 1 {
+            self.frames.pop();
+        }
+    }
+
+    pub fn insert(&mut self, name: String, ty: String) {
+        if let Some(top) = self.frames.last_mut() {
+            top.insert(name, Some(ty));
+        }
+    }
+
+    pub fn shadow(&mut self, name: String) {
+        if let Some(top) = self.frames.last_mut() {
+            top.insert(name, None);
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        for frame in self.frames.iter().rev() {
+            if let Some(entry) = frame.get(name) {
+                return entry.as_deref();
+            }
+        }
+        None
+    }
+}
 
 /// Slice raw source bytes for a Tree-sitter node safely.
 pub fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
@@ -68,6 +129,36 @@ impl RefCollector {
         if !name.is_empty() && self.mention_set.insert(name.to_string()) {
             self.mentions.push(name.to_string());
         }
+    }
+}
+
+/// Shared constructor for extracted `Symbol` records across all language parsers.
+pub fn build_symbol(
+    node: Node,
+    file: &str,
+    name: String,
+    kind: SymbolKind,
+    signature: String,
+    refs: RefCollector,
+    flags: u8,
+) -> Symbol {
+    let start_pos = node.start_position();
+    let end_pos = node.end_position();
+    Symbol {
+        name,
+        kind,
+        file: file.to_string(),
+        start_line: start_pos.row + 1,
+        end_line: end_pos.row + 1,
+        signature,
+        body: String::new(),
+        centrality: 0.0,
+        calls: refs.calls,
+        mentions: refs.mentions,
+        call_counts: refs.counts,
+        member_calls: refs.member_calls,
+        external_imports: crate::model::symbol::empty_external_imports(),
+        flags,
     }
 }
 

@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/fusuyfusuy/mimori/actions/workflows/ci.yml/badge.svg)](https://github.com/fusuyfusuy/mimori/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-3.2.0-blue.svg)](https://github.com/fusuyfusuy/mimori/releases/tag/v3.2.0)
+[![Version](https://img.shields.io/badge/version-3.2.1-blue.svg)](https://github.com/fusuyfusuy/mimori/releases/tag/v3.2.1)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 `mimori` is a single-binary, zero-daemon AST code-intelligence and in-repo agent memory engine written in Rust. It uses embedded Tree-sitter parsers (Rust, TypeScript/JavaScript/TSX/JSX, Python, Go) and an atomic local SQLite cache to answer two questions in ~20 ms — over the CLI or native MCP stdio:
@@ -180,7 +180,7 @@ Agent skill instructions live in [SKILL.md](SKILL.md) (mirrored byte-identically
 
 ## MCP Server
 
-Run `mimori` over JSON-RPC 2.0 stdio (`Content-Length` framed or NDJSON). Warm MCP sessions hold an LRU in-memory graph cache gated by POSIX `ino+size+mtime+ctime` stat fingerprints so repeated calls avoid disk re-hashing.
+Run `mimori` over JSON-RPC 2.0 stdio (accepts `Content-Length` framed or NDJSON requests; emits NDJSON responses). Warm MCP sessions hold an LRU in-memory graph cache gated by POSIX `ino+size+mtime+ctime` stat fingerprints so repeated calls avoid disk re-hashing.
 
 ```json
 {
@@ -261,7 +261,7 @@ Ambiguous symbols never guess silently — `mimori` exits `1` with ranked candid
 
 ## Design Invariants & Honest Limits
 
-- **Supported languages**: Rust (`.rs`), TypeScript (`.ts`, `.mts`, `.cts`), TSX/JSX (`.tsx`, `.jsx`), JavaScript (`.js`, `.mjs`, `.cjs`), Python (`.py`), and Go (`.go`), with monorepo alias resolution (`tsconfig.json`, `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.mod`, `pyproject.toml`).
+- **Supported languages**: Rust (`.rs`), TypeScript (`.ts`, `.mts`, `.cts`), TSX/JSX (`.tsx`, `.jsx`), JavaScript (`.js`, `.mjs`, `.cjs`), Python (`.py`), and Go (`.go`), with monorepo alias resolution (`tsconfig.json`, `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.mod`).
 - **Static AST precision, not full typechecking**: Local receiver types and imports are resolved from ASTs; untyped cross-file `.method()` calls are tracked explicitly and surfaced as `blast` warnings rather than silently linked or silently omitted.
 - **Content-hash indexed, zero daemons**: `.mimori/index.db` uses atomic SQLite WAL transactions keyed on FNV-1a content hashes (`PARSER_VERSION` bumps auto-rebuild). Corrupt caches rebuild automatically; read-only workspaces fall back to in-memory indexing.
 - **Strict workspace confinement**: CLI coordinates, MCP `workspace_dir`, `--scope` filters, manifest discovery, and `clean --all` enforce lexical normalization and symlink confinement — no outside-root reads, writes, or `../` existence oracles.

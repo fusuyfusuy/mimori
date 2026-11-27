@@ -9,6 +9,7 @@ use std::path::Path;
 const MAX_LITERAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LITERAL_HITS: usize = 500;
 const MAX_LITERAL_PREVIEW_CHARS: usize = 160;
+const MAX_LITERAL_SIGNATURE_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindMatch {
@@ -147,6 +148,38 @@ fn split_query_terms(query: &str) -> Vec<String> {
     parts
 }
 
+fn truncate_literal_snippet(line: &str, terms: &[&String], max_chars: usize) -> String {
+    let trimmed = line.trim();
+    let total_chars = trimmed.chars().count();
+    if total_chars <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let lowered = trimmed.to_lowercase();
+    let match_char_idx = terms
+        .iter()
+        .filter_map(|t| lowered.find(t.as_str()))
+        .min()
+        .map(|byte_idx| lowered[..byte_idx].chars().count().min(total_chars))
+        .unwrap_or(0);
+
+    let half = max_chars / 2;
+    let max_start = total_chars.saturating_sub(max_chars);
+    let start = match_char_idx.saturating_sub(half).min(max_start);
+    let end = (start + max_chars).min(total_chars);
+
+    let slice: String = trimmed.chars().skip(start).take(end - start).collect();
+    let mut out = String::with_capacity(slice.len() + 6);
+    if start > 0 {
+        out.push_str("...");
+    }
+    out.push_str(&slice);
+    if end < total_chars {
+        out.push_str("...");
+    }
+    out
+}
+
 fn collect_literal_fallback(
     root: &Path,
     indexed_files: &[String],
@@ -172,21 +205,21 @@ fn collect_literal_fallback(
 
     let mut literal_count = 0usize;
     'files: for rel in &fallback_files {
-        if let Some(sc) = parsed_scope {
-            if !sc.matches_rel(rel) {
-                continue;
-            }
+        if parsed_scope.is_some_and(|sc| !sc.matches_rel(rel)) {
+            continue;
         }
         let Ok(confined) = crate::workspace::walker::confine_to_workspace(root, Path::new(rel))
         else {
             continue;
         };
-        if std::fs::metadata(&confined).is_ok_and(|m| m.len() > MAX_LITERAL_FILE_BYTES) {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&confined) else {
+        let Ok(Some(bytes)) =
+            crate::workspace::walker::read_bounded(&confined, MAX_LITERAL_FILE_BYTES)
+        else {
             continue;
         };
+        if bytes.contains(&0) {
+            continue;
+        }
         let content = String::from_utf8_lossy(&bytes);
         let file_syms = syms_by_file.get(rel.as_str());
         for (idx, line) in content.lines().enumerate() {
@@ -217,7 +250,11 @@ fn collect_literal_fallback(
                 coordinate,
                 start_line: line_no,
                 end_line: line_no,
-                signature: line.trim().to_string(),
+                signature: truncate_literal_snippet(
+                    line,
+                    unmatched_terms,
+                    MAX_LITERAL_SIGNATURE_CHARS,
+                ),
                 // Keep literal fallback at 0.0 so symbol declarations always outrank literals.
                 centrality: 0.0,
             });
@@ -229,36 +266,13 @@ fn collect_literal_fallback(
     }
 }
 
-pub fn execute_find(
+fn validate_find_inputs(
     root: &Path,
     query: &str,
     symbols_only: bool,
     files_only: bool,
     scope: Option<&str>,
-    limit: Option<usize>,
-) -> Result<FindResult> {
-    if query.trim().is_empty() {
-        bail!("Find pattern cannot be empty.");
-    }
-    if symbols_only && files_only {
-        bail!("Cannot combine --symbols-only and --files-only.");
-    }
-    if let Some(sc) = scope {
-        WorkspaceScope::parse(root, sc, false)?;
-    }
-    let graph = get_or_sync_graph(root)?;
-    execute_find_with_graph(root, &graph, query, symbols_only, files_only, scope, limit)
-}
-
-pub fn execute_find_with_graph(
-    root: &Path,
-    graph: &crate::graph::SymbolGraph,
-    query: &str,
-    symbols_only: bool,
-    files_only: bool,
-    scope: Option<&str>,
-    limit: Option<usize>,
-) -> Result<FindResult> {
+) -> Result<(Vec<String>, Option<WorkspaceScope>)> {
     if query.trim().is_empty() {
         bail!("Find pattern cannot be empty.");
     }
@@ -273,101 +287,96 @@ pub fn execute_find_with_graph(
         Some(sc) => Some(WorkspaceScope::parse(root, sc, false)?),
         None => None,
     };
+    Ok((q_terms, parsed_scope))
+}
 
-    let mut matches = Vec::new();
+fn collect_file_matches(
+    graph: &crate::graph::SymbolGraph,
+    q_terms: &[String],
+    parsed_scope: Option<&WorkspaceScope>,
+    matches: &mut Vec<FindMatch>,
+) {
+    let mut seen_files: HashSet<&str> = HashSet::new();
+    let iter_indexed = graph.indexed_files.iter().map(String::as_str);
+    let iter_syms = graph.symbols.iter().map(|s| s.file.as_str());
 
-    if !symbols_only {
-        let mut seen_files: HashSet<&str> = HashSet::new();
-        let iter_indexed = graph.indexed_files.iter().map(|s| s.as_str());
-        let iter_syms = graph.symbols.iter().map(|s| s.file.as_str());
-
-        for path in iter_indexed.chain(iter_syms) {
-            if !seen_files.insert(path) {
-                continue;
-            }
-            if let Some(sc) = &parsed_scope {
-                if !sc.matches_rel(path) {
-                    continue;
-                }
-            }
-            let path_lower = path.to_lowercase();
-            if q_terms.iter().any(|t| path_lower.contains(t)) {
-                matches.push(FindMatch {
-                    name: Path::new(path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    kind: "file".to_string(),
-                    file: path.to_string(),
-                    coordinate: path.to_string(),
-                    start_line: 1,
-                    end_line: 1,
-                    signature: String::new(),
-                    centrality: 0.0,
-                });
-            }
+    for path in iter_indexed.chain(iter_syms) {
+        if !seen_files.insert(path) || parsed_scope.is_some_and(|sc| !sc.matches_rel(path)) {
+            continue;
+        }
+        let path_lower = path.to_lowercase();
+        if q_terms.iter().any(|t| path_lower.contains(t)) {
+            matches.push(FindMatch {
+                name: Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                kind: "file".to_string(),
+                file: path.to_string(),
+                coordinate: path.to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: String::new(),
+                centrality: 0.0,
+            });
         }
     }
+}
 
-    if !files_only {
-        for s in &graph.symbols {
-            if let Some(sc) = &parsed_scope {
-                if !sc.matches_rel(&s.file) {
-                    continue;
-                }
-            }
-            let name_lower = s.name.to_lowercase();
-            if q_terms.iter().any(|t| name_lower.contains(t)) {
-                matches.push(FindMatch {
-                    name: s.name.clone(),
-                    kind: s.kind.as_str().to_string(),
-                    file: s.file.clone(),
-                    coordinate: s.coordinate(),
-                    start_line: s.start_line,
-                    end_line: s.end_line,
-                    signature: s.signature.clone(),
-                    centrality: s.centrality,
-                });
-            }
+fn collect_symbol_matches(
+    graph: &crate::graph::SymbolGraph,
+    q_terms: &[String],
+    parsed_scope: Option<&WorkspaceScope>,
+    matches: &mut Vec<FindMatch>,
+) {
+    for s in &graph.symbols {
+        if parsed_scope.is_some_and(|sc| !sc.matches_rel(&s.file)) {
+            continue;
+        }
+        let name_lower = s.name.to_lowercase();
+        if q_terms.iter().any(|t| name_lower.contains(t)) {
+            matches.push(FindMatch {
+                name: s.name.clone(),
+                kind: s.kind.as_str().to_string(),
+                file: s.file.clone(),
+                coordinate: s.coordinate(),
+                start_line: s.start_line,
+                end_line: s.end_line,
+                signature: s.signature.clone(),
+                centrality: s.centrality,
+            });
         }
     }
+}
 
+fn find_unmatched_terms<'a>(q_terms: &'a [String], matches: &[FindMatch]) -> Vec<&'a String> {
     let match_lowers: Vec<(String, String)> = matches
         .iter()
         .map(|m| {
-            (
-                m.name.to_lowercase(),
-                if m.kind == "file" {
-                    m.file.to_lowercase()
-                } else {
-                    String::new()
-                },
-            )
+            let file_l = if m.kind == "file" {
+                m.file.to_lowercase()
+            } else {
+                String::new()
+            };
+            (m.name.to_lowercase(), file_l)
         })
         .collect();
 
-    if !files_only && !symbols_only {
-        let unmatched_terms: Vec<&String> = q_terms
-            .iter()
-            .filter(|t| {
-                !match_lowers.iter().any(|(nl, fl)| {
-                    nl.contains(t.as_str()) || (!fl.is_empty() && fl.contains(t.as_str()))
-                })
+    q_terms
+        .iter()
+        .filter(|t| {
+            !match_lowers.iter().any(|(nl, fl)| {
+                nl.contains(t.as_str()) || (!fl.is_empty() && fl.contains(t.as_str()))
             })
-            .collect();
+        })
+        .collect()
+}
 
-        if !unmatched_terms.is_empty() {
-            collect_literal_fallback(
-                root,
-                &graph.indexed_files,
-                &graph.symbols,
-                parsed_scope.as_ref(),
-                &unmatched_terms,
-                &mut matches,
-            );
-        }
-    }
-
+fn sort_and_truncate_matches(
+    matches: Vec<FindMatch>,
+    q_terms: &[String],
+    limit: Option<usize>,
+) -> (Vec<FindMatch>, Option<usize>) {
     let mut keyed: Vec<(bool, bool, FindMatch)> = matches
         .into_iter()
         .map(|m| {
@@ -377,6 +386,7 @@ pub fn execute_find_with_graph(
             (exact, is_decl, m)
         })
         .collect();
+
     keyed.sort_by(|(a_exact, a_decl, a), (b_exact, b_decl, b)| {
         b_exact
             .cmp(a_exact)
@@ -387,20 +397,101 @@ pub fn execute_find_with_graph(
             .then_with(|| a.start_line.cmp(&b.start_line))
             .then_with(|| a.name.cmp(&b.name))
     });
-    let mut matches: Vec<FindMatch> = keyed.into_iter().map(|(_, _, m)| m).collect();
 
-    let total_matches = matches.len();
+    let mut sorted: Vec<FindMatch> = keyed.into_iter().map(|(_, _, m)| m).collect();
+    let total_matches = sorted.len();
     let truncated_from = match limit {
         Some(n) if n < total_matches => {
-            matches.truncate(n);
+            sorted.truncate(n);
             Some(total_matches)
         }
         _ => None,
     };
+    (sorted, truncated_from)
+}
 
-    Ok(FindResult {
+#[allow(clippy::too_many_arguments)]
+fn execute_find_parsed(
+    root: &Path,
+    graph: &crate::graph::SymbolGraph,
+    query: &str,
+    q_terms: &[String],
+    symbols_only: bool,
+    files_only: bool,
+    parsed_scope: Option<&WorkspaceScope>,
+    limit: Option<usize>,
+) -> FindResult {
+    let mut matches = Vec::new();
+    if !symbols_only {
+        collect_file_matches(graph, q_terms, parsed_scope, &mut matches);
+    }
+    if !files_only {
+        collect_symbol_matches(graph, q_terms, parsed_scope, &mut matches);
+    }
+    if !files_only && !symbols_only {
+        let unmatched_terms = find_unmatched_terms(q_terms, &matches);
+        if !unmatched_terms.is_empty() {
+            collect_literal_fallback(
+                root,
+                &graph.indexed_files,
+                &graph.symbols,
+                parsed_scope,
+                &unmatched_terms,
+                &mut matches,
+            );
+        }
+    }
+
+    let (matches, truncated_from) = sort_and_truncate_matches(matches, q_terms, limit);
+    FindResult {
         query: query.to_string(),
         matches,
         truncated_from,
-    })
+    }
+}
+
+pub fn execute_find(
+    root: &Path,
+    query: &str,
+    symbols_only: bool,
+    files_only: bool,
+    scope: Option<&str>,
+    limit: Option<usize>,
+) -> Result<FindResult> {
+    let (q_terms, parsed_scope) =
+        validate_find_inputs(root, query, symbols_only, files_only, scope)?;
+    let graph = get_or_sync_graph(root)?;
+    Ok(execute_find_parsed(
+        root,
+        &graph,
+        query,
+        &q_terms,
+        symbols_only,
+        files_only,
+        parsed_scope.as_ref(),
+        limit,
+    ))
+}
+
+pub fn execute_find_with_graph(
+    root: &Path,
+    graph: &crate::graph::SymbolGraph,
+    query: &str,
+    symbols_only: bool,
+    files_only: bool,
+    scope: Option<&str>,
+    limit: Option<usize>,
+) -> Result<FindResult> {
+    let (q_terms, parsed_scope) =
+        validate_find_inputs(root, query, symbols_only, files_only, scope)?;
+    Ok(execute_find_parsed(
+        root,
+        graph,
+        query,
+        &q_terms,
+        symbols_only,
+        files_only,
+        parsed_scope.as_ref(),
+        limit,
+    ))
 }

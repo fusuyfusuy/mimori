@@ -1,6 +1,8 @@
 use crate::graph::blast::{traverse_multi_upstream, BlastNode};
 use crate::graph::SymbolGraph;
 use crate::memory::{check_debt, MemoryLedger};
+use crate::workspace::walker::MAX_INDEX_FILE_BYTES;
+use crate::workspace::AliasSet;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -10,6 +12,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_GIT_DIFF_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_GIT_STDERR_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MutatedSymbol {
@@ -31,6 +35,8 @@ pub struct DiffBlastReport {
     pub entry_points: Vec<String>,
     pub test_suites: Vec<String>,
     pub literal_test_mentions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_member_calls: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_notes: Vec<String>,
     pub debt_status: String,
@@ -46,6 +52,10 @@ impl DiffBlastReport {
             self.mutated_symbols.len(),
             self.affected.len()
         ));
+
+        if let Some(warn) = &self.unverified_member_calls {
+            out.push_str(&format!("> {}\n\n", warn));
+        }
 
         if !self.memory_notes.is_empty() {
             out.push_str("### Scoped Memory\n");
@@ -148,48 +158,37 @@ pub fn validate_diff_base(base: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn run_git_diff_with_timeout(root: &Path, staged: bool, base: Option<&str>) -> Result<String> {
+fn run_git_command_bounded(
+    root: &Path,
+    args: &[&str],
+    max_stdout: u64,
+    label: &str,
+) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .args([
-            "-c",
-            "core.quotepath=false",
-            "-c",
-            "diff.mnemonicPrefix=false",
-            "-c",
-            "diff.noprefix=false",
-            "diff",
-            "--relative",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            "-U0",
-        ]);
-    if staged {
-        cmd.arg("--staged");
-    }
-    if let Some(b) = base {
-        cmd.arg(b);
-    }
-    cmd.arg("--");
+        .args(args);
 
-    let mut child = cmd.spawn().context("Failed to execute 'git diff'")?;
-    let mut stdout_pipe = child.stdout.take().context("missing git stdout pipe")?;
-    let mut stderr_pipe = child.stderr.take().context("missing git stderr pipe")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to execute '{label}'"))?;
+    let stdout_pipe = child.stdout.take().context("missing git stdout pipe")?;
+    let stderr_pipe = child.stderr.take().context("missing git stderr pipe")?;
 
     let out_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stdout_pipe.take(max_stdout + 1).read_to_end(&mut buf);
+        let truncated = buf.len() as u64 > max_stdout;
+        if truncated {
+            buf.truncate(max_stdout as usize);
+        }
+        (buf, truncated)
     });
     let err_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
+        let _ = stderr_pipe.take(MAX_GIT_STDERR_BYTES).read_to_end(&mut buf);
         buf
     });
 
@@ -201,22 +200,93 @@ fn run_git_diff_with_timeout(root: &Path, staged: bool, base: Option<&str>) -> R
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    bail!("git diff timed out after {}s", GIT_DIFF_TIMEOUT.as_secs());
+                    bail!("{label} timed out after {}s", GIT_DIFF_TIMEOUT.as_secs());
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
     };
 
-    let stdout_bytes = out_handle.join().unwrap_or_default();
+    let (stdout_bytes, truncated) = out_handle.join().unwrap_or_default();
     let stderr_bytes = err_handle.join().unwrap_or_default();
+
+    if truncated {
+        bail!("{label} output exceeded {} byte safety cap", max_stdout);
+    }
 
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
-        bail!("git diff exited with error: {}", stderr.trim());
+        bail!("{label} exited with error: {}", stderr.trim());
     }
 
     Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
+}
+
+fn run_git_diff_with_timeout(root: &Path, staged: bool, base: Option<&str>) -> Result<String> {
+    let mut args = vec![
+        "-c",
+        "core.quotepath=false",
+        "-c",
+        "diff.mnemonicPrefix=false",
+        "-c",
+        "diff.noprefix=false",
+        "diff",
+        "--relative",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "-U0",
+    ];
+    if staged {
+        args.push("--staged");
+    }
+    if let Some(b) = base {
+        args.push(b);
+    }
+    args.push("--");
+    run_git_command_bounded(root, &args, MAX_GIT_DIFF_BYTES, "git diff")
+}
+
+fn run_git_show_index_blob(root: &Path, rel_path: &str) -> Option<String> {
+    let clean = rel_path.trim_start_matches("./");
+    if clean.is_empty() || clean.starts_with('/') || clean.contains('\0') {
+        return None;
+    }
+    let spec = format!(":./{clean}");
+    run_git_command_bounded(root, &["show", &spec], MAX_INDEX_FILE_BYTES, "git show").ok()
+}
+
+fn hunk_overlaps_span(h: &DiffHunk, start_line: usize, end_line: usize) -> bool {
+    if h.is_deletion {
+        h.start > 0 && start_line <= h.start && h.start <= end_line
+    } else {
+        start_line <= h.end && end_line >= h.start
+    }
+}
+
+fn match_staged_symbol_to_graph(
+    graph: &SymbolGraph,
+    file_syms: &[usize],
+    staged_sym: &crate::model::Symbol,
+) -> Option<usize> {
+    let exact_kind = file_syms
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let g = &graph.symbols[i];
+            g.name == staged_sym.name && g.kind == staged_sym.kind
+        })
+        .min_by_key(|&i| graph.symbols[i].start_line.abs_diff(staged_sym.start_line));
+    if exact_kind.is_some() {
+        return exact_kind;
+    }
+    file_syms
+        .iter()
+        .copied()
+        .filter(|&i| graph.symbols[i].name == staged_sym.name)
+        .min_by_key(|&i| graph.symbols[i].start_line.abs_diff(staged_sym.start_line))
 }
 
 pub fn calculate_diff_blast(
@@ -252,21 +322,51 @@ pub fn calculate_diff_blast(
         }
     }
 
+    let mut hunks_by_file: HashMap<&str, Vec<&DiffHunk>> = HashMap::new();
+    for h in &parsed.hunks {
+        hunks_by_file.entry(h.file.as_str()).or_default().push(h);
+    }
+
     let mut mutated_indices = Vec::new();
     let mut seen_mutated = HashSet::new();
-    for h in &parsed.hunks {
-        let Some(file_syms) = syms_by_file.get(h.file.as_str()) else {
+    let empty_aliases = AliasSet::default();
+
+    for (file, file_hunks) in &hunks_by_file {
+        let Some(file_syms) = syms_by_file.get(file) else {
             continue;
         };
-        for &idx in file_syms {
-            let sym = &graph.symbols[idx];
-            let overlaps = if h.is_deletion {
-                h.start > 0 && sym.start_line <= h.start && h.start < sym.end_line
-            } else {
-                sym.start_line <= h.end && sym.end_line >= h.start
-            };
-            if overlaps && seen_mutated.insert(idx) {
-                mutated_indices.push(idx);
+
+        let staged_parsed = if staged {
+            run_git_show_index_blob(root, file).and_then(|blob| {
+                crate::parser::parse_file(Path::new(file), &blob, &empty_aliases).ok()
+            })
+        } else {
+            None
+        };
+
+        if let Some(staged_syms) = staged_parsed {
+            for staged_sym in &staged_syms {
+                if file_hunks
+                    .iter()
+                    .any(|h| hunk_overlaps_span(h, staged_sym.start_line, staged_sym.end_line))
+                {
+                    if let Some(idx) = match_staged_symbol_to_graph(graph, file_syms, staged_sym) {
+                        if seen_mutated.insert(idx) {
+                            mutated_indices.push(idx);
+                        }
+                    }
+                }
+            }
+        } else {
+            for h in file_hunks {
+                for &idx in file_syms {
+                    let sym = &graph.symbols[idx];
+                    if hunk_overlaps_span(h, sym.start_line, sym.end_line)
+                        && seen_mutated.insert(idx)
+                    {
+                        mutated_indices.push(idx);
+                    }
+                }
             }
         }
     }
@@ -287,8 +387,7 @@ pub fn calculate_diff_blast(
         })
         .collect();
 
-    let (affected, entry_points, test_suites, literal_test_mentions) =
-        traverse_multi_upstream(graph, &mutated_indices, depth);
+    let upstream = traverse_multi_upstream(graph, &mutated_indices, depth);
 
     let file_refs: Vec<&str> = touched_files.iter().map(String::as_str).collect();
     let sym_refs: Vec<&str> = mutated_symbols.iter().map(|s| s.name.as_str()).collect();
@@ -309,10 +408,11 @@ pub fn calculate_diff_blast(
         touched_files,
         deleted_files: parsed.deleted_files,
         mutated_symbols,
-        affected,
-        entry_points,
-        test_suites,
-        literal_test_mentions,
+        affected: upstream.affected,
+        entry_points: upstream.entry_points,
+        test_suites: upstream.test_suites,
+        literal_test_mentions: upstream.literal_test_mentions,
+        unverified_member_calls: upstream.unverified_member_calls,
         memory_notes,
         debt_status,
         memory_status,
@@ -365,10 +465,17 @@ fn unquote_diff_path(raw: &str) -> String {
                     out.push(b'\r');
                     i += 2;
                 }
-                b'0'..=b'7' if i + 3 < bytes.len() => {
-                    let oct = &inner[i + 1..i + 4];
-                    if let Ok(val) = u8::from_str_radix(oct, 8) {
-                        out.push(val);
+                b'0'..=b'7'
+                    if i + 3 < bytes.len()
+                        && bytes[i + 1..i + 4]
+                            .iter()
+                            .all(|b| (b'0'..=b'7').contains(b)) =>
+                {
+                    let val = ((bytes[i + 1] - b'0') as u16 * 64)
+                        + ((bytes[i + 2] - b'0') as u16 * 8)
+                        + ((bytes[i + 3] - b'0') as u16);
+                    if val <= 255 {
+                        out.push(val as u8);
                         i += 4;
                         continue;
                     }
@@ -517,7 +624,8 @@ fn parse_hunk_header_counts(line: &str) -> Option<(usize, usize, usize, usize, b
         Some((old_count, start, start, 0, true))
     } else {
         let s = start.max(1);
-        Some((old_count, s, s + count - 1, count, false))
+        let end = s.saturating_add(count.checked_sub(1)?);
+        Some((old_count, s, end, count, false))
     }
 }
 
@@ -588,5 +696,113 @@ rename to src/new.rs
     fn unquote_diff_path_unescapes_c_escapes() {
         assert_eq!(unquote_diff_path("\"src/a\\\"b.rs\""), "src/a\"b.rs");
         assert_eq!(unquote_diff_path("\"src/a\\\\b.rs\""), "src/a\\b.rs");
+    }
+
+    #[test]
+    fn diff_parser_never_panics_on_utf8_octal_slice_or_usize_overflow() {
+        let malicious = "+++ \"b/\\0aé.rs\"\n@@ -1,1 +18446744073709551615,2 @@\n";
+        let parsed = parse_unified_diff(malicious);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].2, usize::MAX);
+    }
+
+    #[test]
+    fn pure_deletion_overlap_matches_braceless_tail_and_ignores_line_zero() {
+        let tail_del = DiffHunk {
+            file: "a.py".into(),
+            start: 2,
+            end: 2,
+            is_deletion: true,
+        };
+        assert!(hunk_overlaps_span(&tail_del, 1, 2));
+
+        let top_del = DiffHunk {
+            file: "a.py".into(),
+            start: 0,
+            end: 0,
+            is_deletion: true,
+        };
+        assert!(!hunk_overlaps_span(&top_del, 1, 2));
+    }
+
+    #[test]
+    fn staged_diff_uses_index_spans_and_emits_unverified_member_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub struct S;\nimpl S {\n    pub fn save_rows(&self) {\n        let a = 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app.rs"),
+            "pub fn run() {\n    let s = get_thing();\n    s.save_rows();\n}\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+
+        // Stage a change inside S::save_rows (L4).
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub struct S;\nimpl S {\n    pub fn save_rows(&self) {\n        let a = 2;\n    }\n}\n",
+        )
+        .unwrap();
+        run(&["add", "lib.rs"]);
+
+        // Now shift working-tree lines by inserting an unrelated function at top (unstaged!).
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn unrelated_top() {\n    let x = 0;\n    let y = 1;\n    let z = 2;\n}\npub struct S;\nimpl S {\n    pub fn save_rows(&self) {\n        let a = 2;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let aliases = AliasSet::default();
+        let mut syms = crate::parser::parse_file(
+            Path::new("lib.rs"),
+            &std::fs::read_to_string(dir.path().join("lib.rs")).unwrap(),
+            &aliases,
+        )
+        .unwrap();
+        syms.extend(
+            crate::parser::parse_file(
+                Path::new("app.rs"),
+                &std::fs::read_to_string(dir.path().join("app.rs")).unwrap(),
+                &aliases,
+            )
+            .unwrap(),
+        );
+        let graph = SymbolGraph::new(syms);
+        let report = calculate_diff_blast(dir.path(), &graph, true, None, 3).unwrap();
+        let mutated_names: Vec<&str> = report
+            .mutated_symbols
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(mutated_names, vec!["S::save_rows"]);
+        assert!(
+            report
+                .unverified_member_calls
+                .as_deref()
+                .is_some_and(|w| w.contains(".save_rows()")),
+            "expected unverified member warning in diff report, got: {:?}",
+            report.unverified_member_calls
+        );
     }
 }

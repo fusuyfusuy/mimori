@@ -1,18 +1,20 @@
 use super::ledger::{
-    classify_memory_heading, confine_agents_path, update_code_fence, FenceState, MemoryLedger,
-    MemorySection, MAX_DEBT_CEILING,
+    classify_memory_heading, confine_agents_path, strip_accepted_prefix, update_code_fence,
+    FenceState, MemoryLedger, MemorySection, MAX_DEBT_CEILING,
 };
 use crate::workspace::walker::{is_disallowed_workspace_root, WorkspaceScope};
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Node, Parser};
 
 const MAX_DEBT_FILE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_AST_DEPTH: usize = 128;
+const DEFAULT_DEBT_COMMENT: &str =
+    "<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InCodeMarker {
@@ -111,8 +113,11 @@ fn parse_marker_from_comment_text(
         } else {
             continue;
         };
-        let boundary_ok =
-            i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'/' | b'*' | b'#' | b'-');
+        let boundary_ok = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'/' | b'*' | b'#' | b'-' | b'!'
+            );
         if boundary_ok {
             payload_start = Some(i + prefix_len);
             break;
@@ -120,13 +125,14 @@ fn parse_marker_from_comment_text(
     }
 
     let start = payload_start?;
-    let mut slice = &comment_line[start..];
+    let mut slice = comment_line[start..].trim();
+    // Only strip a genuine closing `*/` at the end of the comment line; never
+    // `rfind("*/")` mid-line, which corrupts glob patterns like `src/*/foo.rs`.
     if is_block_comment {
-        if let Some(end_idx) = slice.rfind("*/") {
-            slice = &slice[..end_idx];
+        if let Some(stripped) = slice.strip_suffix("*/") {
+            slice = stripped.trim_end();
         }
     }
-    let slice = slice.trim();
 
     let Some(left_idx) = slice.find("<-") else {
         return Some(InCodeMarker {
@@ -182,40 +188,205 @@ fn parse_marker_from_comment_text(
     })
 }
 
-fn collect_ts_comments(
+fn extract_comment_node_markers(
     node: Node,
     source: &str,
     lines: &[&str],
     file: &str,
-    depth: usize,
     out: &mut Vec<InCodeMarker>,
 ) {
-    if depth > MAX_AST_DEPTH {
+    let Ok(text) = node.utf8_text(source.as_bytes()) else {
+        return;
+    };
+    if !has_marker_keyword(text) {
         return;
     }
-    let kind = node.kind();
-    if kind == "line_comment" || kind == "block_comment" || kind == "comment" {
-        if let Ok(text) = node.utf8_text(source.as_bytes()) {
-            if has_marker_keyword(text) {
-                let is_block = text.starts_with("/*");
-                let start_row = node.start_position().row;
-                for (offset, seg) in text.lines().enumerate() {
-                    let line_no = start_row + offset + 1;
-                    let raw = lines.get(start_row + offset).copied().unwrap_or(seg);
-                    if let Some(m) =
-                        parse_marker_from_comment_text(seg, is_block, file, line_no, raw)
-                    {
-                        out.push(m);
-                    }
-                }
+    let is_block = text.starts_with("/*");
+    let start_row = node.start_position().row;
+    for (offset, seg) in text.lines().enumerate() {
+        let line_no = start_row + offset + 1;
+        let raw = lines.get(start_row + offset).copied().unwrap_or(seg);
+        if let Some(m) = parse_marker_from_comment_text(seg, is_block, file, line_no, raw) {
+            out.push(m);
+        }
+    }
+}
+
+/// Iterative TreeCursor pre-order traversal so arbitrarily deep ASTs never
+/// stack-overflow or silently drop markers past an arbitrary depth cap.
+fn collect_ts_comments(
+    root: Node,
+    source: &str,
+    lines: &[&str],
+    file: &str,
+    out: &mut Vec<InCodeMarker>,
+) {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        let is_comment = kind == "line_comment" || kind == "block_comment" || kind == "comment";
+
+        if is_comment {
+            extract_comment_node_markers(node, source, lines, file, out);
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
             }
         }
-        return;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_ts_comments(child, source, lines, file, depth + 1, out);
+}
+
+fn push_comment_segment(
+    seg: &str,
+    is_block: bool,
+    file: &str,
+    line_no: usize,
+    lines: &[&str],
+    out: &mut Vec<InCodeMarker>,
+) {
+    let raw = lines.get(line_no.saturating_sub(1)).copied().unwrap_or(seg);
+    if let Some(m) = parse_marker_from_comment_text(seg, is_block, file, line_no, raw) {
+        out.push(m);
     }
+}
+
+fn scan_hash_comments(content: &str, lines: &[&str], file: &str) -> Vec<InCodeMarker> {
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut quote: u8 = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if quote != 0 {
+                if b == b'\\' && quote == b'"' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'"' || b == b'\'' {
+                quote = b;
+                i += 1;
+            } else if b == b'#' {
+                push_comment_segment(&line[i + 1..], false, file, idx + 1, lines, &mut out);
+                break;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let _ = content;
+    out
+}
+
+fn scan_c_or_sql_comments(
+    content: &str,
+    lines: &[&str],
+    file: &str,
+    sql_mode: bool,
+) -> Vec<InCodeMarker> {
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut line_no = 1usize;
+    let mut quote: u8 = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if b == b'\n' {
+                line_no += 1;
+                if !sql_mode {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            if sql_mode && b == quote && i + 1 < bytes.len() && bytes[i + 1] == quote {
+                i += 2;
+                continue;
+            }
+            if !sql_mode && b == b'\\' && i + 1 < bytes.len() {
+                if bytes[i + 1] == b'\n' {
+                    line_no += 1;
+                }
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'\n' {
+            line_no += 1;
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = b;
+            i += 1;
+            continue;
+        }
+
+        let is_line_comment = if sql_mode {
+            b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-'
+        } else {
+            b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/'
+        };
+        if is_line_comment {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'\n' {
+                end += 1;
+            }
+            let seg = content[start..end].trim_end_matches('\r');
+            push_comment_segment(seg, false, file, line_no, lines, &mut out);
+            i = end;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut seg_start = i;
+            let mut seg_line = line_no;
+            while i < bytes.len() {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    let seg = content[seg_start..i].trim_end_matches('\r');
+                    push_comment_segment(seg, true, file, seg_line, lines, &mut out);
+                    i += 2;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    let seg = content[seg_start..i].trim_end_matches('\r');
+                    push_comment_segment(seg, true, file, seg_line, lines, &mut out);
+                    line_no += 1;
+                    i += 1;
+                    seg_start = i;
+                    seg_line = line_no;
+                    continue;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
 }
 
 fn scan_content_markers(content: &str, file: &str, style: CommentStyle) -> Vec<InCodeMarker> {
@@ -233,35 +404,13 @@ fn scan_content_markers(content: &str, file: &str, style: CommentStyle) -> Vec<I
                 return Vec::new();
             };
             let mut out = Vec::new();
-            collect_ts_comments(tree.root_node(), content, &lines, file, 0, &mut out);
+            collect_ts_comments(tree.root_node(), content, &lines, file, &mut out);
             out
         }
-        CommentStyle::HashLine => scan_line_prefix_comments(&lines, file, "#", false),
-        CommentStyle::SqlDash => scan_line_prefix_comments(&lines, file, "--", false),
-        CommentStyle::CStyle => {
-            let mut out = scan_line_prefix_comments(&lines, file, "//", false);
-            out.extend(scan_line_prefix_comments(&lines, file, "/*", true));
-            out
-        }
+        CommentStyle::HashLine => scan_hash_comments(content, &lines, file),
+        CommentStyle::SqlDash => scan_c_or_sql_comments(content, &lines, file, true),
+        CommentStyle::CStyle => scan_c_or_sql_comments(content, &lines, file, false),
     }
-}
-
-fn scan_line_prefix_comments(
-    lines: &[&str],
-    file: &str,
-    prefix: &str,
-    is_block: bool,
-) -> Vec<InCodeMarker> {
-    let mut out = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            if let Some(m) = parse_marker_from_comment_text(rest, is_block, file, idx + 1, line) {
-                out.push(m);
-            }
-        }
-    }
-    out
 }
 
 /// Public single-line helper preserved for callers/tests inspecting comment lines directly.
@@ -280,26 +429,16 @@ pub fn parse_mimodept_line(line: &str, file: &str, line_no: usize) -> Option<InC
     }
 }
 
-pub fn scan_debt_markers_checked(
-    root: &Path,
-    scope: Option<&str>,
-) -> Result<(Vec<InCodeMarker>, Vec<String>)> {
-    if is_disallowed_workspace_root(root) {
-        bail!(
-            "Refusing to scan debt in home or system directory '{}'",
-            root.display()
-        );
-    }
-    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let scan_root = match scope {
-        Some(sc) => {
-            let parsed = WorkspaceScope::parse(&canon_root, sc, true)?;
-            parsed.canon_path.unwrap_or_else(|| canon_root.clone())
-        }
-        None => canon_root.clone(),
-    };
+enum FileScan {
+    Ok(Vec<InCodeMarker>),
+    Err(String),
+}
 
-    let mut builder = crate::workspace::walker::walk_builder(&scan_root);
+fn collect_debt_scan_files(
+    canon_root: &Path,
+    scan_root: &Path,
+) -> Vec<(PathBuf, String, CommentStyle)> {
+    let mut builder = crate::workspace::walker::walk_builder(scan_root);
     builder.hidden(false).follow_links(false);
     if scan_root != canon_root {
         let root_ignore = canon_root.join(".mimoriignore");
@@ -314,7 +453,7 @@ pub fn scan_debt_markers_checked(
             continue;
         }
         let path = entry.path();
-        let Ok(rel) = path.strip_prefix(&canon_root) else {
+        let Ok(rel) = path.strip_prefix(canon_root) else {
             continue;
         };
         if path
@@ -341,26 +480,55 @@ pub fn scan_debt_markers_checked(
         let rel_str = crate::workspace::walker::normalize_rel_str(rel);
         files.push((path.to_path_buf(), rel_str, style));
     }
+    files
+}
 
-    enum FileScan {
-        Ok(Vec<InCodeMarker>),
-        Err(String),
+fn scan_single_file(full_path: &Path, rel_path: &str, style: CommentStyle) -> FileScan {
+    let Ok(meta) = fs::metadata(full_path) else {
+        return FileScan::Err(format!("{}: cannot stat", rel_path));
+    };
+    if meta.len() > MAX_DEBT_FILE_BYTES {
+        return FileScan::Err(format!("{}: exceeds 8 MiB scan cap", rel_path));
     }
+    let Ok(file) = File::open(full_path) else {
+        return FileScan::Err(format!("{}: cannot open", rel_path));
+    };
+    let mut buf = Vec::new();
+    if let Err(e) = file.take(MAX_DEBT_FILE_BYTES + 1).read_to_end(&mut buf) {
+        return FileScan::Err(format!("{}: {}", rel_path, e));
+    }
+    if buf.len() as u64 > MAX_DEBT_FILE_BYTES {
+        return FileScan::Err(format!("{}: exceeds 8 MiB scan cap", rel_path));
+    }
+    match String::from_utf8(buf) {
+        Ok(content) => FileScan::Ok(scan_content_markers(&content, rel_path, style)),
+        Err(e) => FileScan::Err(format!("{}: {}", rel_path, e)),
+    }
+}
 
+pub fn scan_debt_markers_checked(
+    root: &Path,
+    scope: Option<&str>,
+) -> Result<(Vec<InCodeMarker>, Vec<String>)> {
+    if is_disallowed_workspace_root(root) {
+        bail!(
+            "Refusing to scan debt in home or system directory '{}'",
+            root.display()
+        );
+    }
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let scan_root = match scope {
+        Some(sc) => {
+            let parsed = WorkspaceScope::parse(&canon_root, sc, true)?;
+            parsed.canon_path.unwrap_or_else(|| canon_root.clone())
+        }
+        None => canon_root.clone(),
+    };
+
+    let files = collect_debt_scan_files(&canon_root, &scan_root);
     let results: Vec<FileScan> = files
         .into_par_iter()
-        .map(|(full_path, rel_path, style)| {
-            let Ok(meta) = fs::metadata(&full_path) else {
-                return FileScan::Err(format!("{}: cannot stat", rel_path));
-            };
-            if meta.len() > MAX_DEBT_FILE_BYTES {
-                return FileScan::Err(format!("{}: exceeds 8 MiB scan cap", rel_path));
-            }
-            match fs::read_to_string(&full_path) {
-                Ok(content) => FileScan::Ok(scan_content_markers(&content, &rel_path, style)),
-                Err(e) => FileScan::Err(format!("{}: {}", rel_path, e)),
-            }
-        })
+        .map(|(full_path, rel_path, style)| scan_single_file(&full_path, &rel_path, style))
         .collect();
 
     let mut markers = Vec::new();
@@ -422,32 +590,9 @@ pub fn list_debt(root: &Path, scope: Option<&str>) -> Result<(Vec<InCodeMarker>,
     Ok((markers, lines.join("\n")))
 }
 
-fn strip_accepted_prefix(what: &str) -> &str {
-    let w = what.trim();
-    if w.len() >= 10 && w.as_bytes()[..10].eq_ignore_ascii_case(b"[accepted]") {
-        let rest = &w[10..];
-        return rest.strip_prefix(':').unwrap_or(rest).trim_start();
-    }
-    if w.len() >= 8 && w.as_bytes()[..8].eq_ignore_ascii_case(b"accepted") {
-        let rest = &w[8..];
-        if let Some(after_colon) = rest.strip_prefix(':') {
-            return after_colon.trim_start();
-        }
-        let trimmed = rest.trim_start();
-        if trimmed.len() < rest.len() {
-            return trimmed;
-        }
-    }
-    w
-}
-
 fn normalize_debt_key(what: &str, ceiling: &str, trigger: &str) -> String {
-    format!(
-        "{} <- {} -> {}",
-        strip_accepted_prefix(what),
-        ceiling.trim(),
-        trigger.trim()
-    )
+    let clean_what = strip_accepted_prefix(what).unwrap_or_else(|| what.trim());
+    format!("{} <- {} -> {}", clean_what, ceiling.trim(), trigger.trim())
 }
 
 pub fn check_debt(root: &Path) -> (bool, String) {
@@ -560,131 +705,193 @@ pub fn sync_debt(root: &Path) -> Result<(usize, usize, usize, String)> {
         MemoryLedger::scaffold(root, false)?;
     }
 
-    let ledger = MemoryLedger::load(root)?;
-    if ledger.debt_heading_count > 1 {
-        bail!(
-            "Refusing to sync debt: .agents/memory.md contains {} debt headings; consolidate to one `## KNOWN DEBT` section",
-            ledger.debt_heading_count
-        );
-    }
+    MemoryLedger::with_locked_ledger(root, |ledger| {
+        if ledger.debt_heading_count > 1 {
+            bail!(
+                "Refusing to sync debt: .agents/memory.md contains {} debt headings; consolidate to one `## KNOWN DEBT` section",
+                ledger.debt_heading_count
+            );
+        }
 
-    let valid_keys: HashSet<String> = valid_markers
-        .iter()
-        .map(|m| normalize_debt_key(&m.what, &m.ceiling, &m.trigger))
-        .collect();
+        let valid_keys: HashSet<String> = valid_markers
+            .iter()
+            .map(|m| normalize_debt_key(&m.what, &m.ceiling, &m.trigger))
+            .collect();
 
-    let mut manual_items: Vec<String> = Vec::new();
-    let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut accepted_by_key: HashMap<String, String> = HashMap::new();
+        let mut manual_items: Vec<String> = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
 
-    for item in &ledger.debt_items {
-        let key = normalize_debt_key(&item.what, &item.why, &item.trigger);
-        if item.is_accepted && !valid_keys.contains(&key) && seen_keys.insert(key) {
-            manual_items.push(format!(
-                "- {} <- {} -> {}",
-                item.what, item.why, item.trigger
-            ));
+        for item in &ledger.debt_items {
+            if !item.is_accepted {
+                continue;
+            }
+            let key = normalize_debt_key(&item.what, &item.why, &item.trigger);
+            let formatted = format!("- {} <- {} -> {}", item.what, item.why, item.trigger);
+            accepted_by_key
+                .entry(key.clone())
+                .or_insert_with(|| formatted.clone());
+            if !valid_keys.contains(&key) && seen_keys.insert(key) {
+                manual_items.push(formatted);
+            }
+        }
+
+        let mut combined_lines = manual_items.clone();
+        for m in &valid_markers {
+            let key = normalize_debt_key(&m.what, &m.ceiling, &m.trigger);
+            if seen_keys.insert(key.clone()) {
+                if let Some(accepted_line) = accepted_by_key.get(&key) {
+                    combined_lines.push(accepted_line.clone());
+                } else {
+                    combined_lines.push(format!("- {} <- {} -> {}", m.what, m.ceiling, m.trigger));
+                }
+            }
+        }
+
+        // Never truncate waivers or markers silently — preserve all items and warn above 30.
+        let synced_count = combined_lines.len();
+        let ceiling_breached = synced_count > MAX_DEBT_CEILING;
+
+        let pruned: Vec<String> = ledger
+            .debt_items
+            .iter()
+            .filter(|d| !d.is_accepted)
+            .filter(|d| {
+                let key = normalize_debt_key(&d.what, &d.why, &d.trigger);
+                !seen_keys.contains(&key)
+            })
+            .map(|d| format!("- {} <- {} -> {}", d.what, d.why, d.trigger))
+            .collect();
+
+        ledger.raw_content = replace_debt_section(&ledger.raw_content, &combined_lines);
+
+        let in_code_count = valid_markers.len();
+        let manual_count = manual_items.len();
+
+        let output = if ceiling_breached {
+            format!(
+                "DEBT_SYNC_WARN: soft ceiling exceeded ({}/{} lines, all preserved); in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
+                synced_count, MAX_DEBT_CEILING, in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
+            )
+        } else {
+            format!(
+                "DEBT_SYNC: in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
+                in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
+            )
+        };
+
+        let output = if pruned.is_empty() {
+            output
+        } else {
+            format!(
+                "{} PRUNED {} ledger line(s) with no in-code marker and no `accepted` prefix: {}",
+                output,
+                pruned.len(),
+                pruned.join(" | ")
+            )
+        };
+
+        Ok((in_code_count, manual_count, synced_count, output))
+    })
+}
+
+/// Extract non-debt comments (`<!-- ... -->`, `# ...`), subheadings (`### ...`),
+/// and fenced blocks from an existing `## KNOWN DEBT` section body so `debt sync`
+/// preserves author notes instead of wiping them.
+fn collect_preserved_debt_notes(section_lines: &[&str]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut fence = FenceState::default();
+    let mut in_html_comment = false;
+
+    for &line in section_lines {
+        let trimmed = line.trim();
+        if update_code_fence(line, &mut fence) {
+            kept.push(line.to_string());
+            continue;
+        }
+        if in_html_comment {
+            kept.push(line.to_string());
+            if trimmed.contains("-->") {
+                in_html_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            kept.push(line.to_string());
+            if !trimmed.contains("-->") {
+                in_html_comment = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            kept.push(line.to_string());
         }
     }
+    kept
+}
 
-    let mut combined_lines = manual_items.clone();
-    for m in &valid_markers {
-        let key = normalize_debt_key(&m.what, &m.ceiling, &m.trigger);
-        if seen_keys.insert(key) {
-            combined_lines.push(format!("- {} <- {} -> {}", m.what, m.ceiling, m.trigger));
-        }
-    }
-
-    // Never truncate waivers or markers silently — preserve all items and warn above 30.
-    let synced_count = combined_lines.len();
-    let ceiling_breached = synced_count > MAX_DEBT_CEILING;
-
-    let pruned: Vec<String> = ledger
-        .debt_items
+fn push_debt_section_body(
+    out: &mut Vec<String>,
+    existing_section_lines: &[&str],
+    new_debt_lines: &[String],
+) {
+    let preserved = collect_preserved_debt_notes(existing_section_lines);
+    let has_deliberate_hint = preserved
         .iter()
-        .filter(|d| !d.is_accepted)
-        .map(|d| format!("- {} <- {} -> {}", d.what, d.why, d.trigger))
-        .filter(|l| !combined_lines.contains(l))
-        .collect();
+        .any(|l| l.to_lowercase().contains("deliberate gaps"));
 
-    let updated_raw = replace_debt_section(&ledger.raw_content, &combined_lines);
-    MemoryLedger::atomic_write(&mem_path, &updated_raw)?;
-
-    let in_code_count = valid_markers.len();
-    let manual_count = manual_items.len();
-
-    let output = if ceiling_breached {
-        format!(
-            "DEBT_SYNC_WARN: soft ceiling exceeded ({}/{} lines, all preserved); in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
-            synced_count, MAX_DEBT_CEILING, in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
-        )
-    } else {
-        format!(
-            "DEBT_SYNC: in_code: {}; manual: {}; synced to .agents/memory.md: {}/{} lines; exit 0.",
-            in_code_count, manual_count, synced_count, MAX_DEBT_CEILING
-        )
-    };
-
-    let output = if pruned.is_empty() {
-        output
-    } else {
-        format!(
-            "{} PRUNED {} ledger line(s) with no in-code marker and no `accepted` prefix: {}",
-            output,
-            pruned.len(),
-            pruned.join(" | ")
-        )
-    };
-
-    Ok((in_code_count, manual_count, synced_count, output))
+    if !has_deliberate_hint {
+        out.push(DEFAULT_DEBT_COMMENT.to_string());
+    }
+    for note in preserved {
+        out.push(note);
+    }
+    out.push(String::new());
+    if !new_debt_lines.is_empty() {
+        for debt in new_debt_lines {
+            out.push(debt.clone());
+        }
+        out.push(String::new());
+    }
 }
 
 pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
 
-    let mut in_debt_section = false;
-    let mut debt_inserted = false;
+    let mut debt_start: Option<usize> = None;
+    let mut debt_end: Option<usize> = None;
     let mut fence = FenceState::default();
 
-    for line in lines {
-        let trimmed = line.trim();
-        let in_fence = update_code_fence(line, &mut fence);
-
-        if !in_fence {
-            if let Some(section) = classify_memory_heading(trimmed) {
-                if section == MemorySection::Debt && !debt_inserted {
-                    in_debt_section = true;
-                    out.push(line.to_string());
-                    out.push(
-                        "<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->"
-                            .to_string(),
-                    );
-                    out.push(String::new());
-                    if !new_debt_lines.is_empty() {
-                        for debt in new_debt_lines {
-                            out.push(debt.clone());
-                        }
-                        out.push(String::new());
-                    }
-                    debt_inserted = true;
-                    continue;
-                } else {
-                    in_debt_section = false;
-                }
-            }
-        }
-
-        if in_debt_section {
+    for (idx, &line) in lines.iter().enumerate() {
+        if update_code_fence(line, &mut fence) {
             continue;
         }
-
-        out.push(line.to_string());
+        if let Some(section) = classify_memory_heading(line) {
+            if debt_start.is_none() && section == MemorySection::Debt {
+                debt_start = Some(idx);
+            } else if debt_start.is_some() && debt_end.is_none() {
+                debt_end = Some(idx);
+            }
+        }
     }
 
-    if !debt_inserted {
+    if let Some(start) = debt_start {
+        let end = debt_end.unwrap_or(lines.len());
+        for &line in &lines[..=start] {
+            out.push(line.to_string());
+        }
+        push_debt_section_body(&mut out, &lines[start + 1..end], new_debt_lines);
+        for &line in &lines[end..] {
+            out.push(line.to_string());
+        }
+    } else {
+        for &line in &lines {
+            out.push(line.to_string());
+        }
         out.push(String::new());
         out.push("## KNOWN DEBT (open only — one line per item, delete when done)".to_string());
-        out.push("<!-- Deliberate gaps: - accepted <what> <- <why> -> <trigger> -->".to_string());
+        out.push(DEFAULT_DEBT_COMMENT.to_string());
         out.push(String::new());
         for debt in new_debt_lines {
             out.push(debt.clone());
@@ -701,6 +908,7 @@ pub fn replace_debt_section(content: &str, new_debt_lines: &[String]) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn treesitter_scanner_ignores_strings_raw_strings_and_ponytail() {
@@ -733,6 +941,114 @@ def demo():
         let found = scan_content_markers(src, "app.py", CommentStyle::TreeSitter(TsLang::Python));
         assert_eq!(found.len(), 1, "got: {found:?}");
         assert_eq!(found[0].what, "real py debt");
+    }
+
+    #[test]
+    fn block_comment_glob_and_bang_doc_comment_preserved() {
+        let src = "\
+/*
+ * mimodept: glob src/*/foo.rs <- O(n) -> cache
+ */
+//!mimodept: crate doc debt <- cap 1 -> refactor
+pub fn f() {}
+";
+        let found = scan_content_markers(src, "src/lib.rs", CommentStyle::TreeSitter(TsLang::Rust));
+        assert_eq!(found.len(), 2, "got: {found:?}");
+        assert_eq!(found[0].what, "glob src/*/foo.rs");
+        assert!(found[0].valid_trigger);
+        assert_eq!(found[1].what, "crate doc debt");
+        assert!(found[1].valid_trigger);
+    }
+
+    #[test]
+    fn non_ts_scanners_handle_multiline_and_inline_comments() {
+        let c_src = "\
+const char *fake = \"// mimodept: ignored <- 1 -> 2\";
+int x = 1; // mimodept: inline c debt <- 1 -> 2
+/*
+ * mimodept: multiline c glob src/*.c <- O(n) -> cache
+ */
+";
+        let c_found = scan_content_markers(c_src, "app.c", CommentStyle::CStyle);
+        assert_eq!(c_found.len(), 2, "got: {c_found:?}");
+        assert_eq!(c_found[0].what, "inline c debt");
+        assert_eq!(c_found[1].what, "multiline c glob src/*.c");
+
+        let sql_src = "\
+SELECT '-- mimodept: ignored <- 1 -> 2';
+SELECT 1 -- mimodept: inline sql debt <- 100 rows -> index
+/* mimodept: block sql debt <- full scan -> partition */
+";
+        let sql_found = scan_content_markers(sql_src, "q.sql", CommentStyle::SqlDash);
+        assert_eq!(sql_found.len(), 2, "got: {sql_found:?}");
+        assert_eq!(sql_found[0].what, "inline sql debt");
+        assert_eq!(sql_found[1].what, "block sql debt");
+
+        let yaml_src = "\
+url: \"http://example.com#mimodept: ignored <- 1 -> 2\"
+timeout: 30 # mimodept: inline yaml debt <- fixed -> env var
+";
+        let yaml_found = scan_content_markers(yaml_src, "cfg.yaml", CommentStyle::HashLine);
+        assert_eq!(yaml_found.len(), 1, "got: {yaml_found:?}");
+        assert_eq!(yaml_found[0].what, "inline yaml debt");
+    }
+
+    #[test]
+    fn deeply_nested_ast_marker_is_not_dropped() {
+        let depth = 150;
+        let mut src = String::from("pub fn deep() {\n");
+        for _ in 0..depth {
+            src.push_str("{ ");
+        }
+        src.push_str("\n// mimodept: deep marker <- depth 150 -> flatten\n");
+        for _ in 0..depth {
+            src.push_str("} ");
+        }
+        src.push_str("\n}\n");
+
+        let found =
+            scan_content_markers(&src, "src/deep.rs", CommentStyle::TreeSitter(TsLang::Rust));
+        assert_eq!(found.len(), 1, "deeply nested marker must be found");
+        assert_eq!(found[0].what, "deep marker");
+    }
+
+    #[test]
+    fn sync_debt_preserves_accepted_waivers_and_section_comments() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "// mimodept: lock <- 1 -> N\npub fn f() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".agents/memory.md"),
+            "\
+# Project Memory
+
+## KNOWN DEBT
+<!-- Team review note: audit every Friday -->
+### Concurrency
+- accepted lock <- 1 -> N
+",
+        )
+        .unwrap();
+
+        sync_debt(dir.path()).unwrap();
+        let synced = fs::read_to_string(dir.path().join(".agents/memory.md")).unwrap();
+        assert!(
+            synced.contains("- accepted lock <- 1 -> N"),
+            "accepted prefix must be preserved: {synced}"
+        );
+        assert!(
+            synced.contains("<!-- Team review note: audit every Friday -->"),
+            "custom HTML comment must be preserved: {synced}"
+        );
+        assert!(
+            synced.contains("### Concurrency"),
+            "subheading must be preserved: {synced}"
+        );
     }
 
     #[test]
